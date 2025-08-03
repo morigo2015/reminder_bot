@@ -1,0 +1,26 @@
+{
+	"folders": [
+		{
+			"path": "/home/igor/med"
+		}
+	],
+	"settings": {
+		"python.defaultInterpreterPath": "${workspaceFolder}/venv_med/bin/python3",
+		"python.linting.enabled": true,
+		"python.linting.flake8Enabled": false,
+		"ruff.enable": true,
+		"ruff.linting.enabled": true,
+		"ruff.formatting.provider": "none",
+		"editor.formatOnSave": true,
+		"editor.codeActionsOnSave": {
+			"source.fixAll": "explicit"
+		}
+	},
+	"extensions": {
+		"recommendations": [
+			"ms-python.python",
+			"charliermarsh.ruff",
+			"ms-python.vscode-pylance"
+		]
+	}
+}
