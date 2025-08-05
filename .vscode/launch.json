@@ -9,6 +9,13 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Python Debugger: reminder_bot/bot.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/igor/med/reminder_bot/bot.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "env": {

@@ -1,20 +1,23 @@
-"""Escalation handling – ping the nurse when a patient does not confirm."""
-
+"""Handle escalation to nurse when reminders fail."""
+import logging
 from aiogram import Bot
-from reminder_bot.utils import logging as log
 from reminder_bot.config import NURSE_CHAT_ID
+from reminder_bot.config.dialogs_loader import DIALOGS
 
+logger = logging.getLogger(__name__)
 
-async def escalate(bot: Bot, event_name: str, patient_chat_id: int) -> None:
-    if NURSE_CHAT_ID == 0:
-        # Nurse not configured – just log.
-        log.log(event_name, patient_chat_id, "ESCALATION_ERROR", 0)
-        return
+async def escalate(bot: Bot, event_name: str, chat_id: int, attempts: int) -> None:
+    """Notify the nurse when an event has exhausted retries without confirmation."""
+    template = DIALOGS['messages']['nurse']['clarification_failed']
+    text = template.format(event_name=event_name, attempts=attempts)
     try:
-        await bot.send_message(
-            chat_id=NURSE_CHAT_ID,
-            text=f"⚠️ Patient {patient_chat_id} did not confirm '{event_name}'.",
+        await bot.send_message(NURSE_CHAT_ID, text)
+        logger.debug(
+            "Escalated event '%s' for chat %s to nurse %s after %d attempts",
+            event_name, chat_id, NURSE_CHAT_ID, attempts
         )
-        log.log(event_name, patient_chat_id, "ESCALATED", 0)
-    except Exception as exc:  # pragma: no cover
-        log.log(event_name, patient_chat_id, f"ESCALATION_ERROR:{exc}", 0)
+    except Exception as e:
+        logger.error(
+            "Failed to escalate event '%s' for chat %s: %s",
+            event_name, chat_id, e
+        )

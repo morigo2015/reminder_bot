@@ -7,7 +7,7 @@ This file provides structured context for language models to quickly understand,
 ---
 
 ## 1. Project Overview
-
+ 
 - **Purpose**: A Telegram bot to schedule medication reminders for patients, track confirmations, retry if no response, and escalate to a nurse after final retry.
 - **Primary Workflow**:
   1. Scheduler triggers an `Event` at specified time (Europe/Kyiv TZ).

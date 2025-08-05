@@ -1,1 +1,0 @@
-"""Telegram Reminder Bot package."""

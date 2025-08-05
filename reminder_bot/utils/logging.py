@@ -1,18 +1,19 @@
-"""Very simple CSV log helper."""
+"""CSV logging utilities for Reminder Bot."""
 import csv
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
-LOG_FILE = Path("logs.csv")
-FIELDS = ("timestamp", "event_name", "chat_id", "status", "attempts")
+# Directory for log files
+LOG_DIR = Path(__file__).parent.parent / 'logs'
+LOG_DIR.mkdir(exist_ok=True)
 
-def _ensure_header() -> None:
-    if not LOG_FILE.exists():
-        LOG_FILE.write_text(",".join(FIELDS) + "\n", encoding="utf‑8")
-
-def log(event_name: str, chat_id: int, status: str, attempts: int) -> None:
-    _ensure_header()
-    ts_utc = datetime.now(tz=timezone.utc).isoformat()
-    row = (ts_utc, event_name, str(chat_id), status, str(attempts))
-    with LOG_FILE.open("a", newline="", encoding="utf‑8") as f:
-        csv.writer(f).writerow(row)
+def log(event_name: str, chat_id: int, status: str, attempts: int, clarifications: int = 0) -> None:
+    """Append a log entry for confirmation/failed events."""
+    filepath = LOG_DIR / f"{event_name}.csv"
+    first = not filepath.exists()
+    with filepath.open('a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        if first:
+            writer.writerow(['timestamp', 'chat_id', 'event_name', 'status', 'attempts', 'clarifications'])
+        timestamp = datetime.now().astimezone().isoformat()
+        writer.writerow([timestamp, chat_id, event_name, status, attempts, clarifications])
