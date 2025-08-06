@@ -3,8 +3,6 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# from reminder_bot.config.dialogs_loader import DIALOGS
-# from reminder_bot.states import ReminderStates
 from reminder_bot.flow_engine import FlowEngine
 from reminder_bot.services.log_service import LogService
 from reminder_bot.services.reminder_manager import ReminderManager
@@ -23,9 +21,9 @@ async def main():
     log_service = LogService()
     manager = ReminderManager(bot, dp, scheduler, log_service)
 
-    # Expose services for handlers
-    bot["log_service"] = log_service
-    bot["reminder_manager"] = manager
+    # Store services in dispatcher context
+    dp["log_service"] = log_service
+    dp["reminder_manager"] = manager
 
     # Register handlers
     dp.include_router(confirmation_router)

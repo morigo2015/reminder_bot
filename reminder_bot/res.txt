@@ -1,0 +1,915 @@
+### FILE: ./bot.py
+import os
+from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from reminder_bot.flow_engine import FlowEngine
+from reminder_bot.services.log_service import LogService
+from reminder_bot.services.reminder_manager import ReminderManager
+from reminder_bot.handlers.confirmation import router as confirmation_router
+from reminder_bot.handlers.pressure import router as pressure_router
+from reminder_bot.handlers.health_status import router as status_router
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+
+async def main():
+    bot = Bot(token=BOT_TOKEN)
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
+    log_service = LogService()
+    manager = ReminderManager(bot, dp, scheduler, log_service)
+
+    # Store services in dispatcher context
+    dp["log_service"] = log_service
+    dp["reminder_manager"] = manager
+
+    # Register handlers
+    dp.include_router(confirmation_router)
+    dp.include_router(pressure_router)
+    dp.include_router(status_router)
+
+    # Schedule flows from YAML
+    flow = FlowEngine(scheduler, manager)
+    flow.schedule_events()
+
+    scheduler.start()
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    asyncio.run(main())
+
+
+### FILE: ./config/config.py
+"""
+Centralised static configuration moved into the config package.
+BOT_TOKEN and NURSE_CHAT_ID are loaded from environment variables or fallback defaults.
+"""
+import os
+from dotenv import load_dotenv
+
+# Load .env if present
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+NURSE_CHAT_ID = int(os.getenv("NURSE_CHAT_ID", "0"))
+
+
+### FILE: ./config/dialogs_config.yaml
+# Regex patterns
+patterns:
+  confirmation_ok:
+    - '(ok|okay|\+)'
+    - '(так|да)'
+    - 'вже (випив|випила|зробив|зробила)'
+  pressure_prefix:
+    - '^\s*(pressure|тиск)\b'
+  health_prefix:
+    - '^\s*(звіт|report|status)\b'
+
+# Messages
+messages:
+  reminder:
+    clarify: 'Не зрозуміла 🤔 Напишіть *так*, якщо вже виконали.'
+    failed: 'Добре. Зараз попрошу медсестру прояснити.'
+  nurse:
+    clarification_failed: 'Пацієнт не підтвердив {event_name} після {attempts} запитів.'
+  pressure:
+    daily_reminder: 'Будь-ласка, виміряйте тиск і надішліть три числа (С/Д/ПБ).'
+
+# Events
+events:
+  morning_med:
+    retry_delay_seconds: 300
+    main_text: 'Будь ласка, прийміть ранкові ліки 💊.'
+    retry_text: 'Нагадування: ранкові ліки ще не прийняті 💊.'
+    retries: 2
+    escalate: true
+  water:
+    retry_delay_seconds: 180
+    main_text: 'Випийте склянку води 🥤.'
+    retry_text: 'Нагадую: випийте склянку води 🥤.'
+    retries: 0
+    escalate: false
+
+# Timings
+timings:
+  clarify_delay_sec: 300
+  clarify_retries: 2
+  status_window_sec: 300
+  pressure_remind_hour: 8
+  log_msg_max: 250
+  log_status_max_msgs: 10
+
+
+### FILE: ./config/dialogs_loader.py
+import yaml
+from pathlib import Path
+
+# Load raw YAML configuration
+CONFIG_PATH = Path(__file__).parent / "dialogs_config.yaml"
+with CONFIG_PATH.open("r", encoding="utf-8") as f:
+    _RAW = yaml.safe_load(f)
+
+# Expose raw patterns as strings
+RAW_PATTERNS = _RAW.get("patterns", {})
+
+# Expose full raw config for messages, events, timings
+DIALOGS = _RAW
+
+### FILE: ./config/dialogs.yaml
+nurse_chat_id: 123456789
+patterns:
+  confirm_ok: "(?i)^(так|ok|\+|yes)$"
+messages:
+  nurse_alert: "❗ Пацієнт {chat_id} не відповів на нагадування «{event_key}»."
+events:
+  morning_med:
+    schedule_time: "08:00"
+    main: "Настав час ранкових ліків 💊"
+    retry: "Нагадую про ранкові ліки."
+    retry_delay: 600
+    retries: 2
+    clarify_retries: 2
+timings:
+  clarify_delay: 900
+  bp_reminder_hour: 8
+status_window_sec: 300
+
+
+### FILE: ./config/__init__.py
+"""
+Configuration package for Reminder Bot: exports BOT_TOKEN, NURSE_CHAT_ID, and DIALOGS.
+"""
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env if present
+load_dotenv()
+
+# Static configuration
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+NURSE_CHAT_ID = int(os.getenv("NURSE_CHAT_ID", "0"))
+
+# Dialogs configuration loader
+from .dialogs_loader import DIALOGS
+
+
+### FILE: ./dialogues/__init__.py
+
+
+### FILE: ./dialogues/med.py
+import re
+from aiogram import Router, F
+from aiogram.types import Message
+from aiogram.filters.command import Command
+from aiogram.fsm.context import FSMContext
+from services.scheduler import schedule_once, schedule_daily, cancel_jobs, dispatcher, _start_fsm
+from services.config import config
+from services.logging import CSVLogger
+from services.escalation import escalate_to_nurse
+from states import ReminderStates
+
+router = Router()
+reminder_logger = CSVLogger("reminder")
+
+@router.message(Command("schedule"), F.args)
+async def schedule_event_handler(message: Message):
+    args = message.get_args().split()
+    if len(args) != 2:
+        await message.reply("Usage: /schedule <event_key> <HH:MM>")
+        return
+    event_key, time_str = args
+    events = config.get("events", {})
+    if event_key not in events:
+        await message.reply(f"Unknown event key: {event_key}")
+        return
+    try:
+        hh, mm = map(int, time_str.split(":"))
+        assert 0 <= hh < 24 and 0 <= mm < 60
+    except:
+        await message.reply("Time format must be HH:MM")
+        return
+    schedule_daily(message.chat.id, event_key, time_str, reminder_main_handler, {"event_key": event_key})
+    await message.reply(f"Scheduled daily reminder for '{event_key}' at {time_str}")
+
+async def reminder_main_handler(job):
+    data = job.data
+    chat_id = data["chat_id"]
+    event_key = data["event_key"]
+    bot = job.bot
+    event = config["events"][event_key]
+    cancel_jobs(chat_id, event_key)
+    await bot.send_message(chat_id, event["main"])
+    # Start FSM with correct initial state
+    await _start_fsm(chat_id, event_key, ReminderStates.waiting_confirmation)
+    await reminder_logger.log(chat_id, event_key=event_key, action="sent_main")
+    # Schedule retry
+    schedule_once(chat_id, f"{event_key}:retry", event["retry_delay"], reminder_retry_handler, {"event_key": event_key})
+
+async def reminder_retry_handler(job):
+    data = job.data
+    chat_id = data["chat_id"]
+    event_key = data["event_key"]
+    bot = job.bot
+    event = config["events"][event_key]
+    from aiogram.types import Chat, User
+    from aiogram.fsm.context import FSMContext
+    dp = dispatcher
+    chat = Chat(id=chat_id, type="private")
+    user = User(id=chat_id, is_bot=False)
+    fsm_ctx = FSMContext(storage=dp.storage, chat=chat, user=user)
+    state_data = await fsm_ctx.get_data()
+    retries = state_data.get("retries", 0)
+    if retries < event["retries"]:
+        await bot.send_message(chat_id, event["retry"])
+        retries += 1
+        await fsm_ctx.update_data(retries=retries)
+        await reminder_logger.log(chat_id, event_key=event_key, action=f"retry_{retries}")
+        schedule_once(chat_id, f"{event_key}:retry", event["retry_delay"], reminder_retry_handler, {"event_key": event_key})
+    else:
+        schedule_once(chat_id, f"{event_key}:clarify", config["timings"]["clarify_delay"], reminder_clarify_handler, {"event_key": event_key})
+
+async def reminder_clarify_handler(job):
+    data = job.data
+    chat_id = data["chat_id"]
+    event_key = data["event_key"]
+    bot = job.bot
+    event = config["events"][event_key]
+    from aiogram.types import Chat, User
+    from aiogram.fsm.context import FSMContext
+    dp = dispatcher
+    chat = Chat(id=chat_id, type="private")
+    user = User(id=chat_id, is_bot=False)
+    fsm_ctx = FSMContext(storage=dp.storage, chat=chat, user=user)
+    state_data = await fsm_ctx.get_data()
+    clarifies = state_data.get("clarifies", 0)
+    if clarifies < event["clarify_retries"]:
+        await bot.send_message(chat_id, event.get("retry"))
+        clarifies += 1
+        await fsm_ctx.update_data(clarifies=clarifies)
+        await reminder_logger.log(chat_id, event_key=event_key, action=f"clarify_{clarifies}")
+        schedule_once(chat_id, f"{event_key}:clarify", config["timings"]["clarify_delay"], reminder_clarify_handler, {"event_key": event_key})
+    else:
+        await escalate_to_nurse(chat_id, event_key, bot)
+        await reminder_logger.log(chat_id, event_key=event_key, action="escalated")
+        # Clear FSM
+        from aiogram.fsm.context import FSMContext
+        from aiogram.types import Chat, User
+        fsm_ctx = FSMContext(storage=dispatcher.storage, chat=Chat(id=chat_id, type="private"), user=User(id=chat_id, is_bot=False))
+        await fsm_ctx.clear()
+
+from aiogram import F
+from aiogram.types import Message
+from aiogram.fsm.context import FSMContext
+
+@router.message(ReminderStates.waiting_confirmation, F.text.regexp(config["patterns"]["confirm_ok"]))
+@router.message(ReminderStates.waiting_clarification, F.text.regexp(config["patterns"]["confirm_ok"]))
+async def confirm_success(message: Message, state: FSMContext):
+    data = await state.get_data()
+    event_key = data.get("event_key")
+    chat_id = message.chat.id
+    cancel_jobs(chat_id, event_key)
+    await message.reply("Дякую, підтверджено.")
+    await reminder_logger.log(chat_id, event_key=event_key, action="confirmed")
+    await state.clear()
+
+
+### FILE: ./dialogues/pressure.py
+import re
+from aiogram import Router, F
+from aiogram.types import Message
+from services.logging import CSVLogger
+
+router = Router()
+pressure_logger = CSVLogger("pressure")
+bp_regex = re.compile(r"^\D*(\d{2,3})[ /,-](\d{2,3})[ /,-](\d{2,3})\D*$")
+
+@router.message(F.text.regexp(bp_regex))
+async def pressure_handler(message: Message):
+    match = bp_regex.match(message.text)
+    if not match:
+        return
+    systolic, diastolic, pulse = match.groups()
+    await pressure_logger.log(message.chat.id, systolic=systolic, diastolic=diastolic, pulse=pulse)
+    await message.reply("Дякую, тиск записано.")
+
+
+### FILE: ./dialogues/status.py
+from aiogram import Router, F
+from aiogram.types import Message, Chat, User
+from aiogram.filters.command import Command
+from services.scheduler import schedule_once, dispatcher
+from services.logging import CSVLogger
+from services.config import config
+from states import StatusFlow
+from aiogram.fsm.context import FSMContext
+
+router = Router()
+status_logger = CSVLogger("status")
+
+@router.message(Command("status"))
+async def status_start(message: Message):
+    state = FSMContext(storage=dispatcher.storage, chat=message.chat, user=message.from_user)
+    await state.set_state(StatusFlow.waiting_status)
+    await state.update_data(messages=[])
+    await message.reply("Будь ласка, опишіть свій стан протягом 5 хвилин.")
+    schedule_once(message.chat.id, "status_window", config["status_window_sec"], status_end_handler)
+
+async def status_end_handler(job):
+    chat_id = job.data["chat_id"]
+    bot = job.bot
+    fsm_ctx = FSMContext(storage=dispatcher.storage, chat=Chat(id=chat_id, type="private"), user=User(id=chat_id, is_bot=False))
+    data = await fsm_ctx.get_data()
+    messages = data.get("messages", [])
+    await status_logger.log(chat_id, messages=" | ".join(messages))
+    await fsm_ctx.clear()
+    await bot.send_message(chat_id, "Дякую за інформацію. Завершуємо статус.")
+
+@router.message(StatusFlow.waiting_status, F.text)
+async def collect_status(message: Message):
+    state = FSMContext(storage=dispatcher.storage, chat=message.chat, user=message.from_user)
+    data = await state.get_data()
+    msgs = data.get("messages", [])
+    msgs.append(message.text)
+    await state.update_data(messages=msgs)
+
+
+### FILE: ./events.py
+"""Static list of Event definitions (schedule only).
+Human‑facing texts and retry delays are loaded from dialogs_config.yaml."""
+
+from reminder_bot.models import Event
+from reminder_bot.config.dialogs_loader import DIALOGS
+
+# Replace chat_id with real patient chat id
+CHAT_ID = 382163513
+
+_event_conf = DIALOGS["events"]
+
+EVENTS = [
+    Event(
+        event_name="morning_med",
+        chat_id=CHAT_ID,
+        scheduler_args={"hour": 2, "minute": 45},
+        main_text=_event_conf["morning_med"]["main_text"],
+        retry_text=_event_conf["morning_med"]["retry_text"],
+        retries=2,
+        retry_delay_seconds=_event_conf["morning_med"]["retry_delay_seconds"],
+    ),
+    # Event(
+    #     event_name="water",
+    #     chat_id=CHAT_ID,
+    #     scheduler_args={"hour": 11, "minute": 0},
+    #     main_text=_event_conf['water']['main_text'],
+    #     retry_text=_event_conf['water']['retry_text'],
+    #     retries=2,
+    #     retry_delay_seconds=_event_conf['water']['retry_delay_seconds'],
+    # ),
+]
+
+
+### FILE: ./flow_engine.py
+from apscheduler.triggers.cron import CronTrigger
+from reminder_bot.config.dialogs_loader import DIALOGS
+
+
+class FlowEngine:
+    def __init__(self, scheduler, reminder_manager):
+        self.scheduler = scheduler
+        self.reminder_manager = reminder_manager
+
+    def schedule_events(self):
+        for event_name, cfg in DIALOGS["events"].items():
+            trigger_spec = cfg.get("trigger")
+            if not trigger_spec:
+                print(f"⚠️ Skipping event '{event_name}': no trigger spec defined.")
+                continue
+            if trigger_spec.startswith("cron:"):
+                try:
+                    spec = trigger_spec.split(":", 1)[1].strip()
+                    hour, minute = map(int, spec.split())
+                    trigger = CronTrigger(
+                        hour=hour, minute=minute, timezone=self.scheduler.timezone
+                    )
+                    job_id = f"reminder_{event_name}"
+                    self.scheduler.add_job(
+                        self.reminder_manager.start_flow,
+                        trigger,
+                        args=[event_name],
+                        id=job_id,
+                    )
+                except Exception as e:
+                    print(f"❌ Invalid cron spec for '{event_name}': {e}")
+            else:
+                print(
+                    f"⚠️ Skipping event '{event_name}': unsupported trigger spec '{trigger_spec}'"
+                )
+
+
+### FILE: ./handlers/common.py
+from aiogram import Router
+
+router = Router()
+# Common handler deprecated: individual FSM-based handlers are used instead.
+
+
+### FILE: ./handlers/confirmation.py
+import re
+from aiogram import Router
+from aiogram.types import Message
+from aiogram.fsm.context import FSMContext
+from reminder_bot.states import ReminderStates
+
+router = Router()
+
+OK_PATTERN = re.compile(r'^(?:ok|так|yes|si|sure|👍)$', re.IGNORECASE)
+
+@router.message(ReminderStates.waiting_confirmation)
+async def handle_confirmation(message: Message, state: FSMContext):
+    text = message.text or ''
+    if not OK_PATTERN.match(text):
+        return
+    data = await state.get_data()
+    event = data.get('current_event')
+    manager = message.bot['reminder_manager']
+    await manager.cancel_flow(event, message.chat.id)
+    await message.answer('✅ Confirmed.')
+    await state.clear()
+
+@router.message(ReminderStates.waiting_clarification)
+async def handle_clarification(message: Message, state: FSMContext):
+    text = message.text or ''
+    if not OK_PATTERN.match(text):
+        return
+    data = await state.get_data()
+    event = data.get('current_event')
+    manager = message.bot['reminder_manager']
+    await manager.finalize_flow(event, message.chat.id)
+    await message.answer('✅ Clarification received.')
+    await state.clear()
+
+
+### FILE: ./handlers/health_status.py
+from aiogram import Router, F
+from aiogram.types import Message
+
+router = Router()
+STATUS_COMMANDS = ["/status", "звіт", "report"]
+
+
+@router.message(F.text.startswith(tuple(STATUS_COMMANDS)))
+async def status_handler(message: Message):
+    """Collects health-status messages and logs them with a rolling window."""
+    log_service = message.bot.dispatcher["log_service"]
+    await log_service.status(message.chat.id, message.text, dropped=False)
+    await message.answer("📝 Status recorded.")
+
+
+### FILE: ./handlers/__init__.py
+
+
+### FILE: ./handlers/pressure.py
+import re
+from aiogram import Router
+from aiogram.types import Message
+from aiogram.fsm.context import FSMContext
+from reminder_bot.states import ReminderStates
+
+router = Router()
+
+PRESSURE_CMD_PATTERN = re.compile(r'^(?:/pressure|/bp)$', re.IGNORECASE)
+PRESSURE_PATTERN = re.compile(r'^(?:тиск|pressure)\s+(\d{1,3})\s+(\d{1,3})\s+(\d{1,3})$', re.IGNORECASE)
+
+@router.message()
+async def pressure_entry(message: Message, state: FSMContext):
+    text = message.text or ''
+    if PRESSURE_CMD_PATTERN.match(text):
+        await message.answer('Введіть три числа: систолічний, діастолічний, пульс, наприклад: тиск 120 80 70')
+        await state.set_state(ReminderStates.entering_pressure)
+        return
+    # If in entering_pressure state, try to match numbers
+    current_state = await state.get_state()
+    if current_state == ReminderStates.entering_pressure:
+        m = PRESSURE_PATTERN.match(text)
+        if not m:
+            await message.answer('Невірний формат. Введіть, будь ласка, три числа, наприклад: тиск 120 80 70')
+            return
+        high, low, pulse = map(int, m.groups())
+        log_service = message.bot['log_service']
+        await log_service.pressure(message.chat.id, high, low, pulse)
+        await message.answer(f'📋 Logged pressure: {high}/{low}, pulse {pulse}')
+        await state.clear()
+
+
+### FILE: ./__init__.py
+
+
+### FILE: ./main.py
+import os
+import logging
+from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
+
+from services.scheduler import init_scheduler
+from dialogues.med import router as med_router
+from dialogues.pressure import router as pressure_router
+from dialogues.status import router as status_router
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    bot = Bot(token=os.getenv("BOT_TOKEN"))
+    dp = Dispatcher(storage=MemoryStorage())
+
+    # Initialize scheduler
+    init_scheduler(dp)
+
+    # Include routers
+    dp.include_router(med_router)
+    dp.include_router(pressure_router)
+    dp.include_router(status_router)
+
+    # Start polling
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
+
+
+### FILE: ./models.py
+from __future__ import annotations
+from dataclasses import dataclass, field
+from datetime import date
+from typing import Optional, Dict
+
+@dataclass(frozen=True)
+class Event:
+    """Immutable definition of reminder scheduling logic."""
+    event_name: str
+    chat_id: int
+    scheduler_args: dict      # kwargs passed directly to APScheduler.add_job
+    main_text: str
+    retry_text: str
+    retry_delay_seconds: int
+    retries: int = 0
+    escalate: bool = True
+
+@dataclass
+class RuntimeState:
+    """In‑memory tracking of confirmation & clarification attempts."""
+    attempt: int = 0                # number of retry attempts already sent
+    clarify_attempt: int = 0        # number of clarification messages sent
+    confirmed: bool = False
+    retry_job_id: Optional[str] = None
+    clarify_job_id: Optional[str] = None
+
+@dataclass
+class PressureDayState:
+    """Track if today's pressure reading has been received."""
+    received: bool = False
+    day: date = field(default_factory=date.today)
+
+    def reset_if_new_day(self) -> None:
+        today = date.today()
+        if today != self.day:
+            self.day = today
+            self.received = False
+
+### FILE: ./scheduler.py
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+def create_scheduler():
+    # Use Kyiv timezone by default
+    return AsyncIOScheduler(timezone='Europe/Kyiv')
+
+
+### FILE: ./services/config.py
+import os
+import yaml
+
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "dialogs.yaml")
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+
+
+### FILE: ./services/escalation.py
+from services.config import config
+from aiogram import Bot
+
+async def escalate_to_nurse(chat_id: int, event_key: str, bot: Bot):
+    nurse_id = config.get("nurse_chat_id")
+    text = config["messages"]["nurse_alert"].format(chat_id=chat_id, event_key=event_key)
+    await bot.send_message(nurse_id, text)
+
+
+### FILE: ./services/__init__.py
+
+
+### FILE: ./services/logging.py
+import os
+import csv
+import datetime
+from asyncio import Lock
+
+class CSVLogger:
+    _locks = {}
+    def __init__(self, type_name: str):
+        self.type_name = type_name
+        base = os.path.join(os.path.dirname(__file__), "..", "data", "logs")
+        os.makedirs(base, exist_ok=True)
+        self.path = os.path.join(base, f"{type_name}.csv")
+        if not os.path.exists(self.path):
+            with open(self.path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if type_name == "reminder":
+                    writer.writerow(["timestamp", "chat_id", "event_key", "action"])
+                elif type_name == "pressure":
+                    writer.writerow(["timestamp", "chat_id", "systolic", "diastolic", "pulse"])
+                elif type_name == "status":
+                    writer.writerow(["timestamp", "chat_id", "messages"])
+        if type_name not in CSVLogger._locks:
+            CSVLogger._locks[type_name] = Lock()
+        self._lock = CSVLogger._locks[type_name]
+
+    async def log(self, chat_id: int, **data):
+        async with self._lock:
+            with open(self.path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                row = [datetime.datetime.utcnow().isoformat(), chat_id]
+                if self.type_name == "reminder":
+                    row.extend([data["event_key"], data["action"]])
+                elif self.type_name == "pressure":
+                    row.extend([data["systolic"], data["diastolic"], data["pulse"]])
+                elif self.type_name == "status":
+                    row.append(data["messages"])
+                writer.writerow(row)
+
+
+### FILE: ./services/log_service.py
+import csv
+import os
+from datetime import datetime
+
+class LogService:
+    def __init__(self, base_path='logs'):
+        self.base_path = base_path
+        os.makedirs(base_path, exist_ok=True)
+
+    def _log(self, filename, row):
+        path = os.path.join(self.base_path, filename)
+        write_header = not os.path.exists(path)
+        with open(path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(row.keys())
+            writer.writerow(row.values())
+
+    async def pressure(self, chat_id, high, low, pulse):
+        row = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'CHAT_ID': chat_id,
+            'HIGH': high,
+            'LOW': low,
+            'PULSE': pulse,
+        }
+        self._log('pressure.csv', row)
+
+    async def status(self, chat_id, text, dropped):
+        row = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'CHAT_ID': chat_id,
+            'STATUS': text,
+            'DROPPED': dropped,
+        }
+        self._log('status.csv', row)
+
+    async def confirmation(self, chat_id, event_name, status, attempts, clarifications):
+        row = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'CHAT_ID': chat_id,
+            'EVENT': event_name,
+            'STATUS': status,
+            'ATTEMPTS': attempts,
+            'CLARIFICATIONS': clarifications,
+        }
+        self._log('confirmation.csv', row)
+
+
+### FILE: ./services/reminder_manager.py
+import asyncio
+from aiogram import Bot
+from aiogram.fsm.context import FSMContext
+from reminder_bot.states import ReminderStates
+from reminder_bot.config.dialogs_loader import DIALOGS
+
+class ReminderManager:
+    def __init__(self, bot: Bot, dispatcher, scheduler, log_service):
+        self.bot = bot
+        self.dp = dispatcher
+        self.scheduler = scheduler
+        self.log = log_service
+
+    async def start_flow(self, event_name: str):
+        """Entry point for a reminder flow. Sends main prompt and sets FSM state."""
+        cfg = DIALOGS['events'][event_name]
+        # For simplicity assume global chat_id configured
+        chat_id = cfg.get('chat_id')
+        if not chat_id:
+            return
+        # send main text
+        await self.bot.send_message(chat_id, cfg['main_text'])
+        # set FSM to waiting_confirmation
+        state: FSMContext = self.dp.current_state(chat=chat_id, user=chat_id)
+        await state.set_state(ReminderStates.waiting_confirmation)
+        await state.update_data(current_event=event_name, attempts=0, clarifications=0)
+        # schedule retry if needed
+        delay = cfg.get('retry_delay_seconds', 0)
+        retries = cfg.get('retries', 0)
+        if retries > 0:
+            job_id = f"retry_{event_name}_{chat_id}"
+            self.scheduler.add_job(self._handle_retry,
+                                   'date',
+                                   run_date=asyncio.get_event_loop().time() + delay,
+                                   args=[event_name, chat_id, 1],
+                                   id=job_id)
+
+    async def _handle_retry(self, event_name, chat_id, attempt):
+        """Handle a retry attempt: send retry_text or escalate to clarification."""
+        cfg = DIALOGS['events'][event_name]
+        state: FSMContext = self.dp.current_state(chat=chat_id, user=chat_id)
+        data = await state.get_data()
+        if data.get('confirmed'):
+            return
+        if attempt <= cfg.get('retries',0):
+            await self.bot.send_message(chat_id, cfg['retry_text'])
+            await state.update_data(attempts=attempt)
+            # schedule next
+            if attempt < cfg['retries']:
+                delay = cfg.get('retry_delay_seconds',0)
+                self.scheduler.add_job(self._handle_retry,
+                                       'date',
+                                       run_date=asyncio.get_event_loop().time()+delay,
+                                       args=[event_name, chat_id, attempt+1])
+            else:
+                # escalate to clarification
+                await self._start_clarification(event_name, chat_id)
+
+    async def _start_clarification(self, event_name, chat_id):
+        cfg = DIALOGS['events'][event_name]
+        await self.bot.send_message(chat_id, cfg.get('clarify_text','Please confirm (OK)'))
+        state: FSMContext = self.dp.current_state(chat=chat_id, user=chat_id)
+        await state.set_state(ReminderStates.waiting_clarification)
+        await state.update_data(clarifications=1)
+        # schedule further clarifications similar to retries if needed
+
+    # Additional methods: cancel flow upon confirmation, escalation to nurse, etc.
+
+
+### FILE: ./services/scheduler.py
+from datetime import time as dt_time
+from aiogram import Dispatcher
+from aiogram.types import Chat, User
+from aiogram.fsm.context import FSMContext
+from states import ReminderFlow, StatusFlow
+from services.config import config
+
+job_queue = None
+dispatcher = None
+
+def init_scheduler(dp: Dispatcher):
+    global job_queue, dispatcher
+    dispatcher = dp
+    job_queue = dp.job_queue
+
+def schedule_once(chat_id: int, name: str, delay: float, callback, job_data: dict = None):
+    data = {"chat_id": chat_id}
+    if job_data:
+        data.update(job_data)
+    job_queue.run_once(callback, delay, data=data, name=f"{chat_id}:{name}")
+
+def schedule_daily(chat_id: int, name: str, time_str: str, callback, job_data: dict = None):
+    hh, mm = map(int, time_str.split(":"))
+    when = dt_time(hour=hh, minute=mm)
+    data = {"chat_id": chat_id}
+    if job_data:
+        data.update(job_data)
+    job_queue.run_daily(callback, when, data=data, name=f"{chat_id}:{name}")
+
+def cancel_jobs(chat_id: int, prefix: str):
+    for job in list(job_queue.get_jobs()):
+        if job.name and job.name.startswith(f"{chat_id}:{prefix}"):
+            job.schedule_removal()
+
+async def _start_fsm(chat_id: int, event_key: str, state):
+    chat = Chat(id=chat_id, type="private")
+    user = User(id=chat_id, is_bot=False)
+    fsm_ctx = FSMContext(storage=dispatcher.storage, chat=chat, user=user)
+    await fsm_ctx.set_state(state)
+    await fsm_ctx.update_data(event_key=event_key, retries=0, clarifies=0)
+
+async def _start_status_fsm(chat_id: int):
+    chat = Chat(id=chat_id, type="private")
+    user = User(id=chat_id, is_bot=False)
+    fsm_ctx = FSMContext(storage=dispatcher.storage, chat=chat, user=user)
+    await fsm_ctx.set_state(StatusFlow.waiting_status)
+    await fsm_ctx.update_data(messages=[])
+
+
+### FILE: ./services/status_window.py
+"""Manage per‑chat health status collection windows."""
+from __future__ import annotations
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
+from typing import Deque, Dict, List
+
+from ..utils.time import kyiv_now
+from ..utils import logging as log
+
+class StatusWindowManager:
+    """Tracks open status windows and stored messages."""
+
+    def __init__(self, window_sec: int, msg_limit: int):
+        self.window_sec = window_sec
+        self.msg_limit = msg_limit
+        # chat_id -> (window_end, deque[str])
+        self._windows: Dict[int, tuple[datetime, Deque[str]]] = {}
+
+    def add_message(self, chat_id: int, text: str) -> None:
+        now = kyiv_now()
+        window_end, msgs = self._windows.get(chat_id, (now, deque()))
+        if now >= window_end:
+            # start new window
+            window_end = now + timedelta(seconds=self.window_sec)
+            msgs = deque()
+        # store message or mark dropped
+        if len(msgs) < self.msg_limit:
+            msgs.append(text)
+            log.log_status(text, dropped=False)
+        else:
+            log.log_status(text, dropped=True)
+        self._windows[chat_id] = (window_end, msgs)
+
+### FILE: ./states.py
+from aiogram.fsm.state import StatesGroup, State
+
+class ReminderStates(StatesGroup):
+    waiting_confirmation = State()
+    waiting_clarification = State()
+
+class StatusFlow(StatesGroup):
+    waiting_status = State()
+
+
+### FILE: ./utils/__init__.py
+
+
+### FILE: ./utils/logging.py
+"""CSV logging utilities for Reminder Bot."""
+import csv
+from datetime import datetime
+from pathlib import Path
+
+# Directory for log files
+LOG_DIR = Path(__file__).parent.parent / 'logs'
+LOG_DIR.mkdir(exist_ok=True)
+
+def log(event_name: str, chat_id: int, status: str, attempts: int, clarifications: int = 0) -> None:
+    """Append a log entry for confirmation/failed events."""
+    filepath = LOG_DIR / f"{event_name}.csv"
+    first = not filepath.exists()
+    with filepath.open('a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        if first:
+            writer.writerow(['timestamp', 'chat_id', 'event_name', 'status', 'attempts', 'clarifications'])
+        timestamp = datetime.now().astimezone().isoformat()
+        writer.writerow([timestamp, chat_id, event_name, status, attempts, clarifications])
+
+
+### FILE: ./utils/time.py
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+def kyiv_now() -> datetime:
+    """Return now() in Europe/Kyiv."""
+    return datetime.now(tz=KYIV_TZ)
+
+def to_server_tz(dt_kyiv: datetime) -> datetime:
+    """Convert a Kyiv‑tz datetime to the server's local timezone."""
+    return dt_kyiv.astimezone()
+
+def seconds_until(hour: int) -> int:
+    """Return seconds until the next occurrence of `hour:00` (Kyiv time)."""
+    now = kyiv_now()
+    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return int((target - now).total_seconds())
+

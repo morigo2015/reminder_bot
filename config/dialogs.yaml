@@ -1,0 +1,17 @@
+patterns:
+  confirm_ok: "(?i)^(так|ok|\+|yes)$"
+messages:
+  nurse_alert: "❗ Пацієнт {chat_id} не відповів на {event_key}"
+events:
+  morning_med:
+    time: "08:00"
+    main: "Настав час ранкових ліків 💊"
+    retry: "Нагадую про ранкові ліки."
+    retry_delay: 600
+    retries: 2
+    clarify_retries: 2
+timings:
+  clarify_delay: 900
+  bp_reminder_hour: 8
+status_window_sec: 300
+max_status_lines: 10
