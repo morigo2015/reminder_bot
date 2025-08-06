@@ -1,30 +1,42 @@
-import re
-from aiogram import Router
+from aiogram import Router, F
 from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
-from reminder_bot.states import ReminderStates
+
+from states import ReminderStates
+from services.log_service import LogService
 
 router = Router()
+log_service = LogService()
 
-PRESSURE_CMD_PATTERN = re.compile(r'^(?:/pressure|/bp)$', re.IGNORECASE)
-PRESSURE_PATTERN = re.compile(r'^(?:тиск|pressure)\s+(\d{1,3})\s+(\d{1,3})\s+(\d{1,3})$', re.IGNORECASE)
 
-@router.message()
+@router.message(F.text.startswith("/pressure") | F.text.startswith("/bp"))
 async def pressure_entry(message: Message, state: FSMContext):
-    text = message.text or ''
-    if PRESSURE_CMD_PATTERN.match(text):
-        await message.answer('Введіть три числа: систолічний, діастолічний, пульс, наприклад: тиск 120 80 70')
-        await state.set_state(ReminderStates.entering_pressure)
-        return
-    # If in entering_pressure state, try to match numbers
-    current_state = await state.get_state()
-    if current_state == ReminderStates.entering_pressure:
-        m = PRESSURE_PATTERN.match(text)
-        if not m:
-            await message.answer('Невірний формат. Введіть, будь ласка, три числа, наприклад: тиск 120 80 70')
-            return
-        high, low, pulse = map(int, m.groups())
-        log_service = message.bot['log_service']
-        await log_service.pressure(message.chat.id, high, low, pulse)
-        await message.answer(f'📋 Logged pressure: {high}/{low}, pulse {pulse}')
-        await state.clear()
+    """
+    Starts the blood-pressure entry flow.
+    """
+    await state.set_state(ReminderStates.entering_pressure)
+    await message.reply(
+        "Please enter your blood pressure as systolic/diastolic (e.g. 120/80):"
+    )
+
+
+@router.message(ReminderStates.entering_pressure)
+async def pressure_record(message: Message, state: FSMContext):
+    """
+    Records the pressure reading and clears state.
+    """
+    text = message.text.strip()
+    # Basic parse: "120/80"
+    try:
+        systolic, diastolic = map(int, text.split("/"))
+    except ValueError:
+        return await message.reply(
+            "Invalid format. Please use systolic/diastolic (e.g. 120/80)."
+        )
+
+    # Log the values
+    await log_service.pressure(
+        chat_id=message.chat.id, systolic=systolic, diastolic=diastolic
+    )
+    await message.reply(f"Logged your blood pressure: {systolic}/{diastolic}. Thanks!")
+    await state.clear()

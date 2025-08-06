@@ -1,35 +1,49 @@
+import logging
 from apscheduler.triggers.cron import CronTrigger
-from reminder_bot.config.dialogs_loader import DIALOGS
+from config.dialogs_loader import DIALOGS
+from services.reminder_manager import ReminderManager
+
+logger = logging.getLogger(__name__)
 
 
 class FlowEngine:
-    def __init__(self, scheduler, reminder_manager):
+    def __init__(self, scheduler, reminder_manager: ReminderManager):
         self.scheduler = scheduler
         self.reminder_manager = reminder_manager
 
     def schedule_events(self):
-        for event_name, cfg in DIALOGS["events"].items():
-            trigger_spec = cfg.get("trigger")
-            if not trigger_spec:
-                print(f"⚠️ Skipping event '{event_name}': no trigger spec defined.")
-                continue
+        for event_name, cfg in DIALOGS.items():
+            trigger_spec = cfg["trigger"]
             if trigger_spec.startswith("cron:"):
                 try:
-                    spec = trigger_spec.split(":", 1)[1].strip()
-                    hour, minute = map(int, spec.split())
+                    # Expect "cron: HH MM"
+                    _, spec = trigger_spec.split(":", 1)
+                    hour_str, minute_str = spec.strip().split()
+                    hour, minute = int(hour_str), int(minute_str)
+
                     trigger = CronTrigger(
                         hour=hour, minute=minute, timezone=self.scheduler.timezone
                     )
                     job_id = f"reminder_{event_name}"
+                    logger.debug(
+                        f"[FLOW ENGINE] Scheduling '{event_name}' ({job_id}) at {hour:02d}:{minute:02d}"
+                    )
                     self.scheduler.add_job(
                         self.reminder_manager.start_flow,
-                        trigger,
+                        trigger=trigger,
                         args=[event_name],
                         id=job_id,
+                        replace_existing=True,
+                    )
+                    job = self.scheduler.get_job(job_id)
+                    logger.debug(
+                        f"[FLOW ENGINE] → next run for {job_id!r}: {job.next_run_time}"
                     )
                 except Exception as e:
-                    print(f"❌ Invalid cron spec for '{event_name}': {e}")
+                    logger.error(
+                        f"[FLOW ENGINE] Invalid cron spec for '{event_name}': {e}"
+                    )
             else:
-                print(
-                    f"⚠️ Skipping event '{event_name}': unsupported trigger spec '{trigger_spec}'"
+                logger.warning(
+                    f"[FLOW ENGINE] Unsupported trigger '{trigger_spec}' for '{event_name}'"
                 )

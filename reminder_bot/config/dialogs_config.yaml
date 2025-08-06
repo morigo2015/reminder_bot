@@ -22,17 +22,31 @@ messages:
 # Events
 events:
   morning_med:
-    retry_delay_seconds: 300
+    trigger: "cron: 0 48"
+    chat_id: 382163513
+    retry_delay_seconds: 30
     main_text: 'Будь ласка, прийміть ранкові ліки 💊.'
     retry_text: 'Нагадування: ранкові ліки ще не прийняті 💊.'
     retries: 2
     escalate: true
   water:
+    trigger: "cron: 8 0"
+    chat_id: 382163513
     retry_delay_seconds: 180
     main_text: 'Випийте склянку води 🥤.'
     retry_text: 'Нагадую: випийте склянку води 🥤.'
     retries: 0
     escalate: false
+
+  pressure_check:
+    trigger: "cron: 23 25"     # runs every day at 12:00 Europe/Kyiv
+    chat_id: 382163513         # ← same or different chat ID for testing
+    main_text: "It's time for your daily blood-pressure check. Please use /pressure to log it."
+    retries: 1
+    retry_delay_seconds: 300   # 5 minutes
+    retry_text: "Reminder: please log your blood pressure with /pressure."
+    clarify_text: "Have you logged your blood pressure? (OK)"
+
 
 # Timings
 timings:
