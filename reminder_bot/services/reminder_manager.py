@@ -1,123 +1,67 @@
-"""Central coordination of triggers, retries, and confirmations with debug logging."""
-
-from __future__ import annotations
-from typing import Dict, Tuple
-from datetime import timedelta
-
-import logging
+import asyncio
 from aiogram import Bot
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-from ..models import Event, RuntimeState
-from ..utils.time import kyiv_now
-from ..utils import logging as log
-from . import escalation
-
-_STATE: Dict[Tuple[int, str], RuntimeState] = {}
-logger = logging.getLogger(__name__)
-
-def _key(chat_id: int, event_name: str) -> Tuple[int, str]:
-    return chat_id, event_name
+from aiogram.fsm.context import FSMContext
+from reminder_bot.states import ReminderStates
+from reminder_bot.config.dialogs_loader import DIALOGS
 
 class ReminderManager:
-    def __init__(self, bot: Bot, scheduler: AsyncIOScheduler | None):
+    def __init__(self, bot: Bot, dispatcher, scheduler, log_service):
         self.bot = bot
+        self.dp = dispatcher
         self.scheduler = scheduler
+        self.log = log_service
 
-    async def trigger_event(self, event: Event) -> None:
-        now = kyiv_now()
-        logger.debug(
-            "Triggering event '%s' for chat %s at %s; scheduler_args=%s",
-            event.event_name,
-            event.chat_id,
-            now,
-            event.scheduler_args,
-        )
-        state = _STATE.setdefault(_key(event.chat_id, event.event_name), RuntimeState())
-        state.attempt = 0
-        state.confirmed = False
-
-        await self.bot.send_message(event.chat_id, event.main_text)
-
-        if event.retries > 0 and self.scheduler:
-            self._schedule_retry(event)
-
-    def _schedule_retry(self, event: Event) -> None:
-        state = _STATE[_key(event.chat_id, event.event_name)]
-        run_date = kyiv_now() + timedelta(seconds=event.retry_delay_seconds)
-        job = self.scheduler.add_job(
-            self.handle_retry, "date", args=[event], run_date=run_date
-        )
-        state.retry_job_id = job.id
-        logger.debug(
-            "Scheduled retry for event '%s' chat %s at %s | job_id=%s",
-            event.event_name,
-            event.chat_id,
-            run_date,
-            job.id,
-        )
-
-    async def handle_retry(self, event: Event) -> None:
-        state = _STATE.get(_key(event.chat_id, event.event_name))
-        if not state or state.confirmed:
-            logger.debug(
-                "Skipping retry for event '%s' chat %s: no state or already confirmed",
-                event.event_name, event.chat_id
-            )
+    async def start_flow(self, event_name: str):
+        """Entry point for a reminder flow. Sends main prompt and sets FSM state."""
+        cfg = DIALOGS['events'][event_name]
+        # For simplicity assume global chat_id configured
+        chat_id = cfg.get('chat_id')
+        if not chat_id:
             return
+        # send main text
+        await self.bot.send_message(chat_id, cfg['main_text'])
+        # set FSM to waiting_confirmation
+        state: FSMContext = self.dp.current_state(chat=chat_id, user=chat_id)
+        await state.set_state(ReminderStates.waiting_confirmation)
+        await state.update_data(current_event=event_name, attempts=0, clarifications=0)
+        # schedule retry if needed
+        delay = cfg.get('retry_delay_seconds', 0)
+        retries = cfg.get('retries', 0)
+        if retries > 0:
+            job_id = f"retry_{event_name}_{chat_id}"
+            self.scheduler.add_job(self._handle_retry,
+                                   'date',
+                                   run_date=asyncio.get_event_loop().time() + delay,
+                                   args=[event_name, chat_id, 1],
+                                   id=job_id)
 
-        state.attempt += 1
-        logger.debug(
-            "Retry attempt %d for event '%s' chat %s",
-            state.attempt, event.event_name, event.chat_id
-        )
-
-        if state.attempt <= event.retries:
-            logger.debug(
-                "Sending retry message for event '%s' chat %s | attempt %d",
-                event.event_name, event.chat_id, state.attempt
-            )
-            await self.bot.send_message(event.chat_id, event.retry_text)
-
-        if state.attempt < event.retries and self.scheduler:
-            logger.debug(
-                "Rescheduling next retry for event '%s' chat %s",
-                event.event_name, event.chat_id
-            )
-            self._schedule_retry(event)
-        else:
-            logger.debug(
-                "Retries exhausted for event '%s' chat %s; logging failure and escalating",
-                event.event_name, event.chat_id
-            )
-            log.log(event.event_name, event.chat_id, "FAILED", state.attempt)
-            if event.escalate:
-                await escalation.escalate(self.bot, event.event_name, event.chat_id, state.attempt)
-
-    def mark_confirmed(self, chat_id: int, event_name: str) -> None:
-        state = _STATE.get(_key(chat_id, event_name))
-        if not state or state.confirmed:
-            logger.debug(
-                "Received confirmation for event '%s' chat %s but no pending state",
-                event_name, chat_id
-            )
+    async def _handle_retry(self, event_name, chat_id, attempt):
+        """Handle a retry attempt: send retry_text or escalate to clarification."""
+        cfg = DIALOGS['events'][event_name]
+        state: FSMContext = self.dp.current_state(chat=chat_id, user=chat_id)
+        data = await state.get_data()
+        if data.get('confirmed'):
             return
+        if attempt <= cfg.get('retries',0):
+            await self.bot.send_message(chat_id, cfg['retry_text'])
+            await state.update_data(attempts=attempt)
+            # schedule next
+            if attempt < cfg['retries']:
+                delay = cfg.get('retry_delay_seconds',0)
+                self.scheduler.add_job(self._handle_retry,
+                                       'date',
+                                       run_date=asyncio.get_event_loop().time()+delay,
+                                       args=[event_name, chat_id, attempt+1])
+            else:
+                # escalate to clarification
+                await self._start_clarification(event_name, chat_id)
 
-        state.confirmed = True
-        if state.retry_job_id and self.scheduler:
-            try:
-                self.scheduler.remove_job(state.retry_job_id)
-                logger.debug(
-                    "Cancelled retry job %s for event '%s' chat %s",
-                    state.retry_job_id, event_name, chat_id
-                )
-            except Exception as e:
-                logger.debug(
-                    "Error cancelling retry job %s: %s",
-                    state.retry_job_id, e
-                )
-        log.log(event_name, chat_id, "CONFIRMED", state.attempt)
-        logger.debug(
-            "Event '%s' chat %s confirmed at attempt %d",
-            event_name, chat_id, state.attempt
-        )
+    async def _start_clarification(self, event_name, chat_id):
+        cfg = DIALOGS['events'][event_name]
+        await self.bot.send_message(chat_id, cfg.get('clarify_text','Please confirm (OK)'))
+        state: FSMContext = self.dp.current_state(chat=chat_id, user=chat_id)
+        await state.set_state(ReminderStates.waiting_clarification)
+        await state.update_data(clarifications=1)
+        # schedule further clarifications similar to retries if needed
+
+    # Additional methods: cancel flow upon confirmation, escalation to nurse, etc.
