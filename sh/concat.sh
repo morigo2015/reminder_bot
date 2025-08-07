@@ -15,7 +15,7 @@
 
 # === Defaults ===
 output_file="concat_result.txt"
-exclude_folders=()
+exclude_folders=("__pycache__")
 
 # === Parse arguments ===
 output_given=false

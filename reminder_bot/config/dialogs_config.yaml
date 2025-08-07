@@ -22,7 +22,7 @@ messages:
 # Events
 events:
   morning_med:
-    trigger: "cron: 0 48"
+    trigger: "cron: 15 38"
     chat_id: 382163513
     retry_delay_seconds: 30
     main_text: 'Будь ласка, прийміть ранкові ліки 💊.'

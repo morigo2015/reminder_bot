@@ -1,5 +1,6 @@
 import logging
 import asyncio
+
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -69,14 +70,15 @@ async def main():
     dp.include_router(pressure_router)
     dp.include_router(status_router)
 
-    # Schedule flows from YAML
-    flow = FlowEngine(scheduler, manager)
-    flow.schedule_events()
+    # Schedule flows from YAML using FlowEngine
+    flow = FlowEngine(bot, dp, scheduler, log_service)
+    flow.start()
 
     # Log all scheduled jobs at startup
     for job in scheduler.get_jobs():
         logger.info(
-            f"[SCHEDULER STARTUP] Job {job.id!r}: trigger={job.trigger!r}, next_run={job.next_run_time}"
+            f"[SCHEDULER STARTUP] Job {job.id!r}: trigger={job.trigger!r}, "
+            f"next_run={job.next_run_time}"
         )
 
     # Start polling
