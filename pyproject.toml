@@ -1,0 +1,8 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+
+[project]
+name = "pillsbot"
+version = "0.1.0"
+description = "Telegram-first pill reminder bot with retries and escalation"
+requires-python = ">=3.11"
