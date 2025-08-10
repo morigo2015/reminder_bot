@@ -1,0 +1,59 @@
+2025-08-10 22:17:44 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-10 22:17:44 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='0:35' text='Вітамін Д' status='Pending'
+2025-08-10 22:17:44 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='20:00' text='Вітамін Д' status='Pending'
+2025-08-10 22:17:44 DEBUG pillsbot.engine — job.install job_id='dose_382163513_0:35' patient_id=382163513 time='0:35' text='Вітамін Д'
+2025-08-10 22:17:44 DEBUG pillsbot.engine — job.install job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-10 22:17:44 INFO pillsbot.engine — startup.cron job_id='dose_382163513_0:35' patient_id=382163513 time='0:35' text='Вітамін Д'
+2025-08-10 22:17:44 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-10 22:17:44 INFO pillsbot.app — startup.ready patients=1
+2025-08-10 22:17:44 DEBUG pillsbot.app — polling.start
+2025-08-10 22:17:44 DEBUG pillsbot.adapter — polling.run
+2025-08-10 22:20:23 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-10 22:20:23 INFO pillsbot.engine — startup.cron job_id='dose_382163513_0:35' patient_id=382163513 time='0:35' text='Вітамін Д'
+2025-08-10 22:20:23 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-10 22:20:23 INFO pillsbot.app — startup.ready patients=1
+2025-08-10 22:21:04 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-10 22:21:04 INFO pillsbot.engine — startup.cron job_id='dose_382163513_0:35' patient_id=382163513 time='0:35' text='Вітамін Д'
+2025-08-10 22:21:04 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-10 22:21:04 INFO pillsbot.app — startup.ready patients=1
+2025-08-10 22:22:20 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-10 22:22:20 INFO pillsbot.engine — startup.cron job_id='dose_382163513_1:22' patient_id=382163513 time='1:22' text='Вітамін Д'
+2025-08-10 22:22:20 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-10 22:22:20 INFO pillsbot.app — startup.ready patients=1
+2025-08-10 22:23:31 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-10 22:23:31 INFO pillsbot.engine — startup.cron job_id='dose_382163513_1:24' patient_id=382163513 time='1:24' text='Вітамін Д'
+2025-08-10 22:23:31 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-10 22:23:31 INFO pillsbot.app — startup.ready patients=1
+2025-08-10 22:24:00 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='час прийняти Вітамін Д'
+2025-08-10 22:24:30 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження'
+2025-08-10 22:24:38 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=382163513 text='Так'
+2025-08-10 22:24:38 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=382163513 text='Так'
+2025-08-10 22:24:38 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='підтвердження прийнято, дякую'
+2025-08-10 22:24:38 INFO pillsbot.engine — msg.engine.reply group_id=-1002690368389 template='confirm_ack'
+2025-08-10 22:27:29 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-10 22:27:29 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='1:28' text='Вітамін Д' status='Pending'
+2025-08-10 22:27:29 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='20:00' text='Вітамін Д' status='Pending'
+2025-08-10 22:27:29 DEBUG pillsbot.engine — job.install job_id='dose_382163513_1:28' patient_id=382163513 time='1:28' text='Вітамін Д'
+2025-08-10 22:27:29 DEBUG pillsbot.engine — job.install job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-10 22:27:29 INFO pillsbot.engine — startup.cron job_id='dose_382163513_1:28' patient_id=382163513 time='1:28' text='Вітамін Д'
+2025-08-10 22:27:29 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-10 22:27:29 INFO pillsbot.app — startup.ready patients=1
+2025-08-10 22:27:29 DEBUG pillsbot.app — polling.start
+2025-08-10 22:27:29 DEBUG pillsbot.adapter — polling.run
+2025-08-10 22:28:00 DEBUG pillsbot.engine — job.trigger patient_id=382163513 time='1:28'
+2025-08-10 22:28:00 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='час прийняти Вітамін Д'
+2025-08-10 22:28:00 DEBUG pillsbot.engine — state.status.change patient_id=382163513 time='1:28' from_status='Pending' to_status='AwaitingConfirmation' reason='first reminder sent'
+2025-08-10 22:28:00 DEBUG pillsbot.engine — job.retry.start patient_id=382163513 time='1:28' interval_s=30
+2025-08-10 22:28:30 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження'
+2025-08-10 22:28:30 DEBUG pillsbot.engine — job.retry.tick patient_id=382163513 time='1:28' attempt=2
+2025-08-10 22:28:48 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=382163513 text='Гггг'
+2025-08-10 22:28:48 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=382163513 text='Гггг'
+2025-08-10 22:28:48 DEBUG pillsbot.engine — msg.engine.noop reason='not a confirmation' text='Гггг'
+2025-08-10 22:29:00 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження'
+2025-08-10 22:29:00 DEBUG pillsbot.engine — job.retry.tick patient_id=382163513 time='1:28' attempt=3
+2025-08-10 22:29:19 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=382163513 text='Так'
+2025-08-10 22:29:19 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=382163513 text='Так'
+2025-08-10 22:29:19 DEBUG pillsbot.engine — job.retry.cancel patient_id=382163513 time='1:28'
+2025-08-10 22:29:19 DEBUG pillsbot.engine — state.status.change patient_id=382163513 time='1:28' from_status='AwaitingConfirmation' to_status='Confirmed' reason='patient confirmed'
+2025-08-10 22:29:19 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='підтвердження прийнято, дякую'
+2025-08-10 22:29:19 INFO pillsbot.engine — msg.engine.reply group_id=-1002690368389 template='confirm_ack'

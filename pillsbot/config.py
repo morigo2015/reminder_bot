@@ -26,21 +26,15 @@ TAKING_GRACE_INTERVAL_S = 600  # pre-confirm grace period in seconds
 # --------------------------------------------------------------------------------------
 # Confirmation message patterns
 # --------------------------------------------------------------------------------------
-# Explicit regex patterns that count as a confirmation.
-# Compiled with re.IGNORECASE | re.UNICODE by Matcher.
 CONFIRM_PATTERNS = [
-    # Core "OK" cases (Latin/Cyrillic look-alikes)
     r"[OoОо][KkКк]",
-    # Explicit word 'ok' (Latin) and 'ок' (Cyrillic) as standalone words
     r"\bok\b",
     r"\bок\b",
-    # Local language short confirms
-    r"\bтак\b",  # Ukrainian "yes/okay"
-    r"\bвже\b",  # Ukrainian "already/done"
-    r"\bда\b",  # Russian "yes"
-    r"\bокей\b",  # okay transliteration
-    r"\bдобре\b",  # Ukrainian "good/okay"
-    # Symbols and emoji
+    r"\bтак\b",
+    r"\bвже\b",
+    r"\bда\b",
+    r"\bокей\b",
+    r"\bдобре\b",
     r"\+",
     r"^\s*(✅|✔️|👍)\s*$",
     r"\bdone\b",
@@ -49,28 +43,29 @@ CONFIRM_PATTERNS = [
 # --------------------------------------------------------------------------------------
 # Logging
 # --------------------------------------------------------------------------------------
-LOG_FILE = "pillsbot/logs/pills.log"
+# CSV outcome file (unchanged name for backward compatibility with tests/tools)
+LOG_FILE = "pillsbot/logs/pills.csv"
+
+# Human-readable audit trail (separate from CSV)
+AUDIT_LOG_FILE = "pillsbot/logs/audit.log"
 
 # --------------------------------------------------------------------------------------
 # Patient roster (example/demo values; replace with real IDs)
 # --------------------------------------------------------------------------------------
 PATIENTS: list[dict[str, Any]] = [
     {
-        "patient_id": 382163513,  # Telegram user ID of patient
+        "patient_id": 382163513,
         "patient_label": "Іван Петров",
-        "group_id": -1002690368389,  # Telegram group ID for this triad
-        "nurse_user_id": 7391874317,  # Nurse personal account user ID
+        "group_id": -1002690368389,
+        "nurse_user_id": 7391874317,
         "doses": [
-            {"time": "0:35", "text": "Вітамін Д"},
+            {"time": "1:28", "text": "Вітамін Д"},
             {"time": "20:00", "text": "Вітамін Д"},
         ],
     },
 ]
 
 
-# --------------------------------------------------------------------------------------
-# Utility
-# --------------------------------------------------------------------------------------
 def get_bot_token() -> str:
     token = BOT_TOKEN or os.getenv("BOT_TOKEN")
     if not token:
