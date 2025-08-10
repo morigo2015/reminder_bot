@@ -19,7 +19,7 @@ TIMEZONE = "Europe/Kyiv"
 TZ = ZoneInfo(TIMEZONE)
 
 # Retry/escalation configuration
-RETRY_INTERVAL_S = 300  # I
+RETRY_INTERVAL_S = 30  # I
 MAX_RETRY_ATTEMPTS = 3  # N
 TAKING_GRACE_INTERVAL_S = 600  # pre-confirm grace period in seconds
 
@@ -61,7 +61,7 @@ PATIENTS: list[dict[str, Any]] = [
         "group_id": -1002690368389,  # Telegram group ID for this triad
         "nurse_user_id": 7391874317,  # Nurse personal account user ID
         "doses": [
-            {"time": "0:16", "text": "Вітамін Д"},
+            {"time": "0:35", "text": "Вітамін Д"},
             {"time": "20:00", "text": "Вітамін Д"},
         ],
     },

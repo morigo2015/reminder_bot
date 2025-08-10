@@ -141,7 +141,7 @@ class ReminderEngine:
         inst.retry_task = asyncio.create_task(self._retry_loop(inst))
 
     async def _retry_loop(self, inst: DoseInstance) -> None:
-        I = self.cfg.RETRY_INTERVAL_S
+        I = self.cfg.RETRY_INTERVAL_S  # noqa: E741
         N = self.cfg.MAX_RETRY_ATTEMPTS
         # We already sent attempt #1 in _start_dose_job
         while inst.status == "AwaitingConfirmation":
