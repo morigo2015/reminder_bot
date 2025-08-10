@@ -1,14 +1,19 @@
+# pillsbot/app.py
 from __future__ import annotations
 
 import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from . import config as cfg
-from .core.reminder_engine import ReminderEngine
-from .adapters.telegram_adapter import TelegramAdapter
+from pillsbot import config as cfg
+from pillsbot.core.config_validation import validate_config
+from pillsbot.core.reminder_engine import ReminderEngine
+from pillsbot.adapters.telegram_adapter import TelegramAdapter
+
 
 async def main() -> None:
-    cfg.validate()
+    # Validate configuration before starting anything
+    validate_config(cfg)
+
     token = cfg.get_bot_token()
 
     engine = ReminderEngine(cfg, adapter=None)  # temporary None to build adapter
@@ -22,6 +27,7 @@ async def main() -> None:
 
     # Run polling forever
     await adapter.run_polling()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

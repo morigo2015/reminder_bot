@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Dict, Tuple, Optional, Any, List
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, Optional, Any
 from zoneinfo import ZoneInfo
 import os
 
-from .matcher import Matcher
-from .i18n import fmt
+from pillsbot.core.matcher import Matcher
+from pillsbot.core.i18n import fmt
+
 
 @dataclass(frozen=True)
 class DoseKey:
     patient_id: int
-    date_str: str   # YYYY-MM-DD
-    time_str: str   # HH:MM
+    date_str: str  # YYYY-MM-DD
+    time_str: str  # HH:MM
+
 
 @dataclass
 class DoseInstance:
@@ -30,12 +32,14 @@ class DoseInstance:
     preconfirmed: bool = False
     retry_task: Optional[asyncio.Task] = None
 
+
 @dataclass
 class IncomingMessage:
     group_id: int
     sender_user_id: int
     text: str
     sent_at_utc: datetime
+
 
 class ReminderEngine:
     def __init__(self, config: Any, adapter: Any):
@@ -44,12 +48,24 @@ class ReminderEngine:
         self.tz: ZoneInfo = config.TZ
         self.matcher = Matcher(config.CONFIRM_PATTERNS)
         self.state: Dict[DoseKey, DoseInstance] = {}
-        self.group_to_patient: Dict[int, int] = {p["group_id"]: p["patient_id"] for p in config.PATIENTS}
-        self.patient_index: Dict[int, dict] = {p["patient_id"]: p for p in config.PATIENTS}
+        self.group_to_patient: Dict[int, int] = {
+            p["group_id"]: p["patient_id"] for p in config.PATIENTS
+        }
+        self.patient_index: Dict[int, dict] = {
+            p["patient_id"]: p for p in config.PATIENTS
+        }
         os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
 
     # --- Logging ---
-    def _log(self, when_local: datetime, patient_id: int, patient_label: str, pill_text: str, status: str, attempts: int) -> None:
+    def _log(
+        self,
+        when_local: datetime,
+        patient_id: int,
+        patient_label: str,
+        pill_text: str,
+        status: str,
+        attempts: int,
+    ) -> None:
         line = f"{when_local.strftime('%Y-%m-%d %H:%M')}, {patient_id}, {patient_label}, {pill_text}, {status}, {attempts}\n"
         with open(self.cfg.LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line)
@@ -71,7 +87,9 @@ class ReminderEngine:
                 key = self._get_dosekey(p["patient_id"], today, d["time"])
                 if key not in self.state:
                     hh, mm = map(int, d["time"].split(":"))
-                    sched = datetime.now(self.tz).replace(hour=hh, minute=mm, second=0, microsecond=0)
+                    sched = datetime.now(self.tz).replace(
+                        hour=hh, minute=mm, second=0, microsecond=0
+                    )
                     inst = DoseInstance(
                         dose_key=key,
                         patient_id=p["patient_id"],
@@ -113,7 +131,9 @@ class ReminderEngine:
             return  # preconfirmed earlier
 
         # Send first reminder
-        await self.adapter.send_group_message(inst.group_id, fmt("reminder", pill_text=inst.pill_text))
+        await self.adapter.send_group_message(
+            inst.group_id, fmt("reminder", pill_text=inst.pill_text)
+        )
         inst.status = "AwaitingConfirmation"
         inst.attempts_sent = 1
 
@@ -130,18 +150,37 @@ class ReminderEngine:
             if inst.status != "AwaitingConfirmation":
                 break
             if inst.attempts_sent < N:
-                await self.adapter.send_group_message(inst.group_id, fmt("repeat_reminder"))
+                await self.adapter.send_group_message(
+                    inst.group_id, fmt("repeat_reminder")
+                )
                 inst.attempts_sent += 1
             else:
                 # escalate
-                await self.adapter.send_group_message(inst.group_id, fmt("escalate_group"))
+                await self.adapter.send_group_message(
+                    inst.group_id, fmt("escalate_group")
+                )
                 when = inst.scheduled_dt_local
                 date = when.strftime("%Y-%m-%d")
                 time = when.strftime("%H:%M")
-                await self.adapter.send_nurse_dm(inst.nurse_user_id,
-                                                 fmt("escalate_dm", patient_label=inst.patient_label, date=date, time=time, pill_text=inst.pill_text))
+                await self.adapter.send_nurse_dm(
+                    inst.nurse_user_id,
+                    fmt(
+                        "escalate_dm",
+                        patient_label=inst.patient_label,
+                        date=date,
+                        time=time,
+                        pill_text=inst.pill_text,
+                    ),
+                )
                 inst.status = "Escalated"
-                self._log(inst.scheduled_dt_local, inst.patient_id, inst.patient_label, inst.pill_text, "Escalated", inst.attempts_sent)
+                self._log(
+                    inst.scheduled_dt_local,
+                    inst.patient_id,
+                    inst.patient_label,
+                    inst.pill_text,
+                    "Escalated",
+                    inst.attempts_sent,
+                )
                 break
 
     # --- Incoming messages from adapter ---
@@ -195,7 +234,14 @@ class ReminderEngine:
             target.status = "Confirmed"
             if target.retry_task and not target.retry_task.done():
                 target.retry_task.cancel()
-            self._log(target.scheduled_dt_local, target.patient_id, target.patient_label, target.pill_text, "OK", target.attempts_sent)
+            self._log(
+                target.scheduled_dt_local,
+                target.patient_id,
+                target.patient_label,
+                target.pill_text,
+                "OK",
+                target.attempts_sent,
+            )
             await self.adapter.send_group_message(target.group_id, fmt("confirm_ack"))
             return
 
@@ -205,7 +251,16 @@ class ReminderEngine:
             target.status = "Confirmed"
             target.preconfirmed = True
             target.attempts_sent = 0
-            self._log(target.scheduled_dt_local, target.patient_id, target.patient_label, target.pill_text, "OK", 0)
-            await self.adapter.send_group_message(target.group_id, fmt("preconfirm_ack"))
+            self._log(
+                target.scheduled_dt_local,
+                target.patient_id,
+                target.patient_label,
+                target.pill_text,
+                "OK",
+                0,
+            )
+            await self.adapter.send_group_message(
+                target.group_id, fmt("preconfirm_ack")
+            )
         else:
             await self.adapter.send_group_message(target.group_id, fmt("too_early"))

@@ -21,6 +21,17 @@
             "env": {
                 "PYTHONPATH": "${workspaceFolder}"
             }
+        },
+        {
+            "name": "Python Debugger: pillsbot/app.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/igor/med/pillsbot/app.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
         }
     ]
 }

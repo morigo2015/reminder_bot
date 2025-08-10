@@ -1,33 +1,50 @@
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Awaitable, Any
+from typing import Any, Iterable
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
-from aiogram.filters import ChatMemberUpdatedFilter
+
+# Import the dataclass defined at module scope in the engine
+from pillsbot.core.reminder_engine import IncomingMessage
+
 
 class TelegramAdapter:
     """Thin wrapper around aiogram to integrate with ReminderEngine."""
 
-    def __init__(self, bot_token: str, engine: Any, patient_groups: list[int]):
+    def __init__(
+        self, bot_token: str, engine: Any, patient_groups: Iterable[int]
+    ) -> None:
+        # aiogram Bot/Dispatcher
         self.bot = Bot(token=bot_token, parse_mode=None)
         self.dp = Dispatcher()
+
+        # backrefs / config
         self.engine = engine
         self.patient_groups = set(patient_groups)
 
-        @self.dp.message(F.chat.id.in_(self.patient_groups) & F.text)
-        async def on_group_text(msg: Message):
-            # Only raw patient text is forwarded; engine will re-check sender id
-            incoming = engine.IncomingMessage(
-                group_id=msg.chat.id,
-                sender_user_id=msg.from_user.id if msg.from_user else 0,
-                text=msg.text or "",
-                sent_at_utc=datetime.now(timezone.utc),
-            )
-            await self.engine.on_patient_message(incoming)
+        # register handlers
+        # We keep the filter simple and also re-check inside the handler
+        self.dp.message.register(self.on_group_text, F.text)
+
+    async def on_group_text(self, message: Message) -> None:
+        """Handle text messages in patient group chats and forward to the engine."""
+        chat_id = message.chat.id
+        if chat_id not in self.patient_groups:
+            return  # ignore messages from other chats
+
+        text = message.text or ""
+        sender_user_id = message.from_user.id if message.from_user else 0
+
+        incoming = IncomingMessage(
+            group_id=chat_id,
+            sender_user_id=sender_user_id,
+            text=text,
+            sent_at_utc=datetime.now(timezone.utc),
+        )
+
+        await self.engine.on_patient_message(incoming)
 
     async def send_group_message(self, group_id: int, text: str) -> None:
         await self.bot.send_message(chat_id=group_id, text=text)
@@ -38,6 +55,5 @@ class TelegramAdapter:
     async def run_polling(self) -> None:
         await self.dp.start_polling(self.bot)
 
-# expose IncomingMessage for adapter
-from pillsbot.core.reminder_engine import IncomingMessage  # noqa: E402
+
 __all__ = ["TelegramAdapter", "IncomingMessage"]
