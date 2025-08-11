@@ -12,6 +12,8 @@ import os
 from pillsbot.core.matcher import Matcher
 from pillsbot.core.i18n import fmt
 from pillsbot.core.logging_utils import kv
+from pillsbot.core.measurements import MeasurementRegistry
+from pillsbot.core.config_validation import validate_config
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,11 @@ class ReminderEngine:
         self.adapter = adapter
         self.tz: ZoneInfo = config.TZ
         self.matcher = Matcher(config.CONFIRM_PATTERNS)
+
+        # Measurement registry (empty if MEASURES not provided to remain compatible with older tests)
+        measures_cfg = getattr(config, "MEASURES", {}) or {}
+        self.measures = MeasurementRegistry(self.tz, measures_cfg)
+
         self.state: Dict[DoseKey, DoseInstance] = {}
         self.group_to_patient: Dict[int, int] = {
             p["group_id"]: p["patient_id"] for p in config.PATIENTS
@@ -94,7 +101,21 @@ class ReminderEngine:
         return DoseKey(patient_id, date_str, time_str)
 
     def _ensure_today_instances(self) -> None:
+        """Ensure today's dose instances exist; prune older-day instances."""
         today = self._today_str()
+
+        # prune anything not from today to prevent unbounded growth
+        if self.state:
+            to_keep: Dict[DoseKey, DoseInstance] = {
+                k: v for k, v in self.state.items() if k.date_str == today
+            }
+            if len(to_keep) != len(self.state):
+                self.log.debug(
+                    "state.prune " + kv(removed=len(self.state) - len(to_keep))
+                )
+            self.state = to_keep
+
+        # (re)create today's instances
         for p in self.cfg.PATIENTS:
             for d in p["doses"]:
                 key = self._get_dosekey(p["patient_id"], today, d["time"])
@@ -141,9 +162,13 @@ class ReminderEngine:
 
     async def start(self, scheduler) -> None:
         """Prepare state and install daily jobs into the APScheduler."""
+        # Validate configuration before installing any jobs
+        validate_config(self.cfg)
+
         self._ensure_today_instances()
 
         installed = []
+        # Dose jobs (existing)
         for p in self.cfg.PATIENTS:
             for d in p["doses"]:
                 hh, mm = map(int, d["time"].split(":"))
@@ -177,7 +202,53 @@ class ReminderEngine:
                     )
                 )
 
-        # On start list of cron jobs → startup.* → INFO
+        # Measurement daily checks (per patient–measure when configured)
+        for p in self.cfg.PATIENTS:
+            checks = p.get("measurement_checks", []) or []
+            for chk in checks:
+                mid = chk.get("measure_id")
+                t = chk.get("time")
+                if not mid or mid not in self.measures.available():
+                    self.log.debug(
+                        "mcheck.skip "
+                        + kv(
+                            patient_id=p["patient_id"],
+                            measure_id=mid,
+                            reason="unknown measure",
+                        )
+                    )
+                    continue
+                hh, mm = map(int, t.split(":"))
+                job_id = f"measure_check:{p['patient_id']}:{mid}:{t}"
+                scheduler.add_job(
+                    self._measurement_check_job,
+                    trigger="cron",
+                    hour=hh,
+                    minute=mm,
+                    timezone=self.tz,
+                    args=[p["patient_id"], mid],
+                    id=job_id,
+                    replace_existing=True,
+                )
+                self.log.debug(
+                    "job.install "
+                    + kv(
+                        job_id=job_id,
+                        patient_id=p["patient_id"],
+                        measure_id=mid,
+                        time=t,
+                    )
+                )
+                installed.append(
+                    dict(
+                        job_id=job_id,
+                        patient_id=p["patient_id"],
+                        time=t,
+                        text=f"check {mid}",
+                    )
+                )
+
+        # startup.* → INFO (trace all installed cron jobs)
         for j in installed:
             self.log.info(
                 "startup.cron "
@@ -285,6 +356,36 @@ class ReminderEngine:
                 )
                 break
 
+    async def _measurement_check_job(self, patient_id: int, measure_id: str) -> None:
+        """Daily check for missing measurement (group message only)."""
+        self.log.debug(
+            "job.trigger "
+            + kv(kind="measure_check", patient_id=patient_id, measure_id=measure_id)
+        )
+        patient = self.patient_index.get(patient_id)
+        if not patient:
+            self.log.debug(
+                "job.trigger.miss "
+                + kv(reason="unknown patient", patient_id=patient_id)
+            )
+            return
+
+        today = self._local_now().date()
+        if not self.measures.has_today(measure_id, patient_id, today):
+            label = self.measures.get_label(measure_id)
+            await self.adapter.send_group_message(
+                patient["group_id"],
+                fmt("measure_missing_today", measure_label=label),
+            )
+            self.log.info(
+                "msg.engine.reply "
+                + kv(
+                    group_id=patient["group_id"],
+                    template="measure_missing_today",
+                    measure_id=measure_id,
+                )
+            )
+
     # --- Incoming messages from adapter ---
     async def on_patient_message(self, msg: IncomingMessage) -> None:
         # Engine-level inbound (messaging → INFO)
@@ -307,10 +408,63 @@ class ReminderEngine:
             )
             return
 
+        patient = self.patient_index[pid]
         text = msg.text or ""
+
+        # 1) Measurements (start-anchored)
+        m = self.measures.match(text)
+        if m:
+            mid, body = m
+            parsed = self.measures.parse(mid, body)
+            if parsed.get("ok"):
+                now_local = self._local_now()
+                self.measures.append_csv(
+                    mid, now_local, pid, patient["patient_label"], parsed["values"]
+                )
+                await self.adapter.send_group_message(
+                    patient["group_id"],
+                    fmt("measure_ack", measure_label=self.measures.get_label(mid)),
+                )
+                self.log.info(
+                    "msg.engine.reply "
+                    + kv(
+                        group_id=patient["group_id"],
+                        template="measure_ack",
+                        measure_id=mid,
+                    )
+                )
+            else:
+                # Choose error message per parser_kind
+                md = self.measures.measures[mid]
+                if md.parser_kind == "int3":
+                    await self.adapter.send_group_message(
+                        patient["group_id"], fmt("measure_error_arity", expected=3)
+                    )
+                    template = "measure_error_arity"
+                else:
+                    await self.adapter.send_group_message(
+                        patient["group_id"], fmt("measure_error_one")
+                    )
+                    template = "measure_error_one"
+                self.log.info(
+                    "msg.engine.reply "
+                    + kv(
+                        group_id=patient["group_id"],
+                        template=template,
+                        measure_id=mid,
+                    )
+                )
+            return
+
+        # 2) Confirmations (existing semantics; search-anywhere)
         if not self.matcher.matches_confirmation(text):
-            self.log.debug(
-                "msg.engine.noop " + kv(reason="not a confirmation", text=text)
+            # 3) Unknown indicator (neither measurement nor confirmation)
+            await self.adapter.send_group_message(
+                patient["group_id"], fmt("measure_unknown")
+            )
+            self.log.info(
+                "msg.engine.reply "
+                + kv(group_id=patient["group_id"], template="measure_unknown")
             )
             return
 
@@ -318,7 +472,6 @@ class ReminderEngine:
         today = self._today_str()
 
         # Determine target dose
-        patient = self.patient_index[pid]
         upcoming: Optional[DoseInstance] = None
         min_dt = None
         for d in patient["doses"]:
@@ -356,6 +509,10 @@ class ReminderEngine:
         if target.status == "AwaitingConfirmation":
             if target.retry_task and not target.retry_task.done():
                 target.retry_task.cancel()
+                try:
+                    await target.retry_task
+                except asyncio.CancelledError:
+                    pass
                 self.log.debug(
                     "job.retry.cancel "
                     + kv(patient_id=target.patient_id, time=target.dose_key.time_str)
