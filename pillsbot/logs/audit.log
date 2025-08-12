@@ -99,3 +99,218 @@
 2025-08-11 19:30:51 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=382163513 text='Вага 98.5'
 2025-08-11 19:30:51 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='отримано показник Вага. Все ок.'
 2025-08-11 19:30:51 INFO pillsbot.engine — msg.engine.reply group_id=-1002690368389 template='measure_ack' measure_id='weight'
+2025-08-11 19:42:48 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-11 19:42:48 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='22:44' text='Вітамін Д' status='Pending'
+2025-08-11 19:42:48 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='20:00' text='Вітамін Д' status='Pending'
+2025-08-11 19:42:48 DEBUG pillsbot.engine — job.install job_id='dose_382163513_22:44' patient_id=382163513 time='22:44' text='Вітамін Д'
+2025-08-11 19:42:48 DEBUG pillsbot.engine — job.install job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-11 19:42:48 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 measure_id='pressure' time='21:00'
+2025-08-11 19:42:48 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:weight:21:00' patient_id=382163513 measure_id='weight' time='21:00'
+2025-08-11 19:42:48 INFO pillsbot.engine — startup.cron job_id='dose_382163513_22:44' patient_id=382163513 time='22:44' text='Вітамін Д'
+2025-08-11 19:42:48 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-11 19:42:48 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 time='21:00' text='check pressure'
+2025-08-11 19:42:48 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:weight:21:00' patient_id=382163513 time='21:00' text='check weight'
+2025-08-11 19:42:48 INFO pillsbot.app — startup.ready patients=1
+2025-08-11 19:42:48 DEBUG pillsbot.app — polling.start
+2025-08-11 19:42:48 DEBUG pillsbot.adapter — polling.run
+2025-08-11 19:44:00 DEBUG pillsbot.engine — job.trigger patient_id=382163513 time='22:44'
+2025-08-11 19:44:00 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='час прийняти Вітамін Д'
+2025-08-11 19:44:00 DEBUG pillsbot.engine — state.status.change patient_id=382163513 time='22:44' from_status='Pending' to_status='AwaitingConfirmation' reason='first reminder sent'
+2025-08-11 19:44:00 DEBUG pillsbot.engine — job.retry.start patient_id=382163513 time='22:44' interval_s=30
+2025-08-11 19:44:25 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=7391874317 text='Рщрщшщр'
+2025-08-11 19:44:25 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=7391874317 text='Рщрщшщр'
+2025-08-11 19:44:25 DEBUG pillsbot.engine — msg.engine.reject reason='unauthorized or unknown group' group_id=-1002690368389 sender_user_id=7391874317
+2025-08-11 19:44:30 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження'
+2025-08-11 19:44:30 DEBUG pillsbot.engine — job.retry.tick patient_id=382163513 time='22:44' attempt=2
+2025-08-11 19:45:00 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження'
+2025-08-11 19:45:00 DEBUG pillsbot.engine — job.retry.tick patient_id=382163513 time='22:44' attempt=3
+2025-08-11 19:45:23 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=7391874317 text='Так'
+2025-08-11 19:45:23 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=7391874317 text='Так'
+2025-08-11 19:45:23 DEBUG pillsbot.engine — msg.engine.reject reason='unauthorized or unknown group' group_id=-1002690368389 sender_user_id=7391874317
+2025-08-11 19:45:30 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження, залучаємо мед.сестру'
+2025-08-11 19:45:30 INFO pillsbot.adapter — msg.out.dm user_id=7391874317 text='пацієнт (Іван Петров): пропустив 2025-08-11 22:44, Вітамін Д'
+2025-08-11 19:45:30 DEBUG pillsbot.engine — state.status.change patient_id=382163513 time='22:44' from_status='AwaitingConfirmation' to_status='Escalated' reason='max retries exceeded'
+2025-08-11 19:45:30 DEBUG pillsbot.engine — job.retry.stop patient_id=382163513 time='22:44' reason='escalated'
+2025-08-11 19:46:29 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-11 19:46:29 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='22:47' text='Вітамін Д' status='Pending'
+2025-08-11 19:46:29 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='20:00' text='Вітамін Д' status='Pending'
+2025-08-11 19:46:29 DEBUG pillsbot.engine — job.install job_id='dose_382163513_22:47' patient_id=382163513 time='22:47' text='Вітамін Д'
+2025-08-11 19:46:29 DEBUG pillsbot.engine — job.install job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-11 19:46:29 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 measure_id='pressure' time='21:00'
+2025-08-11 19:46:29 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:weight:21:00' patient_id=382163513 measure_id='weight' time='21:00'
+2025-08-11 19:46:29 INFO pillsbot.engine — startup.cron job_id='dose_382163513_22:47' patient_id=382163513 time='22:47' text='Вітамін Д'
+2025-08-11 19:46:29 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-11 19:46:29 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 time='21:00' text='check pressure'
+2025-08-11 19:46:29 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:weight:21:00' patient_id=382163513 time='21:00' text='check weight'
+2025-08-11 19:46:29 INFO pillsbot.app — startup.ready patients=1
+2025-08-11 19:46:29 DEBUG pillsbot.app — polling.start
+2025-08-11 19:46:29 DEBUG pillsbot.adapter — polling.run
+2025-08-11 19:47:00 DEBUG pillsbot.engine — job.trigger patient_id=382163513 time='22:47'
+2025-08-11 19:47:00 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='час прийняти Вітамін Д'
+2025-08-11 19:47:00 DEBUG pillsbot.engine — state.status.change patient_id=382163513 time='22:47' from_status='Pending' to_status='AwaitingConfirmation' reason='first reminder sent'
+2025-08-11 19:47:00 DEBUG pillsbot.engine — job.retry.start patient_id=382163513 time='22:47' interval_s=30
+2025-08-11 19:47:07 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=7391874317 text='Так'
+2025-08-11 19:47:07 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=7391874317 text='Так'
+2025-08-11 19:47:07 DEBUG pillsbot.engine — msg.engine.reject reason='unauthorized or unknown group' group_id=-1002690368389 sender_user_id=7391874317
+2025-08-11 19:47:30 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження'
+2025-08-11 19:47:30 DEBUG pillsbot.engine — job.retry.tick patient_id=382163513 time='22:47' attempt=2
+2025-08-11 19:47:39 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=7391874317 text='так'
+2025-08-11 19:47:39 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=7391874317 text='так'
+2025-08-11 19:47:39 DEBUG pillsbot.engine — msg.engine.reject reason='unauthorized or unknown group' group_id=-1002690368389 sender_user_id=7391874317
+2025-08-11 19:48:00 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження'
+2025-08-11 19:48:00 DEBUG pillsbot.engine — job.retry.tick patient_id=382163513 time='22:47' attempt=3
+2025-08-11 19:48:08 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=7391874317 text='Ок'
+2025-08-11 19:48:08 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=7391874317 text='Ок'
+2025-08-11 19:48:08 DEBUG pillsbot.engine — msg.engine.reject reason='unauthorized or unknown group' group_id=-1002690368389 sender_user_id=7391874317
+2025-08-11 19:48:22 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=7391874317 text='OK'
+2025-08-11 19:48:22 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=7391874317 text='OK'
+2025-08-11 19:48:22 DEBUG pillsbot.engine — msg.engine.reject reason='unauthorized or unknown group' group_id=-1002690368389 sender_user_id=7391874317
+2025-08-11 19:48:30 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження, залучаємо мед.сестру'
+2025-08-11 19:48:30 INFO pillsbot.adapter — msg.out.dm user_id=7391874317 text='пацієнт (Іван Петров): пропустив 2025-08-11 22:47, Вітамін Д'
+2025-08-11 19:48:30 DEBUG pillsbot.engine — state.status.change patient_id=382163513 time='22:47' from_status='AwaitingConfirmation' to_status='Escalated' reason='max retries exceeded'
+2025-08-11 19:48:30 DEBUG pillsbot.engine — job.retry.stop patient_id=382163513 time='22:47' reason='escalated'
+2025-08-11 19:50:25 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-11 19:50:25 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='22:51' text='Вітамін Д' status='Pending'
+2025-08-11 19:50:25 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='20:00' text='Вітамін Д' status='Pending'
+2025-08-11 19:50:25 DEBUG pillsbot.engine — job.install job_id='dose_382163513_22:51' patient_id=382163513 time='22:51' text='Вітамін Д'
+2025-08-11 19:50:25 DEBUG pillsbot.engine — job.install job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-11 19:50:25 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 measure_id='pressure' time='21:00'
+2025-08-11 19:50:25 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:weight:21:00' patient_id=382163513 measure_id='weight' time='21:00'
+2025-08-11 19:50:25 INFO pillsbot.engine — startup.cron job_id='dose_382163513_22:51' patient_id=382163513 time='22:51' text='Вітамін Д'
+2025-08-11 19:50:25 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-11 19:50:25 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 time='21:00' text='check pressure'
+2025-08-11 19:50:25 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:weight:21:00' patient_id=382163513 time='21:00' text='check weight'
+2025-08-11 19:50:25 INFO pillsbot.app — startup.ready patients=1
+2025-08-11 19:50:25 DEBUG pillsbot.app — polling.start
+2025-08-11 19:50:25 DEBUG pillsbot.adapter — polling.run
+2025-08-11 19:51:00 DEBUG pillsbot.engine — job.trigger patient_id=382163513 time='22:51'
+2025-08-11 19:51:00 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='час прийняти Вітамін Д'
+2025-08-11 19:51:00 DEBUG pillsbot.engine — state.status.change patient_id=382163513 time='22:51' from_status='Pending' to_status='AwaitingConfirmation' reason='first reminder sent'
+2025-08-11 19:51:00 DEBUG pillsbot.engine — job.retry.start patient_id=382163513 time='22:51' interval_s=30
+2025-08-11 19:51:14 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=7391874317 text='Так'
+2025-08-11 19:51:14 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=7391874317 text='Так'
+2025-08-11 19:51:14 DEBUG pillsbot.engine — msg.engine.reject reason='unauthorized or unknown group' group_id=-1002690368389 sender_user_id=7391874317
+2025-08-11 19:51:30 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження'
+2025-08-11 19:51:30 DEBUG pillsbot.engine — job.retry.tick patient_id=382163513 time='22:51' attempt=2
+2025-08-11 19:52:00 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження'
+2025-08-11 19:52:00 DEBUG pillsbot.engine — job.retry.tick patient_id=382163513 time='22:51' attempt=3
+2025-08-12 10:45:27 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-12 10:45:27 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='22:51' text='Вітамін Д' status='Pending'
+2025-08-12 10:45:27 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='20:00' text='Вітамін Д' status='Pending'
+2025-08-12 10:45:27 DEBUG pillsbot.engine — job.install job_id='dose_382163513_22:51' patient_id=382163513 time='22:51' text='Вітамін Д'
+2025-08-12 10:45:27 DEBUG pillsbot.engine — job.install job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-12 10:45:27 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 measure_id='pressure' time='21:00'
+2025-08-12 10:45:27 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:weight:21:00' patient_id=382163513 measure_id='weight' time='21:00'
+2025-08-12 10:45:27 INFO pillsbot.engine — startup.cron job_id='dose_382163513_22:51' patient_id=382163513 time='22:51' text='Вітамін Д'
+2025-08-12 10:45:27 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-12 10:45:27 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 time='21:00' text='check pressure'
+2025-08-12 10:45:27 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:weight:21:00' patient_id=382163513 time='21:00' text='check weight'
+2025-08-12 10:45:27 INFO pillsbot.app — startup.ready patients=1
+2025-08-12 10:45:27 DEBUG pillsbot.app — polling.start
+2025-08-12 10:45:27 DEBUG pillsbot.adapter — polling.run
+2025-08-12 10:46:52 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=382163513 text='Hi there!'
+2025-08-12 10:47:43 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=382163513 text='Hi there!'
+2025-08-12 10:48:40 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='вибачте, помилка. невідомий показник'
+2025-08-12 10:49:03 INFO pillsbot.engine — msg.engine.reply group_id=-1002690368389 template='measure_unknown'
+2025-08-12 10:50:08 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-12 10:50:08 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='13:51' text='Вітамін Д' status='Pending'
+2025-08-12 10:50:08 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='20:00' text='Вітамін Д' status='Pending'
+2025-08-12 10:50:08 DEBUG pillsbot.engine — job.install job_id='dose_382163513_13:51' patient_id=382163513 time='13:51' text='Вітамін Д'
+2025-08-12 10:50:08 DEBUG pillsbot.engine — job.install job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-12 10:50:08 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 measure_id='pressure' time='21:00'
+2025-08-12 10:50:08 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:weight:21:00' patient_id=382163513 measure_id='weight' time='21:00'
+2025-08-12 10:50:08 INFO pillsbot.engine — startup.cron job_id='dose_382163513_13:51' patient_id=382163513 time='13:51' text='Вітамін Д'
+2025-08-12 10:50:08 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-12 10:50:08 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 time='21:00' text='check pressure'
+2025-08-12 10:50:08 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:weight:21:00' patient_id=382163513 time='21:00' text='check weight'
+2025-08-12 10:50:08 INFO pillsbot.app — startup.ready patients=1
+2025-08-12 10:50:08 DEBUG pillsbot.app — polling.start
+2025-08-12 10:50:08 DEBUG pillsbot.adapter — polling.run
+2025-08-12 10:51:00 DEBUG pillsbot.engine — job.trigger patient_id=382163513 time='13:51'
+2025-08-12 10:51:00 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='час прийняти Вітамін Д'
+2025-08-12 10:51:00 DEBUG pillsbot.engine — state.status.change patient_id=382163513 time='13:51' from_status='Pending' to_status='AwaitingConfirmation' reason='first reminder sent'
+2025-08-12 10:51:00 DEBUG pillsbot.engine — job.retry.start patient_id=382163513 time='13:51' interval_s=30
+2025-08-12 10:51:32 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=382163513 text='так'
+2025-08-12 10:51:32 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=382163513 text='так'
+2025-08-12 10:52:53 DEBUG pillsbot.engine — job.retry.cancel patient_id=382163513 time='13:51'
+2025-08-12 10:52:55 DEBUG pillsbot.engine — state.status.change patient_id=382163513 time='13:51' from_status='AwaitingConfirmation' to_status='Confirmed' reason='patient confirmed'
+2025-08-12 10:53:10 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='підтвердження прийнято, дякую'
+2025-08-12 10:53:19 INFO pillsbot.engine — msg.engine.reply group_id=-1002690368389 template='confirm_ack'
+2025-08-12 10:53:51 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=382163513 text='тиск 55 99 33'
+2025-08-12 10:53:51 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=382163513 text='тиск 55 99 33'
+2025-08-12 10:53:57 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='отримано показник Тиск. Все ок.'
+2025-08-12 10:53:57 INFO pillsbot.engine — msg.engine.reply group_id=-1002690368389 template='measure_ack' measure_id='pressure'
+2025-08-12 18:19:50 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-12 18:19:50 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='13:51' text='Вітамін Д' status='Pending'
+2025-08-12 18:19:50 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='20:00' text='Вітамін Д' status='Pending'
+2025-08-12 18:19:50 DEBUG pillsbot.engine — job.install job_id='dose_382163513_13:51' patient_id=382163513 time='13:51' text='Вітамін Д'
+2025-08-12 18:19:50 DEBUG pillsbot.engine — job.install job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-12 18:19:50 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 measure_id='pressure' time='21:00'
+2025-08-12 18:19:50 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:weight:21:00' patient_id=382163513 measure_id='weight' time='21:00'
+2025-08-12 18:19:50 INFO pillsbot.engine — startup.cron job_id='dose_382163513_13:51' patient_id=382163513 time='13:51' text='Вітамін Д'
+2025-08-12 18:19:50 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-12 18:19:50 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 time='21:00' text='check pressure'
+2025-08-12 18:19:50 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:weight:21:00' patient_id=382163513 time='21:00' text='check weight'
+2025-08-12 18:19:50 INFO pillsbot.app — startup.ready patients=1
+2025-08-12 18:19:50 DEBUG pillsbot.app — polling.start
+2025-08-12 18:19:50 DEBUG pillsbot.adapter — polling.run
+2025-08-12 18:21:03 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-12 18:21:03 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='21:21' text='Вітамін Д' status='Pending'
+2025-08-12 18:21:03 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='20:00' text='Вітамін Д' status='Pending'
+2025-08-12 18:21:03 DEBUG pillsbot.engine — job.install job_id='dose_382163513_21:21' patient_id=382163513 time='21:21' text='Вітамін Д'
+2025-08-12 18:21:03 DEBUG pillsbot.engine — job.install job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-12 18:21:03 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 measure_id='pressure' time='21:00'
+2025-08-12 18:21:03 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:weight:21:00' patient_id=382163513 measure_id='weight' time='21:00'
+2025-08-12 18:21:03 INFO pillsbot.engine — startup.cron job_id='dose_382163513_21:21' patient_id=382163513 time='21:21' text='Вітамін Д'
+2025-08-12 18:21:03 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-12 18:21:03 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 time='21:00' text='check pressure'
+2025-08-12 18:21:03 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:weight:21:00' patient_id=382163513 time='21:00' text='check weight'
+2025-08-12 18:21:03 INFO pillsbot.app — startup.ready patients=1
+2025-08-12 18:21:03 DEBUG pillsbot.app — polling.start
+2025-08-12 18:21:03 DEBUG pillsbot.adapter — polling.run
+2025-08-12 18:21:46 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-12 18:21:46 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='21:22' text='Вітамін Д' status='Pending'
+2025-08-12 18:21:46 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='20:00' text='Вітамін Д' status='Pending'
+2025-08-12 18:21:46 DEBUG pillsbot.engine — job.install job_id='dose_382163513_21:22' patient_id=382163513 time='21:22' text='Вітамін Д'
+2025-08-12 18:21:46 DEBUG pillsbot.engine — job.install job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-12 18:21:46 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 measure_id='pressure' time='21:00'
+2025-08-12 18:21:46 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:weight:21:00' patient_id=382163513 measure_id='weight' time='21:00'
+2025-08-12 18:21:46 INFO pillsbot.engine — startup.cron job_id='dose_382163513_21:22' patient_id=382163513 time='21:22' text='Вітамін Д'
+2025-08-12 18:21:46 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-12 18:21:46 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 time='21:00' text='check pressure'
+2025-08-12 18:21:46 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:weight:21:00' patient_id=382163513 time='21:00' text='check weight'
+2025-08-12 18:21:46 INFO pillsbot.app — startup.ready patients=1
+2025-08-12 18:21:46 DEBUG pillsbot.app — polling.start
+2025-08-12 18:21:46 DEBUG pillsbot.adapter — polling.run
+2025-08-12 18:22:00 DEBUG pillsbot.engine — job.trigger patient_id=382163513 time='21:22'
+2025-08-12 18:22:00 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='час прийняти Вітамін Д'
+2025-08-12 18:22:00 DEBUG pillsbot.engine — state.status.change patient_id=382163513 time='21:22' from_status='Pending' to_status='AwaitingConfirmation' reason='first reminder sent'
+2025-08-12 18:22:00 DEBUG pillsbot.engine — job.retry.start patient_id=382163513 time='21:22' interval_s=30
+2025-08-12 18:22:30 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження'
+2025-08-12 18:22:30 DEBUG pillsbot.engine — job.retry.tick patient_id=382163513 time='21:22' attempt=2
+2025-08-12 18:23:00 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження'
+2025-08-12 18:23:00 DEBUG pillsbot.engine — job.retry.tick patient_id=382163513 time='21:22' attempt=3
+2025-08-12 18:23:15 INFO pillsbot.adapter — msg.in.group group_id=-1002690368389 sender_user_id=382163513 text='/start'
+2025-08-12 18:23:15 INFO pillsbot.engine — msg.engine.in group_id=-1002690368389 sender_user_id=382163513 text='/start'
+2025-08-12 18:23:15 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='вибачте, помилка. невідомий показник'
+2025-08-12 18:23:15 INFO pillsbot.engine — msg.engine.reply group_id=-1002690368389 template='measure_unknown'
+2025-08-12 20:57:29 INFO pillsbot.app — startup.begin timezone='Europe/Kyiv'
+2025-08-12 20:57:29 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='23:58' text='Вітамін Д' status='Pending'
+2025-08-12 20:57:29 DEBUG pillsbot.engine — state.instance.create patient_id=382163513 time='20:00' text='Вітамін Д' status='Pending'
+2025-08-12 20:57:29 DEBUG pillsbot.engine — job.install job_id='dose_382163513_23:58' patient_id=382163513 time='23:58' text='Вітамін Д'
+2025-08-12 20:57:29 DEBUG pillsbot.engine — job.install job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-12 20:57:29 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 measure_id='pressure' time='21:00'
+2025-08-12 20:57:29 DEBUG pillsbot.engine — job.install job_id='measure_check:382163513:weight:21:00' patient_id=382163513 measure_id='weight' time='21:00'
+2025-08-12 20:57:29 INFO pillsbot.engine — startup.cron job_id='dose_382163513_23:58' patient_id=382163513 time='23:58' text='Вітамін Д'
+2025-08-12 20:57:29 INFO pillsbot.engine — startup.cron job_id='dose_382163513_20:00' patient_id=382163513 time='20:00' text='Вітамін Д'
+2025-08-12 20:57:29 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:pressure:21:00' patient_id=382163513 time='21:00' text='check pressure'
+2025-08-12 20:57:29 INFO pillsbot.engine — startup.cron job_id='measure_check:382163513:weight:21:00' patient_id=382163513 time='21:00' text='check weight'
+2025-08-12 20:57:29 INFO pillsbot.app — startup.ready patients=1
+2025-08-12 20:57:29 DEBUG pillsbot.app — polling.start
+2025-08-12 20:57:29 DEBUG pillsbot.adapter — polling.run
+2025-08-12 20:58:00 DEBUG pillsbot.engine — job.trigger patient_id=382163513 time='23:58'
+2025-08-12 20:58:00 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='час прийняти Вітамін Д'
+2025-08-12 20:58:00 DEBUG pillsbot.engine — state.status.change patient_id=382163513 time='23:58' from_status='Pending' to_status='AwaitingConfirmation' reason='first reminder sent'
+2025-08-12 20:58:00 DEBUG pillsbot.engine — job.retry.start patient_id=382163513 time='23:58' interval_s=30
+2025-08-12 20:58:30 INFO pillsbot.adapter — msg.out.group group_id=-1002690368389 text='не отримано підтвердження'
+2025-08-12 20:58:30 DEBUG pillsbot.engine — job.retry.tick patient_id=382163513 time='23:58' attempt=2

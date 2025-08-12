@@ -2,15 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 from zoneinfo import ZoneInfo
 import os
 
 from pillsbot.core.matcher import Matcher
-from pillsbot.core.i18n import fmt
+from pillsbot.core.i18n import fmt, MESSAGES
 from pillsbot.core.logging_utils import kv
 from pillsbot.core.measurements import MeasurementRegistry
 from pillsbot.core.config_validation import validate_config
@@ -36,6 +37,8 @@ class DoseInstance:
     attempts_sent: int = 0
     preconfirmed: bool = False
     retry_task: Optional[asyncio.Task] = None
+    # v3: keep message_ids of reminders/retries (for trace/debug; no edits performed)
+    last_message_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -53,7 +56,7 @@ class ReminderEngine:
         self.tz: ZoneInfo = config.TZ
         self.matcher = Matcher(config.CONFIRM_PATTERNS)
 
-        # Measurement registry (empty if MEASURES not provided to remain compatible with older tests)
+        # Measurement registry
         measures_cfg = getattr(config, "MEASURES", {}) or {}
         self.measures = MeasurementRegistry(self.tz, measures_cfg)
 
@@ -280,10 +283,15 @@ class ReminderEngine:
             )
             return  # preconfirmed earlier
 
-        # First reminder (messaging → INFO)
-        await self.adapter.send_group_message(
-            inst.group_id, fmt("reminder", pill_text=inst.pill_text)
+        # First reminder (v3: attach inline confirm button)
+        kb_inline = self.adapter.build_confirm_inline_kb(inst.dose_key)
+        msg_id = await self.adapter.send_group_message(
+            inst.group_id,
+            fmt("reminder", pill_text=inst.pill_text),
+            reply_markup=kb_inline,
         )
+        inst.last_message_ids.append(msg_id)
+
         self._set_status(inst, "AwaitingConfirmation", reason="first reminder sent")
         inst.attempts_sent = 1
 
@@ -305,10 +313,12 @@ class ReminderEngine:
             if inst.status != "AwaitingConfirmation":
                 break
             if inst.attempts_sent < N:
-                # Messaging → INFO
-                await self.adapter.send_group_message(
-                    inst.group_id, fmt("repeat_reminder")
+                # Repeat reminder with inline button again
+                kb_inline = self.adapter.build_confirm_inline_kb(inst.dose_key)
+                msg_id = await self.adapter.send_group_message(
+                    inst.group_id, fmt("repeat_reminder"), reply_markup=kb_inline
                 )
+                inst.last_message_ids.append(msg_id)
                 inst.attempts_sent += 1
                 self.log.debug(
                     "job.retry.tick "
@@ -319,14 +329,16 @@ class ReminderEngine:
                     )
                 )
             else:
-                # Messaging → INFO
+                # Escalation: no new inline buttons here; keep existing ones on prior messages
+                kb_fixed = self.adapter.build_patient_reply_kb(
+                    self.patient_index[inst.patient_id]
+                )
                 await self.adapter.send_group_message(
-                    inst.group_id, fmt("escalate_group")
+                    inst.group_id, fmt("escalate_group"), reply_markup=kb_fixed
                 )
                 when = inst.scheduled_dt_local
                 date = when.strftime("%Y-%m-%d")
                 time = when.strftime("%H:%M")
-                # Messaging → INFO
                 await self.adapter.send_nurse_dm(
                     inst.nurse_user_id,
                     fmt(
@@ -373,9 +385,11 @@ class ReminderEngine:
         today = self._local_now().date()
         if not self.measures.has_today(measure_id, patient_id, today):
             label = self.measures.get_label(measure_id)
+            kb_fixed = self.adapter.build_patient_reply_kb(patient)
             await self.adapter.send_group_message(
                 patient["group_id"],
                 fmt("measure_missing_today", measure_label=label),
+                reply_markup=kb_fixed,
             )
             self.log.info(
                 "msg.engine.reply "
@@ -409,7 +423,42 @@ class ReminderEngine:
             return
 
         patient = self.patient_index[pid]
-        text = msg.text or ""
+        text = (msg.text or "").strip()
+
+        # 0) v3: Button-driven flows (before measurement parsing)
+        low = text.lower()
+        if low == MESSAGES["btn_pressure"].lower():
+            await self.adapter.send_group_message(
+                patient["group_id"],
+                fmt("prompt_pressure"),
+                reply_markup=self.adapter.build_force_reply(),
+            )
+            self.log.info(
+                "msg.engine.reply "
+                + kv(group_id=patient["group_id"], template="prompt_pressure")
+            )
+            return
+        if low == MESSAGES["btn_weight"].lower():
+            await self.adapter.send_group_message(
+                patient["group_id"],
+                fmt("prompt_weight"),
+                reply_markup=self.adapter.build_force_reply(),
+            )
+            self.log.info(
+                "msg.engine.reply "
+                + kv(group_id=patient["group_id"], template="prompt_weight")
+            )
+            return
+        if low == MESSAGES["btn_help"].lower():
+            kb_fixed = self.adapter.build_patient_reply_kb(patient)
+            await self.adapter.send_group_message(
+                patient["group_id"], fmt("help_brief"), reply_markup=kb_fixed
+            )
+            self.log.info(
+                "msg.engine.reply "
+                + kv(group_id=patient["group_id"], template="help_brief")
+            )
+            return
 
         # 1) Measurements (start-anchored)
         m = self.measures.match(text)
@@ -421,9 +470,11 @@ class ReminderEngine:
                 self.measures.append_csv(
                     mid, now_local, pid, patient["patient_label"], parsed["values"]
                 )
+                kb_fixed = self.adapter.build_patient_reply_kb(patient)
                 await self.adapter.send_group_message(
                     patient["group_id"],
                     fmt("measure_ack", measure_label=self.measures.get_label(mid)),
+                    reply_markup=kb_fixed,
                 )
                 self.log.info(
                     "msg.engine.reply "
@@ -436,14 +487,19 @@ class ReminderEngine:
             else:
                 # Choose error message per parser_kind
                 md = self.measures.measures[mid]
+                kb_fixed = self.adapter.build_patient_reply_kb(patient)
                 if md.parser_kind == "int3":
                     await self.adapter.send_group_message(
-                        patient["group_id"], fmt("measure_error_arity", expected=3)
+                        patient["group_id"],
+                        fmt("measure_error_arity", expected=3),
+                        reply_markup=kb_fixed,
                     )
                     template = "measure_error_arity"
                 else:
                     await self.adapter.send_group_message(
-                        patient["group_id"], fmt("measure_error_one")
+                        patient["group_id"],
+                        fmt("measure_error_one"),
+                        reply_markup=kb_fixed,
                     )
                     template = "measure_error_one"
                 self.log.info(
@@ -459,8 +515,9 @@ class ReminderEngine:
         # 2) Confirmations (existing semantics; search-anywhere)
         if not self.matcher.matches_confirmation(text):
             # 3) Unknown indicator (neither measurement nor confirmation)
+            kb_fixed = self.adapter.build_patient_reply_kb(patient)
             await self.adapter.send_group_message(
-                patient["group_id"], fmt("measure_unknown")
+                patient["group_id"], fmt("measure_unknown"), reply_markup=kb_fixed
             )
             self.log.info(
                 "msg.engine.reply "
@@ -495,7 +552,10 @@ class ReminderEngine:
         target = awaiting_now or upcoming
 
         if target is None:
-            await self.adapter.send_group_message(patient["group_id"], fmt("too_early"))
+            kb_fixed = self.adapter.build_patient_reply_kb(patient)
+            await self.adapter.send_group_message(
+                patient["group_id"], fmt("too_early"), reply_markup=kb_fixed
+            )
             self.log.info(
                 "msg.engine.reply "
                 + kv(
@@ -509,10 +569,8 @@ class ReminderEngine:
         if target.status == "AwaitingConfirmation":
             if target.retry_task and not target.retry_task.done():
                 target.retry_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await target.retry_task
-                except asyncio.CancelledError:
-                    pass
                 self.log.debug(
                     "job.retry.cancel "
                     + kv(patient_id=target.patient_id, time=target.dose_key.time_str)
@@ -526,7 +584,10 @@ class ReminderEngine:
                 "OK",
                 target.attempts_sent,
             )
-            await self.adapter.send_group_message(target.group_id, fmt("confirm_ack"))
+            kb_fixed = self.adapter.build_patient_reply_kb(patient)
+            await self.adapter.send_group_message(
+                target.group_id, fmt("confirm_ack"), reply_markup=kb_fixed
+            )
             self.log.info(
                 "msg.engine.reply "
                 + kv(group_id=target.group_id, template="confirm_ack")
@@ -547,15 +608,19 @@ class ReminderEngine:
                 "OK",
                 0,
             )
+            kb_fixed = self.adapter.build_patient_reply_kb(patient)
             await self.adapter.send_group_message(
-                target.group_id, fmt("preconfirm_ack")
+                target.group_id, fmt("preconfirm_ack"), reply_markup=kb_fixed
             )
             self.log.info(
                 "msg.engine.reply "
                 + kv(group_id=target.group_id, template="preconfirm_ack")
             )
         else:
-            await self.adapter.send_group_message(target.group_id, fmt("too_early"))
+            kb_fixed = self.adapter.build_patient_reply_kb(patient)
+            await self.adapter.send_group_message(
+                target.group_id, fmt("too_early"), reply_markup=kb_fixed
+            )
             self.log.info(
                 "msg.engine.reply "
                 + kv(
@@ -564,3 +629,84 @@ class ReminderEngine:
                     reason="outside grace",
                 )
             )
+
+    # --- Inline confirmation callback entry (v3) ---
+    async def on_inline_confirm(
+        self, group_id: int, from_user_id: int, data: str
+    ) -> dict:
+        """
+        Process inline 'confirm taken' button presses.
+
+        Returns a dict like {"cb_text": "...", "show_alert": False} for the adapter
+        to answer the callback ephemerally. On success, we send normal group acks and
+        keep the callback silent (cb_text=None).
+        """
+        # Validate group ↔ patient mapping and payload
+        expected_pid = self.group_to_patient.get(group_id)
+        if expected_pid is None or from_user_id != expected_pid:
+            # Someone else pressed the button in the group
+            return {"cb_text": fmt("cb_only_patient"), "show_alert": False}
+
+        parts = (data or "").split(":")
+        if len(parts) != 4 or parts[0] != "confirm":
+            return {"cb_text": fmt("cb_no_target"), "show_alert": False}
+
+        try:
+            pid = int(parts[1])
+            date_s = parts[2]
+            time_s = parts[3]
+        except Exception:
+            return {"cb_text": fmt("cb_no_target"), "show_alert": False}
+
+        if pid != expected_pid:
+            return {"cb_text": fmt("cb_no_target"), "show_alert": False}
+
+        key = DoseKey(pid, date_s, time_s)
+        inst = self.state.get(key)
+        if not inst:
+            return {"cb_text": fmt("cb_no_target"), "show_alert": False}
+
+        if inst.status == "Confirmed":
+            return {"cb_text": fmt("cb_already_done"), "show_alert": False}
+
+        if inst.status not in ("AwaitingConfirmation", "Escalated"):
+            # No actionable state
+            return {"cb_text": fmt("cb_no_target"), "show_alert": False}
+
+        # Confirm now
+        previous_status = inst.status
+
+        if inst.retry_task and not inst.retry_task.done():
+            inst.retry_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await inst.retry_task
+            self.log.debug(
+                "job.retry.cancel "
+                + kv(patient_id=inst.patient_id, time=inst.dose_key.time_str)
+            )
+
+        self._set_status(inst, "Confirmed", reason="inline button")
+        self._log_outcome_csv(
+            inst.scheduled_dt_local,
+            inst.patient_id,
+            inst.patient_label,
+            inst.pill_text,
+            "OK",
+            inst.attempts_sent,
+        )
+
+        # Group ack with fixed reply keyboard
+        patient = self.patient_index.get(inst.patient_id)
+        kb_fixed = self.adapter.build_patient_reply_kb(patient)
+        await self.adapter.send_group_message(
+            inst.group_id, fmt("confirm_ack"), reply_markup=kb_fixed
+        )
+
+        # Optionally notify nurse if confirmation came after escalation
+        if previous_status == "Escalated":
+            # Keep text concise; i18n key not required by spec (optional DM).
+            msg = f"Пізнє підтвердження: {inst.patient_label} за {inst.dose_key.date_str} {inst.dose_key.time_str} — OK."
+            await self.adapter.send_nurse_dm(inst.nurse_user_id, msg)
+
+        # Silent callback OK
+        return {"cb_text": None, "show_alert": False}
