@@ -6,7 +6,8 @@ import contextlib
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Optional, Any, List
+from enum import Enum
+from typing import Dict, Optional, Any, List, Tuple
 from zoneinfo import ZoneInfo
 import os
 
@@ -17,11 +18,34 @@ from pillsbot.core.measurements import MeasurementRegistry
 from pillsbot.core.config_validation import validate_config
 
 
+# --------------------------------------------------------------------------------------
+# Public data structures kept here so other modules (adapters) don't need to change
+# --------------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class DoseKey:
     patient_id: int
-    date_str: str  # YYYY-MM-DD
+    date_str: str  # YYYY-MM-DD (engine-local string)
     time_str: str  # HH:MM
+
+
+@dataclass
+class IncomingMessage:
+    group_id: int
+    sender_user_id: int
+    text: str
+    sent_at_utc: datetime
+
+
+# --------------------------------------------------------------------------------------
+# Internal helpers / small types
+# --------------------------------------------------------------------------------------
+class Status(Enum):
+    """Internal status enum; stored as strings on instances for compatibility."""
+
+    PENDING = "Pending"
+    AWAITING = "AwaitingConfirmation"
+    CONFIRMED = "Confirmed"
+    ESCALATED = "Escalated"
 
 
 @dataclass
@@ -33,33 +57,53 @@ class DoseInstance:
     nurse_user_id: int
     pill_text: str
     scheduled_dt_local: datetime
-    status: str = "Pending"  # Pending | AwaitingConfirmation | Confirmed | Escalated
+    status: str = Status.PENDING.value
     attempts_sent: int = 0
     preconfirmed: bool = False
     retry_task: Optional[asyncio.Task] = None
-    # v3: keep message_ids of reminders/retries (for trace/debug; no edits performed)
-    last_message_ids: List[int] = field(default_factory=list)
+    last_message_ids: List[int] = field(default_factory=list)  # debug/trace only
 
 
-@dataclass
-class IncomingMessage:
-    group_id: int
-    sender_user_id: int
-    text: str
-    sent_at_utc: datetime
+class Clock:
+    """Injectable time source (simple & testable)."""
+
+    def __init__(self, tz: ZoneInfo):
+        self.tz = tz
+
+    def now(self) -> datetime:
+        return datetime.now(self.tz)
+
+    def today_str(self) -> str:
+        return self.now().strftime("%Y-%m-%d")
 
 
+# --------------------------------------------------------------------------------------
+# ReminderEngine
+# --------------------------------------------------------------------------------------
 class ReminderEngine:
-    def __init__(self, config: Any, adapter: Any):
+    """
+    v3 engine, refactored to be simpler & more debuggable:
+    - explicit helpers for state/retry/selection/replies
+    - status via small Enum (stored as strings for compatibility)
+    - inline-callback resolution by message_id (robust) with fallbacks
+    Public API unchanged except on_inline_confirm gains message_id.
+    """
+
+    # ---- lifecycle -------------------------------------------------------------------
+    def __init__(self, config: Any, adapter: Any, clock: Optional[Clock] = None):
         self.cfg = config
         self.adapter = adapter
         self.tz: ZoneInfo = config.TZ
+        self.clock = clock or Clock(self.tz)
+
+        # Natural language bits
         self.matcher = Matcher(config.CONFIRM_PATTERNS)
 
-        # Measurement registry
+        # Measurements
         measures_cfg = getattr(config, "MEASURES", {}) or {}
         self.measures = MeasurementRegistry(self.tz, measures_cfg)
 
+        # State
         self.state: Dict[DoseKey, DoseInstance] = {}
         self.group_to_patient: Dict[int, int] = {
             p["group_id"]: p["patient_id"] for p in config.PATIENTS
@@ -68,116 +112,32 @@ class ReminderEngine:
             p["patient_id"]: p for p in config.PATIENTS
         }
 
+        # Map sent Telegram message_id -> DoseKey (for robust inline callback resolution)
+        self.msg_to_key: Dict[int, DoseKey] = {}
+
+        # Filesystem
         os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
         os.makedirs(
             os.path.dirname(getattr(config, "AUDIT_LOG_FILE", "pillsbot/logs")),
             exist_ok=True,
         )
 
+        # Logging
         self.log = logging.getLogger("pillsbot.engine")
 
-    # --- CSV outcome log (flat file analytics; stays separate from audit log) ---
-    def _log_outcome_csv(
-        self,
-        when_local: datetime,
-        patient_id: int,
-        patient_label: str,
-        pill_text: str,
-        status: str,
-        attempts: int,
-    ) -> None:
-        line = (
-            f"{when_local.strftime('%Y-%m-%d %H:%M')}, "
-            f"{patient_id}, {patient_label}, {pill_text}, {status}, {attempts}\n"
-        )
-        with open(self.cfg.LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
-
-    # --- Helpers ---
-    def _today_str(self) -> str:
-        return datetime.now(self.tz).strftime("%Y-%m-%d")
-
-    def _local_now(self) -> datetime:
-        return datetime.now(self.tz)
-
-    def _get_dosekey(self, patient_id: int, date_str: str, time_str: str) -> DoseKey:
-        return DoseKey(patient_id, date_str, time_str)
-
-    def _ensure_today_instances(self) -> None:
-        """Ensure today's dose instances exist; prune older-day instances."""
-        today = self._today_str()
-
-        # prune anything not from today to prevent unbounded growth
-        if self.state:
-            to_keep: Dict[DoseKey, DoseInstance] = {
-                k: v for k, v in self.state.items() if k.date_str == today
-            }
-            if len(to_keep) != len(self.state):
-                self.log.debug(
-                    "state.prune " + kv(removed=len(self.state) - len(to_keep))
-                )
-            self.state = to_keep
-
-        # (re)create today's instances
-        for p in self.cfg.PATIENTS:
-            for d in p["doses"]:
-                key = self._get_dosekey(p["patient_id"], today, d["time"])
-                if key not in self.state:
-                    hh, mm = map(int, d["time"].split(":"))
-                    sched = datetime.now(self.tz).replace(
-                        hour=hh, minute=mm, second=0, microsecond=0
-                    )
-                    inst = DoseInstance(
-                        dose_key=key,
-                        patient_id=p["patient_id"],
-                        patient_label=p["patient_label"],
-                        group_id=p["group_id"],
-                        nurse_user_id=p["nurse_user_id"],
-                        pill_text=d["text"],
-                        scheduled_dt_local=sched,
-                    )
-                    self.state[key] = inst
-                    # Creation is not messaging → DEBUG
-                    self.log.debug(
-                        "state.instance.create "
-                        + kv(
-                            patient_id=inst.patient_id,
-                            time=d["time"],
-                            text=inst.pill_text,
-                            status=inst.status,
-                        )
-                    )
-
-    def _set_status(self, inst: DoseInstance, new_status: str, reason: str) -> None:
-        old = inst.status
-        inst.status = new_status
-        # State/status changes → DEBUG
-        self.log.debug(
-            "state.status.change "
-            + kv(
-                patient_id=inst.patient_id,
-                time=inst.dose_key.time_str,
-                from_status=old,
-                to_status=new_status,
-                reason=reason,
-            )
-        )
-
     async def start(self, scheduler) -> None:
-        """Prepare state and install daily jobs into the APScheduler."""
-        # Validate configuration before installing any jobs
+        """Validate config, seed today's state, and install recurring jobs."""
         validate_config(self.cfg)
-
         self._ensure_today_instances()
 
-        installed = []
-        # Dose jobs (existing)
+        installed: List[dict] = []
+        # Dose jobs
         for p in self.cfg.PATIENTS:
             for d in p["doses"]:
                 hh, mm = map(int, d["time"].split(":"))
                 job_id = f"dose_{p['patient_id']}_{d['time']}"
                 scheduler.add_job(
-                    self._start_dose_job,
+                    self._job_start_dose,
                     trigger="cron",
                     hour=hh,
                     minute=mm,
@@ -186,7 +146,6 @@ class ReminderEngine:
                     id=job_id,
                     replace_existing=True,
                 )
-                # Job creation → DEBUG
                 self.log.debug(
                     "job.install "
                     + kv(
@@ -205,7 +164,7 @@ class ReminderEngine:
                     )
                 )
 
-        # Measurement daily checks (per patient–measure when configured)
+        # Measurement checks
         for p in self.cfg.PATIENTS:
             checks = p.get("measurement_checks", []) or []
             for chk in checks:
@@ -224,7 +183,7 @@ class ReminderEngine:
                 hh, mm = map(int, t.split(":"))
                 job_id = f"measure_check:{p['patient_id']}:{mid}:{t}"
                 scheduler.add_job(
-                    self._measurement_check_job,
+                    self._job_measure_check,
                     trigger="cron",
                     hour=hh,
                     minute=mm,
@@ -251,7 +210,7 @@ class ReminderEngine:
                     )
                 )
 
-        # startup.* → INFO (trace all installed cron jobs)
+        # Single INFO line per job on startup for visibility
         for j in installed:
             self.log.info(
                 "startup.cron "
@@ -263,150 +222,15 @@ class ReminderEngine:
                 )
             )
 
-    async def _start_dose_job(self, patient_id: int, time_str: str) -> None:
-        """Called by scheduler at dose time in Europe/Kyiv."""
-        # Triggering is not messaging → DEBUG
-        self.log.debug("job.trigger " + kv(patient_id=patient_id, time=time_str))
-
-        self._ensure_today_instances()
-        key = self._get_dosekey(patient_id, self._today_str(), time_str)
-        inst = self.state.get(key)
-        if not inst:
-            self.log.debug(
-                "job.trigger.miss " + kv(patient_id=patient_id, time=time_str)
-            )
-            return
-        if inst.status == "Confirmed":
-            self.log.debug(
-                "job.trigger.skip "
-                + kv(patient_id=patient_id, time=time_str, reason="already confirmed")
-            )
-            return  # preconfirmed earlier
-
-        # First reminder (v3: attach inline confirm button)
-        kb_inline = self.adapter.build_confirm_inline_kb(inst.dose_key)
-        msg_id = await self.adapter.send_group_message(
-            inst.group_id,
-            fmt("reminder", pill_text=inst.pill_text),
-            reply_markup=kb_inline,
-        )
-        inst.last_message_ids.append(msg_id)
-
-        self._set_status(inst, "AwaitingConfirmation", reason="first reminder sent")
-        inst.attempts_sent = 1
-
-        inst.retry_task = asyncio.create_task(self._retry_loop(inst))
-        self.log.debug(
-            "job.retry.start "
-            + kv(
-                patient_id=inst.patient_id,
-                time=time_str,
-                interval_s=self.cfg.RETRY_INTERVAL_S,
-            )
-        )
-
-    async def _retry_loop(self, inst: DoseInstance) -> None:
-        I = self.cfg.RETRY_INTERVAL_S  # noqa: E741
-        N = self.cfg.MAX_RETRY_ATTEMPTS
-        while inst.status == "AwaitingConfirmation":
-            await asyncio.sleep(I)
-            if inst.status != "AwaitingConfirmation":
-                break
-            if inst.attempts_sent < N:
-                # Repeat reminder with inline button again
-                kb_inline = self.adapter.build_confirm_inline_kb(inst.dose_key)
-                msg_id = await self.adapter.send_group_message(
-                    inst.group_id, fmt("repeat_reminder"), reply_markup=kb_inline
-                )
-                inst.last_message_ids.append(msg_id)
-                inst.attempts_sent += 1
-                self.log.debug(
-                    "job.retry.tick "
-                    + kv(
-                        patient_id=inst.patient_id,
-                        time=inst.dose_key.time_str,
-                        attempt=inst.attempts_sent,
-                    )
-                )
-            else:
-                # Escalation: no new inline buttons here; keep existing ones on prior messages
-                kb_fixed = self.adapter.build_patient_reply_kb(
-                    self.patient_index[inst.patient_id]
-                )
-                await self.adapter.send_group_message(
-                    inst.group_id, fmt("escalate_group"), reply_markup=kb_fixed
-                )
-                when = inst.scheduled_dt_local
-                date = when.strftime("%Y-%m-%d")
-                time = when.strftime("%H:%M")
-                await self.adapter.send_nurse_dm(
-                    inst.nurse_user_id,
-                    fmt(
-                        "escalate_dm",
-                        patient_label=inst.patient_label,
-                        date=date,
-                        time=time,
-                        pill_text=inst.pill_text,
-                    ),
-                )
-                self._set_status(inst, "Escalated", reason="max retries exceeded")
-                self._log_outcome_csv(
-                    inst.scheduled_dt_local,
-                    inst.patient_id,
-                    inst.patient_label,
-                    inst.pill_text,
-                    "Escalated",
-                    inst.attempts_sent,
-                )
-                self.log.debug(
-                    "job.retry.stop "
-                    + kv(
-                        patient_id=inst.patient_id,
-                        time=inst.dose_key.time_str,
-                        reason="escalated",
-                    )
-                )
-                break
-
-    async def _measurement_check_job(self, patient_id: int, measure_id: str) -> None:
-        """Daily check for missing measurement (group message only)."""
-        self.log.debug(
-            "job.trigger "
-            + kv(kind="measure_check", patient_id=patient_id, measure_id=measure_id)
-        )
-        patient = self.patient_index.get(patient_id)
-        if not patient:
-            self.log.debug(
-                "job.trigger.miss "
-                + kv(reason="unknown patient", patient_id=patient_id)
-            )
-            return
-
-        today = self._local_now().date()
-        if not self.measures.has_today(measure_id, patient_id, today):
-            label = self.measures.get_label(measure_id)
-            kb_fixed = self.adapter.build_patient_reply_kb(patient)
-            await self.adapter.send_group_message(
-                patient["group_id"],
-                fmt("measure_missing_today", measure_label=label),
-                reply_markup=kb_fixed,
-            )
-            self.log.info(
-                "msg.engine.reply "
-                + kv(
-                    group_id=patient["group_id"],
-                    template="measure_missing_today",
-                    measure_id=measure_id,
-                )
-            )
-
-    # --- Incoming messages from adapter ---
+    # ---- incoming from adapter --------------------------------------------------------
     async def on_patient_message(self, msg: IncomingMessage) -> None:
-        # Engine-level inbound (messaging → INFO)
+        """Main entry for any text from the patient's group."""
         self.log.info(
             "msg.engine.in "
             + kv(
-                group_id=msg.group_id, sender_user_id=msg.sender_user_id, text=msg.text
+                group_id=msg.group_id,
+                sender_user_id=msg.sender_user_id,
+                text=(msg.text or ""),
             )
         )
 
@@ -424,289 +248,560 @@ class ReminderEngine:
 
         patient = self.patient_index[pid]
         text = (msg.text or "").strip()
-
-        # 0) v3: Button-driven flows (before measurement parsing)
         low = text.lower()
+
+        # Button flows (compare via i18n keys)
         if low == MESSAGES["btn_pressure"].lower():
-            await self.adapter.send_group_message(
-                patient["group_id"],
-                fmt("prompt_pressure"),
-                reply_markup=self.adapter.build_force_reply(),
-            )
-            self.log.info(
-                "msg.engine.reply "
-                + kv(group_id=patient["group_id"], template="prompt_pressure")
-            )
+            await self._prompt(patient["group_id"], "prompt_pressure", patient)
             return
         if low == MESSAGES["btn_weight"].lower():
-            await self.adapter.send_group_message(
-                patient["group_id"],
-                fmt("prompt_weight"),
-                reply_markup=self.adapter.build_force_reply(),
-            )
-            self.log.info(
-                "msg.engine.reply "
-                + kv(group_id=patient["group_id"], template="prompt_weight")
-            )
+            await self._prompt(patient["group_id"], "prompt_weight", patient)
             return
         if low == MESSAGES["btn_help"].lower():
-            kb_fixed = self.adapter.build_patient_reply_kb(patient)
-            await self.adapter.send_group_message(
-                patient["group_id"], fmt("help_brief"), reply_markup=kb_fixed
-            )
-            self.log.info(
-                "msg.engine.reply "
-                + kv(group_id=patient["group_id"], template="help_brief")
-            )
+            await self._reply(patient["group_id"], "help_brief", with_fixed_kb=patient)
             return
 
-        # 1) Measurements (start-anchored)
-        m = self.measures.match(text)
-        if m:
-            mid, body = m
+        # Measurements (anchored)
+        mm = self.measures.match(text)
+        if mm:
+            mid, body = mm
             parsed = self.measures.parse(mid, body)
             if parsed.get("ok"):
-                now_local = self._local_now()
+                now_local = self._now()
                 self.measures.append_csv(
                     mid, now_local, pid, patient["patient_label"], parsed["values"]
                 )
-                kb_fixed = self.adapter.build_patient_reply_kb(patient)
-                await self.adapter.send_group_message(
+                await self._reply(
                     patient["group_id"],
-                    fmt("measure_ack", measure_label=self.measures.get_label(mid)),
-                    reply_markup=kb_fixed,
-                )
-                self.log.info(
-                    "msg.engine.reply "
-                    + kv(
-                        group_id=patient["group_id"],
-                        template="measure_ack",
-                        measure_id=mid,
-                    )
+                    "measure_ack",
+                    with_fixed_kb=patient,
+                    measure_label=self.measures.get_label(mid),
                 )
             else:
-                # Choose error message per parser_kind
                 md = self.measures.measures[mid]
-                kb_fixed = self.adapter.build_patient_reply_kb(patient)
                 if md.parser_kind == "int3":
-                    await self.adapter.send_group_message(
+                    await self._reply(
                         patient["group_id"],
-                        fmt("measure_error_arity", expected=3),
-                        reply_markup=kb_fixed,
+                        "measure_error_arity",
+                        with_fixed_kb=patient,
+                        expected=3,
                     )
-                    template = "measure_error_arity"
                 else:
-                    await self.adapter.send_group_message(
-                        patient["group_id"],
-                        fmt("measure_error_one"),
-                        reply_markup=kb_fixed,
+                    await self._reply(
+                        patient["group_id"], "measure_error_one", with_fixed_kb=patient
                     )
-                    template = "measure_error_one"
-                self.log.info(
-                    "msg.engine.reply "
-                    + kv(
-                        group_id=patient["group_id"],
-                        template=template,
-                        measure_id=mid,
-                    )
-                )
             return
 
-        # 2) Confirmations (existing semantics; search-anywhere)
+        # Confirmation (free text)
         if not self.matcher.matches_confirmation(text):
-            # 3) Unknown indicator (neither measurement nor confirmation)
-            kb_fixed = self.adapter.build_patient_reply_kb(patient)
-            await self.adapter.send_group_message(
-                patient["group_id"], fmt("measure_unknown"), reply_markup=kb_fixed
-            )
-            self.log.info(
-                "msg.engine.reply "
-                + kv(group_id=patient["group_id"], template="measure_unknown")
+            await self._reply(
+                patient["group_id"], "measure_unknown", with_fixed_kb=patient
             )
             return
 
-        now_local = self._local_now()
-        today = self._today_str()
-
-        # Determine target dose
-        upcoming: Optional[DoseInstance] = None
-        min_dt = None
-        for d in patient["doses"]:
-            key = self._get_dosekey(pid, today, d["time"])
-            inst = self.state.get(key)
-            if not inst or inst.status in ("Confirmed", "Escalated"):
-                continue
-            dt = inst.scheduled_dt_local
-            if dt >= now_local and (min_dt is None or dt < min_dt):
-                upcoming = inst
-                min_dt = dt
-
-        awaiting_now: Optional[DoseInstance] = None
-        for d in patient["doses"]:
-            key = self._get_dosekey(pid, today, d["time"])
-            inst = self.state.get(key)
-            if inst and inst.status == "AwaitingConfirmation":
-                awaiting_now = inst
-                break
-
-        target = awaiting_now or upcoming
-
+        # Map confirmation → a target dose
+        now = self._now()
+        target = self._select_target_for_confirmation(now, patient)
         if target is None:
-            kb_fixed = self.adapter.build_patient_reply_kb(patient)
-            await self.adapter.send_group_message(
-                patient["group_id"], fmt("too_early"), reply_markup=kb_fixed
-            )
-            self.log.info(
-                "msg.engine.reply "
-                + kv(
-                    group_id=patient["group_id"],
-                    template="too_early",
-                    reason="no target dose",
-                )
-            )
+            await self._reply(patient["group_id"], "too_early", with_fixed_kb=patient)
             return
 
-        if target.status == "AwaitingConfirmation":
-            if target.retry_task and not target.retry_task.done():
-                target.retry_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await target.retry_task
-                self.log.debug(
-                    "job.retry.cancel "
-                    + kv(patient_id=target.patient_id, time=target.dose_key.time_str)
-                )
-            self._set_status(target, "Confirmed", reason="patient confirmed")
-            self._log_outcome_csv(
-                target.scheduled_dt_local,
-                target.patient_id,
-                target.patient_label,
-                target.pill_text,
-                "OK",
-                target.attempts_sent,
-            )
-            kb_fixed = self.adapter.build_patient_reply_kb(patient)
-            await self.adapter.send_group_message(
-                target.group_id, fmt("confirm_ack"), reply_markup=kb_fixed
-            )
-            self.log.info(
-                "msg.engine.reply "
-                + kv(group_id=target.group_id, template="confirm_ack")
-            )
+        if self._status(target) == Status.AWAITING:
+            await self._confirm_and_ack(target, patient, reason="patient confirmed")
             return
 
-        # Preconfirm path
-        delta = (target.scheduled_dt_local - now_local).total_seconds()
+        # Preconfirm path (within grace)
+        delta = (target.scheduled_dt_local - now).total_seconds()
         if 0 <= delta <= self.cfg.TAKING_GRACE_INTERVAL_S:
-            self._set_status(target, "Confirmed", reason="preconfirm within grace")
+            self._set_status(target, Status.CONFIRMED, reason="preconfirm within grace")
             target.preconfirmed = True
             target.attempts_sent = 0
-            self._log_outcome_csv(
-                target.scheduled_dt_local,
-                target.patient_id,
-                target.patient_label,
-                target.pill_text,
-                "OK",
-                0,
-            )
-            kb_fixed = self.adapter.build_patient_reply_kb(patient)
-            await self.adapter.send_group_message(
-                target.group_id, fmt("preconfirm_ack"), reply_markup=kb_fixed
-            )
-            self.log.info(
-                "msg.engine.reply "
-                + kv(group_id=target.group_id, template="preconfirm_ack")
-            )
+            self._log_outcome_csv(target, status="OK")
+            await self._reply(target.group_id, "preconfirm_ack", with_fixed_kb=patient)
         else:
-            kb_fixed = self.adapter.build_patient_reply_kb(patient)
-            await self.adapter.send_group_message(
-                target.group_id, fmt("too_early"), reply_markup=kb_fixed
-            )
-            self.log.info(
-                "msg.engine.reply "
-                + kv(
-                    group_id=target.group_id,
-                    template="too_early",
-                    reason="outside grace",
-                )
-            )
+            await self._reply(target.group_id, "too_early", with_fixed_kb=patient)
 
-    # --- Inline confirmation callback entry (v3) ---
     async def on_inline_confirm(
-        self, group_id: int, from_user_id: int, data: str
+        self,
+        group_id: int,
+        from_user_id: int,
+        data: str,
+        message_id: Optional[int] = None,
     ) -> dict:
         """
-        Process inline 'confirm taken' button presses.
-
-        Returns a dict like {"cb_text": "...", "show_alert": False} for the adapter
-        to answer the callback ephemerally. On success, we send normal group acks and
-        keep the callback silent (cb_text=None).
+        Inline button confirm.
+        Returns dict for adapter: {'cb_text': str|None, 'show_alert': bool}.
+        Resolution order: message_id → payload → any awaiting/escalated today.
         """
-        # Validate group ↔ patient mapping and payload
         expected_pid = self.group_to_patient.get(group_id)
         if expected_pid is None or from_user_id != expected_pid:
-            # Someone else pressed the button in the group
             return {"cb_text": fmt("cb_only_patient"), "show_alert": False}
 
-        parts = (data or "").split(":")
-        if len(parts) != 4 or parts[0] != "confirm":
+        inst: Optional[DoseInstance] = None
+
+        # 1) Resolve by message_id first (authoritative mapping)
+        if message_id is not None:
+            key = self.msg_to_key.get(message_id)
+            if key:
+                inst = self.state.get(key)
+                if inst is None:
+                    self.log.debug(
+                        "cb.resolve.msgid.miss "
+                        + kv(message_id=message_id, reason="key pruned")
+                    )
+                else:
+                    self.log.debug(
+                        "cb.resolve.msgid.hit "
+                        + kv(
+                            message_id=message_id,
+                            patient_id=key.patient_id,
+                            time=key.time_str,
+                        )
+                    )
+
+        # 2) Fallback by payload (pid/date/time)
+        if inst is None:
+            parts = (data or "").split(":")
+            if len(parts) == 4 and parts[0] == "confirm":
+                try:
+                    pid = int(parts[1])
+                    date_s = parts[2]
+                    time_s = parts[3]
+                except Exception:
+                    pid = -1
+                    date_s = ""
+                    time_s = ""
+                if pid == expected_pid:
+                    inst = self.state.get(DoseKey(pid, date_s, time_s))
+                    if inst:
+                        self.log.debug(
+                            "cb.resolve.payload.hit "
+                            + kv(patient_id=pid, date=date_s, time=time_s)
+                        )
+                    else:
+                        self.log.debug(
+                            "cb.resolve.payload.miss "
+                            + kv(patient_id=pid, date=date_s, time=time_s)
+                        )
+
+        # 3) Last resort: any AWAITING/ESCALATED for this patient today with same time (or any awaiting)
+        if inst is None:
+            today = self._today_str()
+            # try same time match first if payload existed
+            time_guess = None
+            parts = (data or "").split(":")
+            if len(parts) == 4 and parts[0] == "confirm":
+                time_guess = parts[3]
+            for k, v in self.state.items():
+                if (
+                    k.patient_id == expected_pid
+                    and k.date_str == today
+                    and self._status(v) in (Status.AWAITING, Status.ESCALATED)
+                ):
+                    if time_guess is None or k.time_str == time_guess:
+                        inst = v
+                        self.log.debug(
+                            "cb.resolve.fallback.hit "
+                            + kv(
+                                patient_id=k.patient_id,
+                                date=k.date_str,
+                                time=k.time_str,
+                            )
+                        )
+                        break
+
+        if inst is None:
             return {"cb_text": fmt("cb_no_target"), "show_alert": False}
 
-        try:
-            pid = int(parts[1])
-            date_s = parts[2]
-            time_s = parts[3]
-        except Exception:
+        status = self._status(inst)
+        if status == Status.CONFIRMED:
+            return {"cb_text": fmt("cb_already_done"), "show_alert": False}
+        if status not in (Status.AWAITING, Status.ESCALATED):
             return {"cb_text": fmt("cb_no_target"), "show_alert": False}
 
-        if pid != expected_pid:
-            return {"cb_text": fmt("cb_no_target"), "show_alert": False}
+        previous = status
+        patient = self.patient_index.get(inst.patient_id)
+        await self._confirm_and_ack(inst, patient, reason="inline button")
+        if previous == Status.ESCALATED:
+            msg = f"Пізнє підтвердження: {inst.patient_label} за {inst.dose_key.date_str} {inst.dose_key.time_str} — OK."
+            await self.adapter.send_nurse_dm(inst.nurse_user_id, msg)
 
-        key = DoseKey(pid, date_s, time_s)
+        return {"cb_text": None, "show_alert": False}
+
+    # ---- jobs (scheduler) -------------------------------------------------------------
+    async def _job_start_dose(self, patient_id: int, time_str: str) -> None:
+        """Scheduler entry: set awaiting, send first reminder, refresh keyboard, start retry loop."""
+        self.log.debug("job.trigger " + kv(patient_id=patient_id, time=time_str))
+        self._ensure_today_instances()
+
+        key = self._dosekey_today(patient_id, time_str)
         inst = self.state.get(key)
         if not inst:
-            return {"cb_text": fmt("cb_no_target"), "show_alert": False}
+            self.log.debug(
+                "job.trigger.miss " + kv(patient_id=patient_id, time=time_str)
+            )
+            return
+        if self._status(inst) == Status.CONFIRMED:
+            self.log.debug(
+                "job.trigger.skip "
+                + kv(patient_id=patient_id, time=time_str, reason="already confirmed")
+            )
+            return
 
-        if inst.status == "Confirmed":
-            return {"cb_text": fmt("cb_already_done"), "show_alert": False}
+        # Pre-set awaiting FIRST to eliminate tap-before-set race
+        self._set_status(inst, Status.AWAITING, reason="first reminder pre-set")
+        inst.attempts_sent = 1
 
-        if inst.status not in ("AwaitingConfirmation", "Escalated"):
-            # No actionable state
-            return {"cb_text": fmt("cb_no_target"), "show_alert": False}
+        await self._send_reminder(inst, "reminder")
+        await self._refresh_reply_kb(self.patient_index[inst.patient_id])
+        await self._start_retry(inst)
 
-        # Confirm now
-        previous_status = inst.status
+    async def _job_measure_check(self, patient_id: int, measure_id: str) -> None:
+        """Scheduler entry: daily 'missing today' measurement check."""
+        self.log.debug(
+            "job.trigger "
+            + kv(kind="measure_check", patient_id=patient_id, measure_id=measure_id)
+        )
+        patient = self.patient_index.get(patient_id)
+        if not patient:
+            self.log.debug(
+                "job.trigger.miss "
+                + kv(reason="unknown patient", patient_id=patient_id)
+            )
+            return
+        today = self._now().date()
+        if not self.measures.has_today(measure_id, patient_id, today):
+            label = self.measures.get_label(measure_id)
+            await self._reply(
+                patient["group_id"],
+                "measure_missing_today",
+                with_fixed_kb=patient,
+                measure_label=label,
+            )
 
+    # ---- retry management -------------------------------------------------------------
+    async def _start_retry(self, inst: DoseInstance) -> None:
+        """Start the retry loop for a dose (idempotent)."""
+        self._stop_retry(inst)  # just in case
+        inst.retry_task = asyncio.create_task(self._retry_loop(inst))
+        self.log.debug(
+            "job.retry.start "
+            + kv(
+                patient_id=inst.patient_id,
+                time=inst.dose_key.time_str,
+                interval_s=self.cfg.RETRY_INTERVAL_S,
+            )
+        )
+
+    def _stop_retry(self, inst: DoseInstance) -> None:
+        """Cancel a running retry task if present."""
         if inst.retry_task and not inst.retry_task.done():
             inst.retry_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await inst.retry_task
+
+    async def _retry_loop(self, inst: DoseInstance) -> None:
+        """Retry loop: send repeats up to N, then escalate."""
+        I = self.cfg.RETRY_INTERVAL_S
+        N = self.cfg.MAX_RETRY_ATTEMPTS
+        try:
+            while self._status(inst) == Status.AWAITING:
+                await asyncio.sleep(I)
+                if self._status(inst) != Status.AWAITING:
+                    break
+                if inst.attempts_sent < N:
+                    await self._send_reminder(inst, "repeat_reminder")
+                    await self._refresh_reply_kb(self.patient_index[inst.patient_id])
+                    inst.attempts_sent += 1
+                    self.log.debug(
+                        "job.retry.tick "
+                        + kv(
+                            patient_id=inst.patient_id,
+                            time=inst.dose_key.time_str,
+                            attempt=inst.attempts_sent,
+                        )
+                    )
+                else:
+                    await self._escalate(inst)
+                    break
+        except asyncio.CancelledError:
             self.log.debug(
                 "job.retry.cancel "
                 + kv(patient_id=inst.patient_id, time=inst.dose_key.time_str)
             )
+            raise
 
-        self._set_status(inst, "Confirmed", reason="inline button")
-        self._log_outcome_csv(
-            inst.scheduled_dt_local,
-            inst.patient_id,
-            inst.patient_label,
-            inst.pill_text,
-            "OK",
-            inst.attempts_sent,
-        )
-
-        # Group ack with fixed reply keyboard
-        patient = self.patient_index.get(inst.patient_id)
+    async def _escalate(self, inst: DoseInstance) -> None:
+        """Escalate to nurse after max retries; keep existing inline buttons on prior messages."""
+        patient = self.patient_index[inst.patient_id]
         kb_fixed = self.adapter.build_patient_reply_kb(patient)
-        await self.adapter.send_group_message(
-            inst.group_id, fmt("confirm_ack"), reply_markup=kb_fixed
+        await self._send_group(
+            inst.group_id, fmt("escalate_group"), reply_markup=kb_fixed
         )
 
-        # Optionally notify nurse if confirmation came after escalation
-        if previous_status == "Escalated":
-            # Keep text concise; i18n key not required by spec (optional DM).
-            msg = f"Пізнє підтвердження: {inst.patient_label} за {inst.dose_key.date_str} {inst.dose_key.time_str} — OK."
-            await self.adapter.send_nurse_dm(inst.nurse_user_id, msg)
+        when = inst.scheduled_dt_local
+        await self.adapter.send_nurse_dm(
+            inst.nurse_user_id,
+            fmt(
+                "escalate_dm",
+                patient_label=inst.patient_label,
+                date=when.strftime("%Y-%m-%d"),
+                time=when.strftime("%H:%M"),
+                pill_text=inst.pill_text,
+            ),
+        )
 
-        # Silent callback OK
-        return {"cb_text": None, "show_alert": False}
+        self._set_status(inst, Status.ESCALATED, reason="max retries exceeded")
+        self._log_outcome_csv(inst, status="Escalated")
+        self.log.debug(
+            "job.retry.stop "
+            + kv(
+                patient_id=inst.patient_id,
+                time=inst.dose_key.time_str,
+                reason="escalated",
+            )
+        )
+
+    # ---- selection / confirmation -----------------------------------------------------
+    def _select_target_for_confirmation(
+        self, now: datetime, patient: dict
+    ) -> Optional[DoseInstance]:
+        """Prefer the actively waiting dose; otherwise the nearest upcoming (same day)."""
+        pid = patient["patient_id"]
+        today = self._today_str()
+
+        # 1) Actively waiting
+        for d in patient["doses"]:
+            key = DoseKey(pid, today, d["time"])
+            inst = self.state.get(key)
+            if inst and self._status(inst) == Status.AWAITING:
+                return inst
+
+        # 2) Nearest upcoming today (not confirmed/escalated)
+        best: Tuple[Optional[DoseInstance], Optional[datetime]] = (None, None)
+        for d in patient["doses"]:
+            key = DoseKey(pid, today, d["time"])
+            inst = self.state.get(key)
+            if not inst or self._status(inst) in (Status.CONFIRMED, Status.ESCALATED):
+                continue
+            dt = inst.scheduled_dt_local
+            if dt >= now and (best[1] is None or dt < best[1]):
+                best = (inst, dt)
+        return best[0]
+
+    async def _confirm_and_ack(
+        self, inst: DoseInstance, patient: dict, reason: str
+    ) -> None:
+        """Confirm a dose, stop retry loop, log outcome, and send ack with fixed keyboard."""
+        if inst.retry_task and not inst.retry_task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                self._stop_retry(inst)
+                await inst.retry_task
+        self._set_status(inst, Status.CONFIRMED, reason=reason)
+        self._log_outcome_csv(inst, status="OK")
+        await self._reply(inst.group_id, "confirm_ack", with_fixed_kb=patient)
+
+    # ---- state management -------------------------------------------------------------
+    def _ensure_today_instances(self) -> None:
+        """Prune old instances and (re)create today's. Also prune msg→key map."""
+        today = self._today_str()
+
+        # prune non-today
+        if self.state:
+            kept: Dict[DoseKey, DoseInstance] = {
+                k: v for k, v in self.state.items() if k.date_str == today
+            }
+            if len(kept) != len(self.state):
+                self.log.debug("state.prune " + kv(removed=len(self.state) - len(kept)))
+            self.state = kept
+
+        # prune msg_to_key entries pointing to non-existent keys
+        if self.msg_to_key:
+            removed = 0
+            for mid in list(self.msg_to_key.keys()):
+                if self.msg_to_key[mid] not in self.state:
+                    del self.msg_to_key[mid]
+                    removed += 1
+            if removed:
+                self.log.debug("state.msgmap.prune " + kv(removed=removed))
+
+        # create today's
+        for p in self.cfg.PATIENTS:
+            for d in p["doses"]:
+                key = DoseKey(p["patient_id"], today, d["time"])
+                if key in self.state:
+                    continue
+                hh, mm = map(int, d["time"].split(":"))
+                sched = self._now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+                inst = DoseInstance(
+                    dose_key=key,
+                    patient_id=p["patient_id"],
+                    patient_label=p["patient_label"],
+                    group_id=p["group_id"],
+                    nurse_user_id=p["nurse_user_id"],
+                    pill_text=d["text"],
+                    scheduled_dt_local=sched,
+                )
+                self.state[key] = inst
+                self.log.debug(
+                    "state.instance.create "
+                    + kv(
+                        patient_id=inst.patient_id,
+                        time=d["time"],
+                        text=inst.pill_text,
+                        status=inst.status,
+                    )
+                )
+
+    def _set_status(self, inst: DoseInstance, status: Status, reason: str) -> None:
+        """Set status with a consistent debug log."""
+        old = inst.status
+        inst.status = status.value  # store as string for compatibility
+        self.log.debug(
+            "state.status.change "
+            + kv(
+                patient_id=inst.patient_id,
+                time=inst.dose_key.time_str,
+                from_status=old,
+                to_status=inst.status,
+                reason=reason,
+            )
+        )
+
+    def _status(self, inst: DoseInstance) -> Status:
+        """Convert stored string status back to enum."""
+        s = inst.status
+        if s == Status.AWAITING.value:
+            return Status.AWAITING
+        if s == Status.CONFIRMED.value:
+            return Status.CONFIRMED
+        if s == Status.ESCALATED.value:
+            return Status.ESCALATED
+        return Status.PENDING
+
+    # ---- messaging helpers ------------------------------------------------------------
+    async def _send_reminder(self, inst: DoseInstance, text_key: str) -> None:
+        """
+        Send a reminder (first or repeat) with inline confirm (if enabled),
+        and remember the message_id → dose mapping for robust callbacks.
+        """
+        inline_enabled = getattr(self.cfg, "INLINE_CONFIRM_ENABLED", True)
+        kb_inline = (
+            self.adapter.build_confirm_inline_kb(inst.dose_key)
+            if inline_enabled
+            else None
+        )
+        text = (
+            fmt("reminder", pill_text=inst.pill_text)
+            if text_key == "reminder"
+            else fmt("repeat_reminder")
+        )
+        msg_id = await self._send_group(inst.group_id, text, reply_markup=kb_inline)
+        if msg_id is not None:
+            inst.last_message_ids.append(msg_id)
+            self.msg_to_key[msg_id] = inst.dose_key
+        else:
+            self.log.error(
+                "msg.reminder.error "
+                + kv(
+                    group_id=inst.group_id,
+                    patient_id=inst.patient_id,
+                    time=inst.dose_key.time_str,
+                    kind=text_key,
+                )
+            )
+
+    async def _send_group(
+        self, group_id: int, text: str, reply_markup: Any | None = None
+    ) -> Optional[int]:
+        """
+        Wrapper to send a group message with error handling.
+        Returns message_id or None on error.
+        """
+        try:
+            self.log.info(
+                "msg.engine.reply "
+                + kv(
+                    group_id=group_id,
+                    template=text[:64] + ("..." if len(text) > 64 else ""),
+                )
+            )
+            return await self.adapter.send_group_message(
+                group_id, text, reply_markup=reply_markup
+            )
+        except Exception as e:
+            self.log.error(
+                "msg.engine.reply.error " + kv(group_id=group_id, err=str(e))
+            )
+            return None
+
+    async def _reply(
+        self,
+        group_id: int,
+        template_key: str,
+        *,
+        with_fixed_kb: Optional[dict] = None,
+        **fmt_args: Any,
+    ) -> Optional[int]:
+        """Send a group message using i18n template; optionally attach fixed reply keyboard."""
+        kb = None
+        if with_fixed_kb is not None:
+            kb = self.adapter.build_patient_reply_kb(with_fixed_kb)
+        text = fmt(template_key, **fmt_args) if fmt_args else fmt(template_key)
+        return await self._send_group(group_id, text, reply_markup=kb)
+
+    async def _prompt(
+        self, group_id: int, template_key: str, patient: dict, **fmt_args: Any
+    ) -> Optional[int]:
+        """Send a ForceReply prompt (selective) for guided input like BP/weight."""
+        markup = self.adapter.build_force_reply()
+        text = fmt(template_key, **fmt_args) if fmt_args else fmt(template_key)
+        return await self._send_group(group_id, text, reply_markup=markup)
+
+    async def _refresh_reply_kb(self, patient: dict) -> None:
+        """
+        Refresh fixed reply keyboard using adapter helper, with a safe fallback if missing.
+        The adapter method sends a small visible message with the keyboard.
+        """
+        try:
+            if hasattr(self.adapter, "refresh_reply_keyboard") and callable(
+                self.adapter.refresh_reply_keyboard
+            ):
+                await self.adapter.refresh_reply_keyboard(patient)
+                return
+        except Exception as e:
+            self.log.error(
+                "keyboard.refresh.error "
+                + kv(group_id=patient.get("group_id"), err=str(e))
+            )
+            # continue to fallback
+
+        # Fallback: send visible message with keyboard directly
+        try:
+            kb = self.adapter.build_patient_reply_kb(patient)
+            await self._send_group(
+                patient["group_id"], "Оновив кнопки ↓", reply_markup=kb
+            )
+        except Exception as e:
+            self.log.error(
+                "keyboard.refresh.fallback.error "
+                + kv(group_id=patient.get("group_id"), err=str(e))
+            )
+
+    # ---- tiny sugar -------------------------------------------------------------------
+    def _now(self) -> datetime:
+        return self.clock.now()
+
+    def _today_str(self) -> str:
+        return self.clock.today_str()
+
+    def _dosekey_today(self, patient_id: int, time_str: str) -> DoseKey:
+        return DoseKey(patient_id, self._today_str(), time_str)
+
+    # ---- outcome CSV ------------------------------------------------------------------
+    def _log_outcome_csv(self, inst: DoseInstance, status: str) -> None:
+        """Append a one-line outcome row into the configured CSV (analytics/audit)."""
+        line = (
+            f"{inst.scheduled_dt_local.strftime('%Y-%m-%d %H:%M')}, "
+            f"{inst.patient_id}, {inst.patient_label}, {inst.pill_text}, {status}, {inst.attempts_sent}\n"
+        )
+        with open(self.cfg.LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line)

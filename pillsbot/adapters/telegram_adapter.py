@@ -82,10 +82,14 @@ class TelegramAdapter:
             group_id = 0
         from_user_id = callback.from_user.id if callback.from_user else 0
         data = callback.data or ""
+        message_id = callback.message.message_id if callback.message else None
 
         # Engine decides the outcome and any ephemeral text to show
         result: dict[str, Any] = await self.engine.on_inline_confirm(
-            group_id=group_id, from_user_id=from_user_id, data=data
+            group_id=group_id,
+            from_user_id=from_user_id,
+            data=data,
+            message_id=message_id,
         )
         cb_text: Optional[str] = result.get("cb_text")
         show_alert: bool = bool(result.get("show_alert", False))
@@ -130,8 +134,8 @@ class TelegramAdapter:
     # ------------------------------------------------------------------------------
     def build_patient_reply_kb(self, patient: dict) -> ReplyKeyboardMarkup:
         """
-        Persistent reply keyboard primarily for the patient.
-        Telegram "selective" is best-effort in groups; server side enforcement is in the engine.
+        Fixed reply keyboard for the patient.
+        NOTE: Avoid selective=True in supergroups; it causes the keyboard to not show.
         """
         kb = ReplyKeyboardMarkup(
             keyboard=[
@@ -141,10 +145,8 @@ class TelegramAdapter:
                 ],
                 [KeyboardButton(text=MESSAGES["btn_help"])],
             ],
-            is_persistent=True,
             resize_keyboard=True,
             one_time_keyboard=False,
-            selective=True,
             input_field_placeholder="Виберіть дію або введіть значення...",
         )
         return kb
@@ -166,6 +168,30 @@ class TelegramAdapter:
     def build_force_reply(self) -> ForceReply:
         """ForceReply for guided input; selective=True as per spec."""
         return ForceReply(selective=True)
+
+    async def refresh_reply_keyboard(
+        self, patient: dict, group_id: int | None = None
+    ) -> Optional[int]:
+        """
+        Send a tiny follow-up message with the fixed reply keyboard to "refresh" it.
+        Use visible text so clients don't drop it.
+        Returns the sent message_id (or None on failure).
+        """
+        gid = group_id or patient["group_id"]
+        try:
+            text = "Оновив кнопки ↓"
+            kb = self.build_patient_reply_kb(patient)
+            self.log.info(
+                "msg.out.group " + kv(group_id=gid, text="(keyboard refresh)")
+            )
+            msg = await self.bot.send_message(chat_id=gid, text=text, reply_markup=kb)
+            return msg.message_id
+        except Exception as e:
+            self.log.error(
+                "msg.out.group.error "
+                + kv(group_id=gid, err=str(e), where="refresh_reply_keyboard")
+            )
+            return None
 
 
 __all__ = [
