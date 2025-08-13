@@ -1,0 +1,2086 @@
+### FILE: ./adapters/telegram_adapter.py
+# pillsbot/adapters/telegram_adapter.py
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import Any, Iterable, Optional
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ForceReply,
+)
+
+from pillsbot.core.reminder_engine import IncomingMessage, DoseKey
+from pillsbot.core.logging_utils import kv
+from pillsbot.core.i18n import MESSAGES
+
+
+class TelegramAdapter:
+    """Thin wrapper around aiogram to integrate with ReminderEngine, plus v3 UI helpers."""
+
+    def __init__(
+        self, bot_token: str, engine: Any, patient_groups: Iterable[int]
+    ) -> None:
+        self.bot = Bot(token=bot_token, parse_mode=None)
+        self.dp = Dispatcher()
+
+        self.engine = engine
+        self.patient_groups = set(patient_groups)
+
+        self.log = logging.getLogger("pillsbot.adapter")
+
+        # Text in groups
+        self.dp.message.register(self.on_group_text, F.text)
+        # Inline button callbacks (v3)
+        self.dp.callback_query.register(
+            self.on_callback_confirm, F.data.startswith("confirm:")
+        )
+
+    # ------------------------------------------------------------------------------
+    # Handlers
+    # ------------------------------------------------------------------------------
+    async def on_group_text(self, message: Message) -> None:
+        """Handle text messages in patient group chats and forward to the engine."""
+        chat_id = message.chat.id
+        text = message.text or ""
+        sender_user_id = message.from_user.id if message.from_user else 0
+
+        # Always log inbound traffic (messaging stays INFO)
+        self.log.info(
+            "msg.in.group "
+            + kv(group_id=chat_id, sender_user_id=sender_user_id, text=text)
+        )
+
+        if chat_id not in self.patient_groups:
+            self.log.debug("msg.in.ignored " + kv(reason="not a patient group"))
+            return
+
+        incoming = IncomingMessage(
+            group_id=chat_id,
+            sender_user_id=sender_user_id,
+            text=text,
+            sent_at_utc=datetime.now(timezone.utc),
+        )
+
+        await self.engine.on_patient_message(incoming)
+
+    async def on_callback_confirm(self, callback: CallbackQuery) -> None:
+        """
+        Handle inline confirmation button presses.
+        Passes through to engine for validation & state mutation,
+        then answers the callback (ephemeral).
+        """
+        try:
+            group_id = callback.message.chat.id if callback.message else 0
+        except Exception:
+            group_id = 0
+        from_user_id = callback.from_user.id if callback.from_user else 0
+        data = callback.data or ""
+        message_id = callback.message.message_id if callback.message else None
+
+        # Engine decides the outcome and any ephemeral text to show
+        result: dict[str, Any] = await self.engine.on_inline_confirm(
+            group_id=group_id,
+            from_user_id=from_user_id,
+            data=data,
+            message_id=message_id,
+        )
+        cb_text: Optional[str] = result.get("cb_text")
+        show_alert: bool = bool(result.get("show_alert", False))
+
+        await self.answer_callback(callback.id, text=cb_text, show_alert=show_alert)
+
+    # ------------------------------------------------------------------------------
+    # Outbound messaging
+    # ------------------------------------------------------------------------------
+    async def send_group_message(
+        self, group_id: int, text: str, reply_markup: Any | None = None
+    ) -> int:
+        """
+        Sends a group message and returns Telegram message_id.
+        Messaging-level logging remains at INFO.
+        """
+        self.log.info("msg.out.group " + kv(group_id=group_id, text=text))
+        msg = await self.bot.send_message(
+            chat_id=group_id, text=text, reply_markup=reply_markup
+        )
+        return msg.message_id
+
+    async def send_nurse_dm(self, user_id: int, text: str) -> None:
+        # Messaging → INFO
+        self.log.info("msg.out.dm " + kv(user_id=user_id, text=text))
+        await self.bot.send_message(chat_id=user_id, text=text)
+
+    async def answer_callback(
+        self, callback_query_id: str, text: str | None = None, show_alert: bool = False
+    ) -> None:
+        """Answer inline button press (ephemeral)."""
+        await self.bot.answer_callback_query(
+            callback_query_id, text=text or None, show_alert=show_alert
+        )
+
+    async def run_polling(self) -> None:
+        self.log.debug("polling.run")
+        await self.dp.start_polling(self.bot)
+
+    # ------------------------------------------------------------------------------
+    # v3 UI helpers
+    # ------------------------------------------------------------------------------
+    def build_patient_reply_kb(self, patient: dict) -> ReplyKeyboardMarkup:
+        """
+        Fixed reply keyboard for the patient.
+        NOTE: Avoid selective=True in supergroups; it causes the keyboard to not show.
+        """
+        kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [
+                    KeyboardButton(text=MESSAGES["btn_pressure"]),
+                    KeyboardButton(text=MESSAGES["btn_weight"]),
+                ],
+                [KeyboardButton(text=MESSAGES["btn_help"])],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=False,
+            input_field_placeholder="Виберіть дію або введіть значення...",
+        )
+        return kb
+
+    def build_confirm_inline_kb(self, dose_key: DoseKey) -> InlineKeyboardMarkup:
+        """Inline 'confirm taken' button attached to reminder/retry messages."""
+        data = f"confirm:{dose_key.patient_id}:{dose_key.date_str}:{dose_key.time_str}"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=MESSAGES["btn_confirm_taken"], callback_data=data
+                    )
+                ]
+            ]
+        )
+        return kb
+
+    def build_force_reply(self) -> ForceReply:
+        """ForceReply for guided input; selective=True as per spec."""
+        return ForceReply(selective=True)
+
+    async def refresh_reply_keyboard(
+        self, patient: dict, group_id: int | None = None
+    ) -> Optional[int]:
+        """
+        Send a tiny follow-up message with the fixed reply keyboard to "refresh" it.
+        Use visible text so clients don't drop it.
+        Returns the sent message_id (or None on failure).
+        """
+        gid = group_id or patient["group_id"]
+        try:
+            text = "Оновив кнопки ↓"
+            kb = self.build_patient_reply_kb(patient)
+            self.log.info(
+                "msg.out.group " + kv(group_id=gid, text="(keyboard refresh)")
+            )
+            msg = await self.bot.send_message(chat_id=gid, text=text, reply_markup=kb)
+            return msg.message_id
+        except Exception as e:
+            self.log.error(
+                "msg.out.group.error "
+                + kv(group_id=gid, err=str(e), where="refresh_reply_keyboard")
+            )
+            return None
+
+
+__all__ = [
+    "TelegramAdapter",
+    "IncomingMessage",
+    "DoseKey",
+]
+
+
+### FILE: ./app.py
+# pillsbot/app.py
+from __future__ import annotations
+
+import asyncio
+import logging
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from pillsbot import config as cfg
+from pillsbot.core.config_validation import validate_config
+from pillsbot.core.reminder_engine import ReminderEngine
+from pillsbot.adapters.telegram_adapter import TelegramAdapter
+from pillsbot.core.logging_utils import setup_logging, kv
+
+
+async def main() -> None:
+    # Validate configuration before starting anything
+    validate_config(cfg)
+
+    # Setup logging (separate audit file, console mirror)
+    setup_logging(cfg)
+    log = logging.getLogger("pillsbot.app")
+
+    token = cfg.get_bot_token()
+
+    engine = ReminderEngine(cfg, adapter=None)  # temporary None to build adapter
+    adapter = TelegramAdapter(token, engine, [p["group_id"] for p in cfg.PATIENTS])
+    engine.adapter = adapter
+
+    scheduler = AsyncIOScheduler(timezone=cfg.TZ)
+
+    # startup.* must be INFO
+    log.info("startup.begin " + kv(timezone=cfg.TIMEZONE))
+    await engine.start(scheduler)
+    scheduler.start()
+    log.info("startup.ready " + kv(patients=len(cfg.PATIENTS)))
+
+    # Not startup, not messaging → DEBUG
+    log.debug("polling.start")
+    await adapter.run_polling()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+### FILE: ./config.py
+"""
+Runtime configuration for PillsBot.
+All times for scheduling/logging are Europe/Kyiv.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+from zoneinfo import ZoneInfo
+
+# --------------------------------------------------------------------------------------
+# Core bot settings
+# --------------------------------------------------------------------------------------
+BOT_TOKEN: str | None = (
+    "550433191:AAFkG6atLs_uo0nwphtuiwbwIJeUhwfzCyI"  # fallback if env BOT_TOKEN is not set
+)
+TIMEZONE = "Europe/Kyiv"
+TZ = ZoneInfo(TIMEZONE)
+
+# Retry/escalation configuration
+RETRY_INTERVAL_S = 30  # I
+MAX_RETRY_ATTEMPTS = 3  # N
+TAKING_GRACE_INTERVAL_S = 600  # pre-confirm grace period in seconds
+
+# --------------------------------------------------------------------------------------
+# Patterns (centralized: confirmations + measurements)
+# --------------------------------------------------------------------------------------
+# Confirmation patterns (search-anywhere). Existing behavior unchanged.
+CONFIRM_PATTERNS = [
+    r"[OoОо][KkКк]",
+    r"\bok\b",
+    r"\bок\b",
+    r"\bтак\b",
+    r"\bвже\b",
+    r"\bда\b",
+    r"\bокей\b",
+    r"\bдобре\b",
+    r"\+",
+    r"^\s*(✅|✔️|👍)\s*$",
+    r"\bdone\b",
+]
+
+# Measurement definitions (start-anchored; config-only extensibility)
+MEASURES: dict[str, dict[str, Any]] = {
+    "pressure": {
+        "label": "Тиск",
+        "patterns": ["тиск", "давление", "BP", "pressure"],
+        "csv_file": "pillsbot/logs/pressure.csv",
+        "parser_kind": "int3",  # exactly three integers
+        "separators": [" ", ",", "/"],  # allowed separators between the three numbers
+    },
+    "weight": {
+        "label": "Вага",
+        "patterns": ["вага", "вес", "взвешивание", "weight"],
+        "csv_file": "pillsbot/logs/weight.csv",
+        "parser_kind": "float1",  # exactly one number
+        "decimal_commas": True,  # accept "102,4"
+    },
+}
+
+# --------------------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------------------
+# CSV outcome file (unchanged name for backward compatibility with tests/tools)
+LOG_FILE = "pillsbot/logs/pills.csv"
+
+# Human-readable audit trail (separate from CSV)
+AUDIT_LOG_FILE = "pillsbot/logs/audit.log"
+
+# --------------------------------------------------------------------------------------
+# Patient roster (example/demo values; replace with real IDs)
+# --------------------------------------------------------------------------------------
+PATIENTS: list[dict[str, Any]] = [
+    {
+        "patient_id": 382163513,
+        "patient_label": "Іван Петров",
+        "group_id": -1002690368389,
+        "nurse_user_id": 7391874317,
+        "doses": [
+            {"time": "15:46", "text": "Вітамін Д"},
+            {"time": "20:00", "text": "Вітамін Д"},
+        ],
+        # Optional daily measurement checks (per measure)
+        "measurement_checks": [
+            {"measure_id": "pressure", "time": "21:00"},
+            {"measure_id": "weight", "time": "21:00"},
+        ],
+    },
+]
+
+
+def get_bot_token() -> str:
+    token = BOT_TOKEN or os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "Bot token is not set. Set BOT_TOKEN in config.py or env var BOT_TOKEN."
+        )
+    return token
+
+
+### FILE: ./core/config_validation.py
+# pillsbot/core/config_validation.py
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+import os
+
+
+def validate_config(cfg: Any) -> None:
+    """
+    Validate runtime configuration before starting the bot.
+
+    - Ensures patient records have required fields.
+    - Ensures dose times are valid HH:MM strings and unique per patient.
+    - Ensures dose text is present.
+    - Ensures measurement configuration (if present) is valid.
+    """
+    required_fields = {
+        "patient_id",
+        "patient_label",
+        "group_id",
+        "nurse_user_id",
+        "doses",
+    }
+
+    def parse_time_str(t: str) -> None:
+        try:
+            datetime.strptime(t, "%H:%M")
+        except ValueError as e:
+            raise ValueError(f"Invalid time '{t}', expected HH:MM") from e
+
+    patients = getattr(cfg, "PATIENTS", None)
+    if not isinstance(patients, list):
+        raise ValueError("PATIENTS must be a list of patient dictionaries")
+
+    for p in patients:
+        missing = required_fields - set(p.keys())
+        if missing:
+            raise ValueError(f"Patient missing fields: {missing}")
+
+        seen_times = set()
+        for d in p.get("doses", []):
+            t = d.get("time")
+            if not t:
+                raise ValueError(
+                    f"Missing 'time' in a dose for patient {p.get('patient_label')}"
+                )
+            if t in seen_times:
+                raise ValueError(
+                    f"Duplicate dose time for patient {p['patient_label']}: {t}"
+                )
+            seen_times.add(t)
+            parse_time_str(t)
+
+            if not d.get("text"):
+                raise ValueError(
+                    f"Dose text is required for patient {p['patient_label']} at {t}"
+                )
+
+        # Validate optional measurement checks
+        checks = p.get("measurement_checks", []) or []
+        per_measure_seen: dict[str, set[str]] = {}
+        for chk in checks:
+            mid = chk.get("measure_id")
+            if not mid:
+                raise ValueError(
+                    f"measurement_checks entry missing 'measure_id' for patient {p['patient_label']}"
+                )
+            measures = getattr(cfg, "MEASURES", {})
+            if mid not in measures:
+                raise ValueError(
+                    f"Unknown measure_id '{mid}' in measurement_checks for patient {p['patient_label']}"
+                )
+            t = chk.get("time")
+            if not t:
+                raise ValueError(
+                    f"measurement_checks entry missing 'time' for measure {mid} and patient {p['patient_label']}"
+                )
+            parse_time_str(t)
+            seen = per_measure_seen.setdefault(mid, set())
+            if t in seen:
+                raise ValueError(
+                    f"Duplicate measurement check time for measure {mid} and patient {p['patient_label']}: {t}"
+                )
+            seen.add(t)
+
+    # Ensure directories for measurement CSVs exist
+    for _, m in (getattr(cfg, "MEASURES", {}) or {}).items():
+        path = m.get("csv_file")
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+
+
+### FILE: ./core/i18n.py
+from __future__ import annotations
+
+MESSAGES = {
+    # v1 pill-reminder texts (unchanged)
+    "reminder": "час прийняти {pill_text}",
+    "repeat_reminder": "не отримано підтвердження",
+    "confirm_ack": "підтвердження прийнято, дякую",
+    "preconfirm_ack": "заздалегідь - теж ОК. Дякую",
+    "too_early": "ще не на часі, чекайте нагадування",
+    "escalate_group": "не отримано підтвердження, залучаємо мед.сестру",
+    "escalate_dm": "пацієнт ({patient_label}): пропустив {date} {time}, {pill_text}",
+    # v2 measurement acks/errors + daily check
+    "measure_ack": "отримано показник {measure_label}. Все ок.",
+    "measure_error_arity": "вибачте, помилка. має бути {expected} числа",
+    "measure_error_one": "вибачте, помилка. має бути 1 число",
+    "measure_unknown": "вибачте, помилка. невідомий показник",
+    "measure_missing_today": "сьогодні не отримано показник {measure_label}",
+    # v3 buttons / prompts / help
+    "btn_pressure": "Тиск",
+    "btn_weight": "Вага",
+    "btn_help": "Help",
+    "btn_confirm_taken": "Ліки вже прийнято",
+    "prompt_pressure": 'Введіть три числа: систолічний, діастолічний, пульс. Приклад: "тиск 120 80 60".',
+    "prompt_weight": 'Введіть одну цифру (кг). Приклад: "вага 72,5".',
+    "help_brief": (
+        "Кнопки:\n"
+        '• Тиск — надішліть 3 числа: верхній, нижній, пульс (наприклад: "тиск 120 80 60").\n'
+        '• Вага — надішліть одне число в кг (наприклад: "вага 72,5").\n'
+        "• Ліки вже прийнято — підтвердження прийому.\n"
+        'Також можна просто написати: "ок", "+", "так" тощо.'
+    ),
+    # v3 callback responses / guards
+    "cb_only_patient": "Ця кнопка — лише для пацієнта.",
+    "cb_already_done": "Це нагадування вже підтверджено. Дякую!",
+    "cb_late_ok": "Підтверджено. Дякую!",
+    "cb_no_target": "Немає активного нагадування.",
+}
+
+
+def fmt(key: str, **kwargs) -> str:
+    return MESSAGES[key].format(**kwargs)
+
+
+### FILE: ./core/logging_utils.py
+# pillsbot/core/logging_utils.py
+from __future__ import annotations
+
+import logging
+import os
+from logging.handlers import RotatingFileHandler
+from typing import Any
+
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s — %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def setup_logging(cfg: Any) -> logging.Logger:
+    """
+    Configure logging:
+    - Console shows INFO and above (clean runtime output).
+    - Audit log file stores DEBUG and above (full trace).
+    """
+    log_dir = os.path.dirname(cfg.AUDIT_LOG_FILE)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    root = logging.getLogger("pillsbot")
+    root.setLevel(logging.DEBUG)  # Allow DEBUG to propagate to file handler
+
+    fmt = logging.Formatter(LOG_FORMAT, DATE_FORMAT)
+
+    # File handler — DEBUG level, full history
+    fh = RotatingFileHandler(
+        cfg.AUDIT_LOG_FILE, maxBytes=1_000_000, backupCount=10, encoding="utf-8"
+    )
+    fh.setFormatter(fmt)
+    fh.setLevel(logging.DEBUG)
+
+    # Console handler — INFO level, clean output
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    ch.setLevel(logging.INFO)
+
+    root.handlers.clear()
+    root.addHandler(fh)
+    root.addHandler(ch)
+
+    return root
+
+
+def kv(**kwargs: Any) -> str:
+    """Key=value compact formatting (values repr()'d for clarity)."""
+    return " ".join(f"{k}={v!r}" for k, v in kwargs.items())
+
+
+### FILE: ./core/matcher.py
+# pillsbot/core/matcher.py
+from __future__ import annotations
+
+import re
+from typing import Iterable, List, Pattern
+
+
+class Matcher:
+    """
+    Regex-based confirmation matcher (Unicode + case-insensitive).
+    All matching semantics live in the provided patterns (see config.CONFIRM_PATTERNS).
+    No input normalization or pattern rewriting happens here.
+    """
+
+    def __init__(self, patterns: Iterable[str]) -> None:
+        flags = re.IGNORECASE | re.UNICODE
+        self._compiled: List[Pattern[str]] = [re.compile(p, flags) for p in patterns]
+
+    def matches_confirmation(self, text: str | None) -> bool:
+        if not text:
+            return False
+        return any(rx.search(text) for rx in self._compiled)
+
+
+__all__ = ["Matcher"]
+
+
+### FILE: ./core/measurements.py
+# pillsbot/core/measurements.py
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime, date
+from typing import Any, Dict, List, Optional, Tuple
+
+
+@dataclass
+class MeasureDef:
+    id: str
+    label: str
+    patterns: List[str]
+    csv_file: str
+    parser_kind: str  # "int3" | "float1"
+    separators: Optional[List[str]] = None  # for pressure
+    decimal_commas: Optional[bool] = None  # for weight
+
+
+class MeasurementRegistry:
+    """
+    Central registry for measurement parsing + storage.
+
+    * Start-anchored dispatch by configured patterns.
+    * Optional punctuation after keyword (':' or '-') is allowed.
+    * Per-measure syntax validation/parsing.
+    * CSV append with header creation.
+    * 'has_today' helper for daily checks.
+    """
+
+    def __init__(self, tz, measures_cfg: Dict[str, Dict[str, Any]] | None = None):
+        self.tz = tz
+        self.measures: Dict[str, MeasureDef] = {}
+        self._compiled: Dict[str, re.Pattern[str]] = {}
+        measures_cfg = measures_cfg or {}
+        flags = re.IGNORECASE | re.UNICODE
+
+        for mid, m in measures_cfg.items():
+            md = MeasureDef(
+                id=mid,
+                label=m["label"],
+                patterns=m["patterns"],
+                csv_file=m["csv_file"],
+                parser_kind=m["parser_kind"],
+                separators=m.get("separators"),
+                decimal_commas=m.get("decimal_commas"),
+            )
+            self.measures[mid] = md
+            # ^\s*(kw1|kw2|...)\b[:\-]?\s*(?P<body>.*)?$
+            union = "|".join(re.escape(p) for p in md.patterns)
+            self._compiled[mid] = re.compile(
+                rf"^\s*(?:{union})\b[:\-]?\s*(?P<body>.+)?$", flags
+            )
+
+    def available(self) -> List[str]:
+        return list(self.measures.keys())
+
+    def get_label(self, measure_id: str) -> str:
+        return self.measures[measure_id].label
+
+    # ---- Dispatch (start-anchored) ----
+    def match(self, text: str | None) -> Optional[Tuple[str, str]]:
+        t = text or ""
+        for mid, rx in self._compiled.items():
+            m = rx.match(t)
+            if m:
+                body = (m.group("body") or "").strip()
+                return mid, body
+        return None
+
+    # ---- Parsing per measure ----
+    def parse(self, measure_id: str, body: str) -> Dict[str, Any]:
+        md = self.measures[measure_id]
+        if md.parser_kind == "int3":
+            # pressure: exactly three integers; separators: space/comma/slash
+            seps = md.separators or [" ", ",", "/"]
+            s = body.strip()
+            if not s:
+                return {"ok": False, "error": "arity"}
+            for sep in seps:
+                s = s.replace(sep, " ")
+            parts = [p for p in s.strip().split() if p]
+            if len(parts) != 3:
+                return {"ok": False, "error": "arity"}
+            vals: List[int] = []
+            for p in parts:
+                if p.startswith("+"):
+                    p = p[1:]
+                if not p.isdigit():
+                    return {"ok": False, "error": "format"}
+                vals.append(int(p))
+            return {"ok": True, "values": tuple(vals)}
+        elif md.parser_kind == "float1":
+            # weight: exactly one number (dot or comma decimal), non-negative
+            tok = (body or "").strip()
+            toks = tok.split()
+            if len(toks) != 1:
+                return {"ok": False, "error": "arity_one"}
+            token = toks[0]
+            if md.decimal_commas:
+                token = token.replace(",", ".")
+            if token.startswith("+"):
+                token = token[1:]
+            try:
+                v = float(token)
+            except ValueError:
+                return {"ok": False, "error": "format_one"}
+            if v < 0 or v != v or v in (float("inf"), float("-inf")):
+                return {"ok": False, "error": "format_one"}
+            return {"ok": True, "values": (v,)}
+        else:
+            raise ValueError(f"Unknown parser_kind for {measure_id}: {md.parser_kind}")
+
+    # ---- CSV writing ----
+    def append_csv(
+        self,
+        measure_id: str,
+        dt_local: datetime,
+        patient_id: int,
+        patient_label: str,
+        values: tuple,
+    ) -> None:
+        md = self.measures[measure_id]
+        path = md.csv_file
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        is_new = not os.path.exists(path)
+
+        with open(path, "a", encoding="utf-8") as f:
+            if is_new:
+                if measure_id == "pressure":
+                    f.write(
+                        "date_time_local,patient_id,patient_label,systolic,diastolic,pulse\n"
+                    )
+                elif measure_id == "weight":
+                    f.write("date_time_local,patient_id,patient_label,weight\n")
+                else:
+                    cols = ",".join(f"value{i + 1}" for i in range(len(values)))
+                    f.write(f"date_time_local,patient_id,patient_label,{cols}\n")
+
+            ts = dt_local.strftime("%Y-%m-%d %H:%M")
+            if measure_id == "pressure":
+                sys, dia, pul = values
+                f.write(f"{ts},{patient_id},{patient_label},{sys},{dia},{pul}\n")
+            elif measure_id == "weight":
+                (w,) = values
+                f.write(f"{ts},{patient_id},{patient_label},{w}\n")
+            else:
+                vals = ",".join(str(x) for x in values)
+                f.write(f"{ts},{patient_id},{patient_label},{vals}\n")
+
+    # ---- Daily check helper ----
+    def has_today(self, measure_id: str, patient_id: int, date_local: date) -> bool:
+        md = self.measures[measure_id]
+        path = md.csv_file
+        if not os.path.exists(path):
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            _ = f.readline()  # header
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                if len(parts) < 3:
+                    continue
+                dt_str = parts[0].strip()
+                pid_str = parts[1].strip()
+                try:
+                    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+                    pid = int(pid_str)
+                except Exception:
+                    continue
+                if pid == patient_id and dt.date() == date_local:
+                    return True
+        return False
+
+
+### FILE: ./core/reminder_engine.py
+# pillsbot/core/reminder_engine.py
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Dict, Optional, Any, List, Tuple
+from zoneinfo import ZoneInfo
+import os
+
+from pillsbot.core.matcher import Matcher
+from pillsbot.core.i18n import fmt, MESSAGES
+from pillsbot.core.logging_utils import kv
+from pillsbot.core.measurements import MeasurementRegistry
+from pillsbot.core.config_validation import validate_config
+
+
+# --------------------------------------------------------------------------------------
+# Public data structures kept here so other modules (adapters) don't need to change
+# --------------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class DoseKey:
+    patient_id: int
+    date_str: str  # YYYY-MM-DD (engine-local string)
+    time_str: str  # HH:MM
+
+
+@dataclass
+class IncomingMessage:
+    group_id: int
+    sender_user_id: int
+    text: str
+    sent_at_utc: datetime
+
+
+# --------------------------------------------------------------------------------------
+# Internal helpers / small types
+# --------------------------------------------------------------------------------------
+class Status(Enum):
+    """Internal status enum; stored as strings on instances for compatibility."""
+
+    PENDING = "Pending"
+    AWAITING = "AwaitingConfirmation"
+    CONFIRMED = "Confirmed"
+    ESCALATED = "Escalated"
+
+
+@dataclass
+class DoseInstance:
+    dose_key: DoseKey
+    patient_id: int
+    patient_label: str
+    group_id: int
+    nurse_user_id: int
+    pill_text: str
+    scheduled_dt_local: datetime
+    status: str = Status.PENDING.value
+    attempts_sent: int = 0
+    preconfirmed: bool = False
+    retry_task: Optional[asyncio.Task] = None
+    last_message_ids: List[int] = field(default_factory=list)  # debug/trace only
+
+
+class Clock:
+    """Injectable time source (simple & testable)."""
+
+    def __init__(self, tz: ZoneInfo):
+        self.tz = tz
+
+    def now(self) -> datetime:
+        return datetime.now(self.tz)
+
+    def today_str(self) -> str:
+        return self.now().strftime("%Y-%m-%d")
+
+
+# --------------------------------------------------------------------------------------
+# ReminderEngine
+# --------------------------------------------------------------------------------------
+class ReminderEngine:
+    """
+    v3 engine, refactored to be simpler & more debuggable:
+    - explicit helpers for state/retry/selection/replies
+    - status via small Enum (stored as strings for compatibility)
+    - inline-callback resolution by message_id (robust) with fallbacks
+    Public API unchanged; plus legacy test shims for *_job names.
+    """
+
+    # ---- lifecycle -------------------------------------------------------------------
+    def __init__(self, config: Any, adapter: Any, clock: Optional[Clock] = None):
+        self.cfg = config
+        self.adapter = adapter
+        self.tz: ZoneInfo = config.TZ
+        self.clock = clock or Clock(self.tz)
+
+        # Natural language bits
+        self.matcher = Matcher(config.CONFIRM_PATTERNS)
+
+        # Measurements
+        measures_cfg = getattr(config, "MEASURES", {}) or {}
+        self.measures = MeasurementRegistry(self.tz, measures_cfg)
+
+        # State
+        self.state: Dict[DoseKey, DoseInstance] = {}
+        self.group_to_patient: Dict[int, int] = {
+            p["group_id"]: p["patient_id"] for p in config.PATIENTS
+        }
+        self.patient_index: Dict[int, dict] = {
+            p["patient_id"]: p for p in config.PATIENTS
+        }
+
+        # Map sent Telegram message_id -> DoseKey (for robust inline callback resolution)
+        self.msg_to_key: Dict[int, DoseKey] = {}
+
+        # Filesystem
+        os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
+        os.makedirs(
+            os.path.dirname(getattr(config, "AUDIT_LOG_FILE", "pillsbot/logs")),
+            exist_ok=True,
+        )
+
+        # Logging
+        self.log = logging.getLogger("pillsbot.engine")
+
+    async def start(self, scheduler) -> None:
+        """Validate config, seed today's state, and install recurring jobs."""
+        validate_config(self.cfg)
+        self._ensure_today_instances()
+
+        installed: List[dict] = []
+        # Dose jobs
+        for p in self.cfg.PATIENTS:
+            for d in p["doses"]:
+                hh, mm = map(int, d["time"].split(":"))
+                job_id = f"dose_{p['patient_id']}_{d['time']}"
+                scheduler.add_job(
+                    self._job_start_dose,
+                    trigger="cron",
+                    hour=hh,
+                    minute=mm,
+                    timezone=self.tz,
+                    args=[p["patient_id"], d["time"]],
+                    id=job_id,
+                    replace_existing=True,
+                )
+                self.log.debug(
+                    "job.install "
+                    + kv(
+                        job_id=job_id,
+                        patient_id=p["patient_id"],
+                        time=d["time"],
+                        text=d["text"],
+                    )
+                )
+                installed.append(
+                    dict(
+                        job_id=job_id,
+                        patient_id=p["patient_id"],
+                        time=d["time"],
+                        text=d["text"],
+                    )
+                )
+
+        # Measurement checks
+        for p in self.cfg.PATIENTS:
+            checks = p.get("measurement_checks", []) or []
+            for chk in checks:
+                mid = chk.get("measure_id")
+                t = chk.get("time")
+                if not mid or mid not in self.measures.available():
+                    self.log.debug(
+                        "mcheck.skip "
+                        + kv(
+                            patient_id=p["patient_id"],
+                            measure_id=mid,
+                            reason="unknown measure",
+                        )
+                    )
+                    continue
+                hh, mm = map(int, t.split(":"))
+                job_id = f"measure_check:{p['patient_id']}:{mid}:{t}"
+                scheduler.add_job(
+                    self._job_measure_check,
+                    trigger="cron",
+                    hour=hh,
+                    minute=mm,
+                    timezone=self.tz,
+                    args=[p["patient_id"], mid],
+                    id=job_id,
+                    replace_existing=True,
+                )
+                self.log.debug(
+                    "job.install "
+                    + kv(
+                        job_id=job_id,
+                        patient_id=p["patient_id"],
+                        measure_id=mid,
+                        time=t,
+                    )
+                )
+                installed.append(
+                    dict(
+                        job_id=job_id,
+                        patient_id=p["patient_id"],
+                        time=t,
+                        text=f"check {mid}",
+                    )
+                )
+
+        # Single INFO line per job on startup for visibility
+        for j in installed:
+            self.log.info(
+                "startup.cron "
+                + kv(
+                    job_id=j["job_id"],
+                    patient_id=j["patient_id"],
+                    time=j["time"],
+                    text=j["text"],
+                )
+            )
+
+    # ---- incoming from adapter --------------------------------------------------------
+    async def on_patient_message(self, msg: IncomingMessage) -> None:
+        """Main entry for any text from the patient's group."""
+        self.log.info(
+            "msg.engine.in "
+            + kv(
+                group_id=msg.group_id,
+                sender_user_id=msg.sender_user_id,
+                text=(msg.text or ""),
+            )
+        )
+
+        pid = self.group_to_patient.get(msg.group_id)
+        if pid is None or pid != msg.sender_user_id:
+            self.log.debug(
+                "msg.engine.reject "
+                + kv(
+                    reason="unauthorized or unknown group",
+                    group_id=msg.group_id,
+                    sender_user_id=msg.sender_user_id,
+                )
+            )
+            return
+
+        patient = self.patient_index[pid]
+        text = (msg.text or "").strip()
+        low = text.lower()
+
+        # Button flows (compare via i18n keys)
+        if low == MESSAGES["btn_pressure"].lower():
+            await self._prompt(patient["group_id"], "prompt_pressure", patient)
+            return
+        if low == MESSAGES["btn_weight"].lower():
+            await self._prompt(patient["group_id"], "prompt_weight", patient)
+            return
+        if low == MESSAGES["btn_help"].lower():
+            await self._reply(patient["group_id"], "help_brief", with_fixed_kb=patient)
+            return
+
+        # Measurements (anchored)
+        mm = self.measures.match(text)
+        if mm:
+            mid, body = mm
+            parsed = self.measures.parse(mid, body)
+            if parsed.get("ok"):
+                now_local = self._now()
+                self.measures.append_csv(
+                    mid, now_local, pid, patient["patient_label"], parsed["values"]
+                )
+                await self._reply(
+                    patient["group_id"],
+                    "measure_ack",
+                    with_fixed_kb=patient,
+                    measure_label=self.measures.get_label(mid),
+                )
+            else:
+                md = self.measures.measures[mid]
+                if md.parser_kind == "int3":
+                    await self._reply(
+                        patient["group_id"],
+                        "measure_error_arity",
+                        with_fixed_kb=patient,
+                        expected=3,
+                    )
+                else:
+                    await self._reply(
+                        patient["group_id"], "measure_error_one", with_fixed_kb=patient
+                    )
+            return
+
+        # Confirmation (free text)
+        if not self.matcher.matches_confirmation(text):
+            await self._reply(
+                patient["group_id"], "measure_unknown", with_fixed_kb=patient
+            )
+            return
+
+        # Map confirmation → a target dose
+        now = self._now()
+        target = self._select_target_for_confirmation(now, patient)
+        if target is None:
+            await self._reply(patient["group_id"], "too_early", with_fixed_kb=patient)
+            return
+
+        if self._status(target) == Status.AWAITING:
+            await self._confirm_and_ack(target, patient, reason="patient confirmed")
+            return
+
+        # Preconfirm path (within grace)
+        delta = (target.scheduled_dt_local - now).total_seconds()
+        if 0 <= delta <= self.cfg.TAKING_GRACE_INTERVAL_S:
+            self._set_status(target, Status.CONFIRMED, reason="preconfirm within grace")
+            target.preconfirmed = True
+            target.attempts_sent = 0
+            self._log_outcome_csv(target, status="OK")
+            await self._reply(target.group_id, "preconfirm_ack", with_fixed_kb=patient)
+        else:
+            await self._reply(target.group_id, "too_early", with_fixed_kb=patient)
+
+    async def on_inline_confirm(
+        self,
+        group_id: int,
+        from_user_id: int,
+        data: str,
+        message_id: Optional[int] = None,
+    ) -> dict:
+        """
+        Inline button confirm.
+        Returns dict for adapter: {'cb_text': str|None, 'show_alert': bool}.
+        Resolution order: message_id → payload → any awaiting/escalated today.
+        """
+        expected_pid = self.group_to_patient.get(group_id)
+        if expected_pid is None or from_user_id != expected_pid:
+            return {"cb_text": fmt("cb_only_patient"), "show_alert": False}
+
+        inst: Optional[DoseInstance] = None
+
+        # 1) Resolve by message_id first (authoritative mapping)
+        if message_id is not None:
+            key = self.msg_to_key.get(message_id)
+            if key:
+                inst = self.state.get(key)
+                if inst is None:
+                    self.log.debug(
+                        "cb.resolve.msgid.miss "
+                        + kv(message_id=message_id, reason="key pruned")
+                    )
+                else:
+                    self.log.debug(
+                        "cb.resolve.msgid.hit "
+                        + kv(
+                            message_id=message_id,
+                            patient_id=key.patient_id,
+                            time=key.time_str,
+                        )
+                    )
+
+        # 2) Fallback by payload (pid/date/time)
+        if inst is None:
+            parts = (data or "").split(":")
+            if len(parts) == 4 and parts[0] == "confirm":
+                try:
+                    pid = int(parts[1])
+                    date_s = parts[2]
+                    time_s = parts[3]
+                except Exception:
+                    pid = -1
+                    date_s = ""
+                    time_s = ""
+                if pid == expected_pid:
+                    inst = self.state.get(DoseKey(pid, date_s, time_s))
+                    if inst:
+                        self.log.debug(
+                            "cb.resolve.payload.hit "
+                            + kv(patient_id=pid, date=date_s, time=time_s)
+                        )
+                    else:
+                        self.log.debug(
+                            "cb.resolve.payload.miss "
+                            + kv(patient_id=pid, date=date_s, time=time_s)
+                        )
+
+        # 3) Last resort: any AWAITING/ESCALATED for this patient today with same time (or any awaiting)
+        if inst is None:
+            today = self._today_str()
+            time_guess = None
+            parts = (data or "").split(":")
+            if len(parts) == 4 and parts[0] == "confirm":
+                time_guess = parts[3]
+            for k, v in self.state.items():
+                if (
+                    k.patient_id == expected_pid
+                    and k.date_str == today
+                    and self._status(v) in (Status.AWAITING, Status.ESCALATED)
+                ):
+                    if time_guess is None or k.time_str == time_guess:
+                        inst = v
+                        self.log.debug(
+                            "cb.resolve.fallback.hit "
+                            + kv(
+                                patient_id=k.patient_id,
+                                date=k.date_str,
+                                time=k.time_str,
+                            )
+                        )
+                        break
+
+        if inst is None:
+            return {"cb_text": fmt("cb_no_target"), "show_alert": False}
+
+        status = self._status(inst)
+        if status == Status.CONFIRMED:
+            return {"cb_text": fmt("cb_already_done"), "show_alert": False}
+        if status not in (Status.AWAITING, Status.ESCALATED):
+            return {"cb_text": fmt("cb_no_target"), "show_alert": False}
+
+        previous = status
+        patient = self.patient_index.get(inst.patient_id)
+        await self._confirm_and_ack(inst, patient, reason="inline button")
+        if previous == Status.ESCALATED:
+            msg = f"Пізнє підтвердження: {inst.patient_label} за {inst.dose_key.date_str} {inst.dose_key.time_str} — OK."
+            await self.adapter.send_nurse_dm(inst.nurse_user_id, msg)
+
+        return {"cb_text": None, "show_alert": False}
+
+    # ---- jobs (scheduler) -------------------------------------------------------------
+    async def _job_start_dose(self, patient_id: int, time_str: str) -> None:
+        """Scheduler entry: set awaiting, send first reminder, refresh keyboard, start retry loop."""
+        self.log.debug("job.trigger " + kv(patient_id=patient_id, time=time_str))
+        self._ensure_today_instances()
+
+        key = self._dosekey_today(patient_id, time_str)
+        inst = self.state.get(key)
+        if not inst:
+            self.log.debug(
+                "job.trigger.miss " + kv(patient_id=patient_id, time=time_str)
+            )
+            return
+        if self._status(inst) == Status.CONFIRMED:
+            self.log.debug(
+                "job.trigger.skip "
+                + kv(patient_id=patient_id, time=time_str, reason="already confirmed")
+            )
+            return
+
+        # Pre-set awaiting FIRST to eliminate tap-before-set race
+        self._set_status(inst, Status.AWAITING, reason="first reminder pre-set")
+        inst.attempts_sent = 1
+
+        await self._send_reminder(inst, "reminder")
+        await self._refresh_reply_kb(self.patient_index[inst.patient_id])
+        await self._start_retry(inst)
+
+    async def _job_measure_check(self, patient_id: int, measure_id: str) -> None:
+        """Scheduler entry: daily 'missing today' measurement check."""
+        self.log.debug(
+            "job.trigger "
+            + kv(kind="measure_check", patient_id=patient_id, measure_id=measure_id)
+        )
+        patient = self.patient_index.get(patient_id)
+        if not patient:
+            self.log.debug(
+                "job.trigger.miss "
+                + kv(reason="unknown patient", patient_id=patient_id)
+            )
+            return
+        today = self._now().date()
+        if not self.measures.has_today(measure_id, patient_id, today):
+            label = self.measures.get_label(measure_id)
+            await self._reply(
+                patient["group_id"],
+                "measure_missing_today",
+                with_fixed_kb=patient,
+                measure_label=label,
+            )
+
+    # ---------- Legacy test shims (compat wrappers to keep tests green) ----------------
+    async def _start_dose_job(self, patient_id: int, time_str: str) -> None:
+        """Compatibility wrapper for older tests."""
+        await self._job_start_dose(patient_id, time_str)
+
+    async def _measurement_check_job(self, patient_id: int, measure_id: str) -> None:
+        """Compatibility wrapper for older tests."""
+        await self._job_measure_check(patient_id, measure_id)
+
+    # ---- retry management -------------------------------------------------------------
+    async def _start_retry(self, inst: DoseInstance) -> None:
+        """Start the retry loop for a dose (idempotent)."""
+        self._stop_retry(inst)  # just in case
+        inst.retry_task = asyncio.create_task(self._retry_loop(inst))
+        self.log.debug(
+            "job.retry.start "
+            + kv(
+                patient_id=inst.patient_id,
+                time=inst.dose_key.time_str,
+                interval_s=self.cfg.RETRY_INTERVAL_S,
+            )
+        )
+
+    def _stop_retry(self, inst: DoseInstance) -> None:
+        """Cancel a running retry task if present."""
+        if inst.retry_task and not inst.retry_task.done():
+            inst.retry_task.cancel()
+
+    async def _retry_loop(self, inst: DoseInstance) -> None:
+        """Retry loop: send repeats up to N, then escalate."""
+        I = self.cfg.RETRY_INTERVAL_S
+        N = self.cfg.MAX_RETRY_ATTEMPTS
+        try:
+            while self._status(inst) == Status.AWAITING:
+                await asyncio.sleep(I)
+                if self._status(inst) != Status.AWAITING:
+                    break
+                if inst.attempts_sent < N:
+                    await self._send_reminder(inst, "repeat_reminder")
+                    await self._refresh_reply_kb(self.patient_index[inst.patient_id])
+                    inst.attempts_sent += 1
+                    self.log.debug(
+                        "job.retry.tick "
+                        + kv(
+                            patient_id=inst.patient_id,
+                            time=inst.dose_key.time_str,
+                            attempt=inst.attempts_sent,
+                        )
+                    )
+                else:
+                    await self._escalate(inst)
+                    break
+        except asyncio.CancelledError:
+            self.log.debug(
+                "job.retry.cancel "
+                + kv(patient_id=inst.patient_id, time=inst.dose_key.time_str)
+            )
+            raise
+
+    async def _escalate(self, inst: DoseInstance) -> None:
+        """Escalate to nurse after max retries; keep existing inline buttons on prior messages."""
+        patient = self.patient_index[inst.patient_id]
+        kb_fixed = None
+        # Build keyboard only if adapter provides it (tests' FakeAdapter might not)
+        if hasattr(self.adapter, "build_patient_reply_kb"):
+            try:
+                kb_fixed = self.adapter.build_patient_reply_kb(patient)
+            except Exception as e:
+                self.log.debug(
+                    "kb.build.error " + kv(group_id=patient.get("group_id"), err=str(e))
+                )
+        await self._send_group(
+            inst.group_id, fmt("escalate_group"), reply_markup=kb_fixed
+        )
+
+        when = inst.scheduled_dt_local
+        await self.adapter.send_nurse_dm(
+            inst.nurse_user_id,
+            fmt(
+                "escalate_dm",
+                patient_label=inst.patient_label,
+                date=when.strftime("%Y-%m-%d"),
+                time=when.strftime("%H:%M"),
+                pill_text=inst.pill_text,
+            ),
+        )
+
+        self._set_status(inst, Status.ESCALATED, reason="max retries exceeded")
+        self._log_outcome_csv(inst, status="Escalated")
+        self.log.debug(
+            "job.retry.stop "
+            + kv(
+                patient_id=inst.patient_id,
+                time=inst.dose_key.time_str,
+                reason="escalated",
+            )
+        )
+
+    # ---- selection / confirmation -----------------------------------------------------
+    def _select_target_for_confirmation(
+        self, now: datetime, patient: dict
+    ) -> Optional[DoseInstance]:
+        """Prefer the actively waiting dose; otherwise the nearest upcoming (same day)."""
+        pid = patient["patient_id"]
+        today = self._today_str()
+
+        # 1) Actively waiting
+        for d in patient["doses"]:
+            key = DoseKey(pid, today, d["time"])
+            inst = self.state.get(key)
+            if inst and self._status(inst) == Status.AWAITING:
+                return inst
+
+        # 2) Nearest upcoming today (not confirmed/escalated)
+        best: Tuple[Optional[DoseInstance], Optional[datetime]] = (None, None)
+        for d in patient["doses"]:
+            key = DoseKey(pid, today, d["time"])
+            inst = self.state.get(key)
+            if not inst or self._status(inst) in (Status.CONFIRMED, Status.ESCALATED):
+                continue
+            dt = inst.scheduled_dt_local
+            if dt >= now and (best[1] is None or dt < best[1]):
+                best = (inst, dt)
+        return best[0]
+
+    async def _confirm_and_ack(
+        self, inst: DoseInstance, patient: dict, reason: str
+    ) -> None:
+        """Confirm a dose, stop retry loop, log outcome, and send ack with fixed keyboard."""
+        if inst.retry_task and not inst.retry_task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                self._stop_retry(inst)
+                await inst.retry_task
+        self._set_status(inst, Status.CONFIRMED, reason=reason)
+        self._log_outcome_csv(inst, status="OK")
+        await self._reply(inst.group_id, "confirm_ack", with_fixed_kb=patient)
+
+    # ---- state management -------------------------------------------------------------
+    def _ensure_today_instances(self) -> None:
+        """Prune old instances and (re)create today's. Also prune msg→key map."""
+        today = self._today_str()
+
+        # prune non-today
+        if self.state:
+            kept: Dict[DoseKey, DoseInstance] = {
+                k: v for k, v in self.state.items() if k.date_str == today
+            }
+            if len(kept) != len(self.state):
+                self.log.debug("state.prune " + kv(removed=len(self.state) - len(kept)))
+            self.state = kept
+
+        # prune msg_to_key entries pointing to non-existent keys
+        if self.msg_to_key:
+            removed = 0
+            for mid in list(self.msg_to_key.keys()):
+                if self.msg_to_key[mid] not in self.state:
+                    del self.msg_to_key[mid]
+                    removed += 1
+            if removed:
+                self.log.debug("state.msgmap.prune " + kv(removed=removed))
+
+        # create today's
+        for p in self.cfg.PATIENTS:
+            for d in p["doses"]:
+                key = DoseKey(p["patient_id"], today, d["time"])
+                if key in self.state:
+                    continue
+                hh, mm = map(int, d["time"].split(":"))
+                sched = self._now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+                inst = DoseInstance(
+                    dose_key=key,
+                    patient_id=p["patient_id"],
+                    patient_label=p["patient_label"],
+                    group_id=p["group_id"],
+                    nurse_user_id=p["nurse_user_id"],
+                    pill_text=d["text"],
+                    scheduled_dt_local=sched,
+                )
+                self.state[key] = inst
+                self.log.debug(
+                    "state.instance.create "
+                    + kv(
+                        patient_id=inst.patient_id,
+                        time=d["time"],
+                        text=inst.pill_text,
+                        status=inst.status,
+                    )
+                )
+
+    def _set_status(self, inst: DoseInstance, status: Status, reason: str) -> None:
+        """Set status with a consistent debug log."""
+        old = inst.status
+        inst.status = status.value  # store as string for compatibility
+        self.log.debug(
+            "state.status.change "
+            + kv(
+                patient_id=inst.patient_id,
+                time=inst.dose_key.time_str,
+                from_status=old,
+                to_status=inst.status,
+                reason=reason,
+            )
+        )
+
+    def _status(self, inst: DoseInstance) -> Status:
+        """Convert stored string status back to enum."""
+        s = inst.status
+        if s == Status.AWAITING.value:
+            return Status.AWAITING
+        if s == Status.CONFIRMED.value:
+            return Status.CONFIRMED
+        if s == Status.ESCALATED.value:
+            return Status.ESCALATED
+        return Status.PENDING
+
+    # ---- messaging helpers ------------------------------------------------------------
+    async def _send_reminder(self, inst: DoseInstance, text_key: str) -> None:
+        """
+        Send a reminder (first or repeat) with inline confirm (if enabled),
+        and remember the message_id → dose mapping for robust callbacks.
+        """
+        inline_enabled = getattr(self.cfg, "INLINE_CONFIRM_ENABLED", True)
+        kb_inline = (
+            self.adapter.build_confirm_inline_kb(inst.dose_key)
+            if inline_enabled and hasattr(self.adapter, "build_confirm_inline_kb")
+            else None
+        )
+        text = (
+            fmt("reminder", pill_text=inst.pill_text)
+            if text_key == "reminder"
+            else fmt("repeat_reminder")
+        )
+        msg_id = await self._send_group(inst.group_id, text, reply_markup=kb_inline)
+        if msg_id is not None:
+            inst.last_message_ids.append(msg_id)
+            self.msg_to_key[msg_id] = inst.dose_key
+        else:
+            self.log.error(
+                "msg.reminder.error "
+                + kv(
+                    group_id=inst.group_id,
+                    patient_id=inst.patient_id,
+                    time=inst.dose_key.time_str,
+                    kind=text_key,
+                )
+            )
+
+    async def _send_group(
+        self, group_id: int, text: str, reply_markup: Any | None = None
+    ) -> Optional[int]:
+        """
+        Wrapper to send a group message with error handling.
+        Returns message_id or None on error.
+
+        Compatible with test FakeAdapter that doesn't accept `reply_markup`.
+        """
+        try:
+            self.log.info(
+                "msg.engine.reply "
+                + kv(
+                    group_id=group_id,
+                    template=text[:64] + ("..." if len(text) > 64 else ""),
+                )
+            )
+            # Preferred call (adapters that support reply_markup)
+            try:
+                return await self.adapter.send_group_message(
+                    group_id, text, reply_markup=reply_markup
+                )
+            except TypeError:
+                # Fallback: adapter only supports (group_id, text)
+                return await self.adapter.send_group_message(group_id, text)
+        except Exception as e:
+            self.log.error(
+                "msg.engine.reply.error " + kv(group_id=group_id, err=str(e))
+            )
+            return None
+
+    async def _reply(
+        self,
+        group_id: int,
+        template_key: str,
+        *,
+        with_fixed_kb: Optional[dict] = None,
+        **fmt_args: Any,
+    ) -> Optional[int]:
+        """Send a group message using i18n template; optionally attach fixed reply keyboard."""
+        kb = None
+        if with_fixed_kb is not None and hasattr(
+            self.adapter, "build_patient_reply_kb"
+        ):
+            try:
+                kb = self.adapter.build_patient_reply_kb(with_fixed_kb)
+            except Exception as e:
+                self.log.debug("kb.build.error " + kv(group_id=group_id, err=str(e)))
+        text = fmt(template_key, **fmt_args) if fmt_args else fmt(template_key)
+        return await self._send_group(group_id, text, reply_markup=kb)
+
+    async def _prompt(
+        self, group_id: int, template_key: str, patient: dict, **fmt_args: Any
+    ) -> Optional[int]:
+        """Send a ForceReply prompt (selective) for guided input like BP/weight."""
+        markup = None
+        if hasattr(self.adapter, "build_force_reply"):
+            try:
+                markup = self.adapter.build_force_reply()
+            except Exception as e:
+                self.log.debug(
+                    "force_reply.build.error " + kv(group_id=group_id, err=str(e))
+                )
+        text = fmt(template_key, **fmt_args) if fmt_args else fmt(template_key)
+        return await self._send_group(group_id, text, reply_markup=markup)
+
+    async def _refresh_reply_kb(self, patient: dict) -> None:
+        """
+        Refresh fixed reply keyboard using adapter helper, with a safe fallback if missing.
+        The adapter method sends a small visible message with the keyboard.
+        """
+        try:
+            if hasattr(self.adapter, "refresh_reply_keyboard") and callable(
+                self.adapter.refresh_reply_keyboard
+            ):
+                await self.adapter.refresh_reply_keyboard(patient)
+                return
+        except Exception as e:
+            self.log.error(
+                "keyboard.refresh.error "
+                + kv(group_id=patient.get("group_id"), err=str(e))
+            )
+            # continue to fallback
+
+        # Fallback: send visible message with keyboard directly if we can build it
+        try:
+            if hasattr(self.adapter, "build_patient_reply_kb"):
+                kb = self.adapter.build_patient_reply_kb(patient)
+            else:
+                kb = None
+            await self._send_group(
+                patient["group_id"], "Оновив кнопки ↓", reply_markup=kb
+            )
+        except Exception as e:
+            self.log.error(
+                "keyboard.refresh.fallback.error "
+                + kv(group_id=patient.get("group_id"), err=str(e))
+            )
+
+    # ---- tiny sugar -------------------------------------------------------------------
+    def _now(self) -> datetime:
+        return self.clock.now()
+
+    def _today_str(self) -> str:
+        return self.clock.today_str()
+
+    def _dosekey_today(self, patient_id: int, time_str: str) -> DoseKey:
+        return DoseKey(patient_id, self._today_str(), time_str)
+
+    # ---- outcome CSV ------------------------------------------------------------------
+    def _log_outcome_csv(self, inst: DoseInstance, status: str) -> None:
+        """Append a one-line outcome row into the configured CSV (analytics/audit)."""
+        line = (
+            f"{inst.scheduled_dt_local.strftime('%Y-%m-%d %H:%M')}, "
+            f"{inst.patient_id}, {inst.patient_label}, {inst.pill_text}, {status}, {inst.attempts_sent}\n"
+        )
+        with open(self.cfg.LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
+### FILE: ./__init__.py
+
+
+### FILE: ./tests/integration/test_measure_unknown_behaviour.py
+# pillsbot/tests/integration/test_measure_unknown_behavior.py
+import pytest
+from datetime import UTC, datetime
+from pillsbot.core.reminder_engine import ReminderEngine, IncomingMessage
+from pillsbot import config as cfg
+
+
+class FakeAdapter:
+    def __init__(self):
+        self.sent = []  # (kind, id, text)
+
+    async def send_group_message(self, group_id, text):
+        self.sent.append(("group", group_id, text))
+
+    async def send_nurse_dm(self, user_id, text):
+        self.sent.append(("dm", user_id, text))
+
+
+class NoOpScheduler:
+    def add_job(self, *args, **kwargs):
+        pass
+
+
+def make_engine():
+    class Cfg:
+        TZ = cfg.TZ
+        LOG_FILE = cfg.LOG_FILE
+        CONFIRM_PATTERNS = cfg.CONFIRM_PATTERNS
+        MEASURES = cfg.MEASURES
+        RETRY_INTERVAL_S = 0.05
+        MAX_RETRY_ATTEMPTS = 2
+        TAKING_GRACE_INTERVAL_S = 60
+        PATIENTS = [
+            {
+                "patient_id": 10,
+                "patient_label": "P",
+                "group_id": -10,
+                "nurse_user_id": 20,
+                "doses": [],  # none to avoid confirm effects
+            }
+        ]
+
+    return ReminderEngine(Cfg, FakeAdapter())
+
+
+@pytest.mark.asyncio
+async def test_unknown_when_not_measure_nor_confirmation():
+    eng = make_engine()
+    await eng.start(NoOpScheduler())
+
+    msg = IncomingMessage(
+        group_id=-10,
+        sender_user_id=10,
+        text="hello there",
+        sent_at_utc=datetime.now(UTC),
+    )
+    await eng.on_patient_message(msg)
+
+    assert any("невідомий показник" in t for _, _, t in eng.adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_no_unknown_for_confirmation():
+    eng = make_engine()
+    await eng.start(NoOpScheduler())
+
+    msg = IncomingMessage(
+        group_id=-10, sender_user_id=10, text="ok", sent_at_utc=datetime.now(UTC)
+    )
+    await eng.on_patient_message(msg)
+
+    # For confirmation with no target doses, engine replies "too_early" instead of measure_unknown
+    assert any("ще не на часі" in t for _, _, t in eng.adapter.sent)
+    assert all("невідомий показник" not in t for _, _, t in eng.adapter.sent)
+
+
+### FILE: ./tests/integration/test_retry_and_escalation.py
+import asyncio
+import pytest
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from pillsbot.core.reminder_engine import ReminderEngine, IncomingMessage
+from pillsbot import config as cfg
+
+class FakeAdapter:
+    def __init__(self):
+        self.sent = []
+
+    async def send_group_message(self, group_id, text):
+        self.sent.append(("group", group_id, text))
+
+    async def send_nurse_dm(self, user_id, text):
+        self.sent.append(("dm", user_id, text))
+
+class NoOpScheduler:
+    def __init__(self): pass
+    def add_job(self, *args, **kwargs): pass
+
+def make_engine(interval=0.05, max_attempts=2):
+    now = datetime.now(cfg.TZ)
+    dose_time = (now + timedelta(seconds=0.1)).strftime("%H:%M")
+    class Cfg:
+        TZ = cfg.TZ
+        LOG_FILE = cfg.LOG_FILE
+        CONFIRM_PATTERNS = cfg.CONFIRM_PATTERNS
+        RETRY_INTERVAL_S = interval
+        MAX_RETRY_ATTEMPTS = max_attempts
+        TAKING_GRACE_INTERVAL_S = 0
+        PATIENTS = [{
+            "patient_id": 10,
+            "patient_label": "P",
+            "group_id": -10,
+            "nurse_user_id": 20,
+            "doses": [{"time": dose_time, "text": "X"}],
+        }]
+    eng = ReminderEngine(Cfg, FakeAdapter())
+    return eng
+
+@pytest.mark.asyncio
+async def test_retry_and_escalation():
+    eng = make_engine(interval=0.05, max_attempts=2)
+    await eng.start(NoOpScheduler())
+    # Manually trigger the job (simulate scheduler firing)
+    await eng._start_dose_job(patient_id=10, time_str=list(eng.state.keys())[0].time_str)
+    # Wait enough for retries + escalation
+    await asyncio.sleep(0.2)
+    # Check an escalation happened
+    assert any(kind=="dm" for (kind, _, _) in eng.adapter.sent)
+
+
+### FILE: ./tests/unit/test_matcher.py
+# pillsbot/tests/unit/test_matcher.py
+from pillsbot.core.matcher import Matcher
+from pillsbot import config as cfg
+
+
+def test_matcher_positive_cases():
+    # Use the same patterns as production config to keep tests realistic
+    m = Matcher(cfg.CONFIRM_PATTERNS)
+    for txt in ["Ок", "все ок!", "+", "да", "вже"]:
+        assert m.matches_confirmation(txt)
+
+
+def test_matcher_negative_cases():
+    # Narrow pattern to ensure boundaries work as intended
+    m = Matcher([r"\bтак\b"])
+    assert not m.matches_confirmation("також")  # word boundary prevents false positive
+    assert not m.matches_confirmation("random text")
+
+
+### FILE: ./tests/unit/test_measurements_flow.py
+# pillsbot/tests/unit/test_measurements_flow.py
+import os
+from datetime import UTC, datetime
+
+from pillsbot.core.reminder_engine import ReminderEngine, IncomingMessage
+from pillsbot import config as cfg
+
+
+class FakeAdapter:
+    def __init__(self):
+        self.sent = []  # (kind, id, text)
+
+    async def send_group_message(self, group_id, text):
+        self.sent.append(("group", group_id, text))
+
+    async def send_nurse_dm(self, user_id, text):
+        self.sent.append(("dm", user_id, text))
+
+
+class NoOpScheduler:
+    def add_job(self, *args, **kwargs):
+        pass
+
+
+def _cleanup_csvs(tmp_suffix: str):
+    paths = [
+        f"pillsbot/logs/pressure_{tmp_suffix}.csv",
+        f"pillsbot/logs/weight_{tmp_suffix}.csv",
+    ]
+    for p in paths:
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+
+
+def make_engine(tmp_suffix="x"):
+    # Ensure a clean slate for this test run
+    _cleanup_csvs(tmp_suffix)
+
+    # Use test-specific CSV paths to avoid touching prod logs
+    MEASURES = {k: dict(v) for k, v in cfg.MEASURES.items()}
+    MEASURES["pressure"] = dict(
+        MEASURES["pressure"], csv_file=f"pillsbot/logs/pressure_{tmp_suffix}.csv"
+    )
+    MEASURES["weight"] = dict(
+        MEASURES["weight"], csv_file=f"pillsbot/logs/weight_{tmp_suffix}.csv"
+    )
+
+    class Cfg:
+        TZ = cfg.TZ
+        LOG_FILE = cfg.LOG_FILE
+        CONFIRM_PATTERNS = cfg.CONFIRM_PATTERNS
+        MEASURES = {}  # set right after the class definition
+        RETRY_INTERVAL_S = 0.05
+        MAX_RETRY_ATTEMPTS = 2
+        TAKING_GRACE_INTERVAL_S = 60
+        PATIENTS = [
+            {
+                "patient_id": 100,
+                "patient_label": "P",
+                "group_id": -100,
+                "nurse_user_id": 200,
+                "doses": [],
+                "measurement_checks": [{"measure_id": "pressure", "time": "23:59"}],
+            }
+        ]
+
+    # IMPORTANT: assign here to avoid NameError inside class scope
+    Cfg.MEASURES = MEASURES
+
+    eng = ReminderEngine(Cfg, FakeAdapter())
+    return eng
+
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_measurement_ack_and_csv():
+    eng = make_engine(tmp_suffix="flow1")
+    await eng.start(NoOpScheduler())
+    # Send a good pressure message
+    msg = IncomingMessage(
+        group_id=-100,
+        sender_user_id=100,
+        text="BP 120/80/60",
+        sent_at_utc=datetime.now(UTC),
+    )
+    await eng.on_patient_message(msg)
+    # Should have ack
+    assert any("отримано показник" in t for _, _, t in eng.adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_daily_missing_then_ok():
+    eng = make_engine(tmp_suffix="flow2")
+    await eng.start(NoOpScheduler())
+
+    # First check: no entry today -> missing reminder
+    await eng._measurement_check_job(100, "pressure")
+    assert any("сьогодні не отримано показник" in t for _, _, t in eng.adapter.sent)
+    eng.adapter.sent.clear()
+
+    # Now record a measurement (this will produce an ACK message)
+    msg = IncomingMessage(
+        group_id=-100,
+        sender_user_id=100,
+        text="pressure 120 80 60",
+        sent_at_utc=datetime.now(UTC),
+    )
+    await eng.on_patient_message(msg)
+    assert any("отримано показник" in t for _, _, t in eng.adapter.sent)
+
+    # Check again: should NOT send a "missing" reminder and should NOT append any new messages
+    before = len(eng.adapter.sent)
+    await eng._measurement_check_job(100, "pressure")
+    after = len(eng.adapter.sent)
+    assert before == after  # no additional messages
+    # and specifically no "missing" text present
+    assert not any("сьогодні не отримано показник" in t for _, _, t in eng.adapter.sent)
+
+
+### FILE: ./tests/unit/test_measurements_parsing.py
+# pillsbot/tests/unit/test_measurements_parsing.py
+from pillsbot.core.measurements import MeasurementRegistry
+from pillsbot import config as cfg
+
+
+def make_registry():
+    return MeasurementRegistry(cfg.TZ, cfg.MEASURES)
+
+
+def test_pressure_positive_cases():
+    reg = make_registry()
+    mid, body = reg.match("тиск 120 80 60")
+    assert mid == "pressure"
+    assert reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("BP 118/79/62")
+    assert mid == "pressure"
+    assert reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("давление 125,85,59")
+    assert mid == "pressure"
+    assert reg.parse(mid, body)["ok"]
+
+    # NEW: punctuation after keyword
+    mid, body = reg.match("BP: 120/80/60")
+    assert mid == "pressure"
+    assert reg.parse(mid, body)["ok"]
+
+
+def test_pressure_negative_cases():
+    reg = make_registry()
+    mid, body = reg.match("pressure 120/80")  # missing one
+    assert mid == "pressure"
+    assert not reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("давление 120.5/80/60")  # decimal not allowed
+    assert mid == "pressure"
+    assert not reg.parse(mid, body)["ok"]
+
+
+def test_weight_positive_cases():
+    reg = make_registry()
+    mid, body = reg.match("вага 102,4")
+    assert mid == "weight"
+    assert reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("weight 73.0")
+    assert mid == "weight"
+    assert reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("вес 80")
+    assert mid == "weight"
+    assert reg.parse(mid, body)["ok"]
+
+    # NEW: boundaries
+    mid, body = reg.match("weight 0")
+    assert reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("weight 0.0")
+    assert reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("weight 350.1234")
+    assert reg.parse(mid, body)["ok"]
+
+
+def test_weight_negative_cases():
+    reg = make_registry()
+    mid, body = reg.match("weight -5")
+    r = reg.parse(mid, body)
+    assert not r["ok"]
+
+    mid, body = reg.match("взвешивание 80 кг")
+    r = reg.parse(mid, body)
+    assert not r["ok"]
+
+
+def test_start_anchored():
+    reg = make_registry()
+    assert reg.match("моє давление 120 80 60") is None
+
+
+### FILE: ./tests/unit/test_preconfirm_logic.py
+from datetime import datetime, timedelta
+
+from pillsbot.core.reminder_engine import ReminderEngine, IncomingMessage
+from pillsbot import config as cfg
+
+
+class FakeAdapter:
+    def __init__(self):
+        self.sent = []  # (chat_id, text)
+
+    async def send_group_message(self, group_id, text):
+        self.sent.append(("group", group_id, text))
+
+    async def send_nurse_dm(self, user_id, text):
+        self.sent.append(("dm", user_id, text))
+
+
+def make_engine():
+    class Cfg:
+        TZ = cfg.TZ
+        LOG_FILE = cfg.LOG_FILE
+        CONFIRM_PATTERNS = cfg.CONFIRM_PATTERNS
+        RETRY_INTERVAL_S = 1
+        MAX_RETRY_ATTEMPTS = 2
+        TAKING_GRACE_INTERVAL_S = 60
+        PATIENTS = [
+            {
+                "patient_id": 1,
+                "patient_label": "Test Patient",
+                "group_id": -1,
+                "nurse_user_id": 2,
+                "doses": [
+                    {
+                        "time": (datetime.now(cfg.TZ) + timedelta(minutes=1)).strftime(
+                            "%H:%M"
+                        ),
+                        "text": "Vit D",
+                    }
+                ],
+            }
+        ]
+
+    adapter = FakeAdapter()
+    eng = ReminderEngine(Cfg, adapter)
+    return eng, adapter
+
+
+import pytest  # noqa: E402
+from datetime import UTC  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_preconfirm_within_grace():
+    eng, ad = make_engine()
+    await eng.start(
+        scheduler=type("S", (), {"add_job": lambda *a, **k: None})()
+    )  # no-op scheduler
+    # Send a confirmation now; next dose is within 60s
+    msg = IncomingMessage(
+        group_id=-1,
+        sender_user_id=1,
+        text="ок",
+        sent_at_utc=datetime.now(UTC),
+    )
+    await eng.on_patient_message(msg)
+    # Expect preconfirm ack
+    assert any("заздалегідь" in t for _, _, t in ad.sent)
+
+
+### FILE: ./tests/unit/test_retry_semantics.py
+
+
+### FILE: ./tests/unit/test_validation_config.py
+# pillsbot/tests/unit/test_validation_config.py
+import pytest
+from pillsbot.core.config_validation import validate_config
+from zoneinfo import ZoneInfo
+
+
+class CfgOk:
+    TZ = ZoneInfo("Europe/Kyiv")
+    MEASURES = {
+        "pressure": {
+            "label": "Тиск",
+            "patterns": ["тиск", "давление", "BP", "pressure"],
+            "csv_file": "pillsbot/logs/pressure_test.csv",
+            "parser_kind": "int3",
+            "separators": [" ", ",", "/"],
+        }
+    }
+    PATIENTS = [
+        {
+            "patient_id": 1,
+            "patient_label": "A",
+            "group_id": -1,
+            "nurse_user_id": 2,
+            "doses": [{"time": "08:00", "text": "Med"}],
+            "measurement_checks": [{"measure_id": "pressure", "time": "21:00"}],
+        }
+    ]
+
+
+def test_validate_ok():
+    validate_config(CfgOk)
+
+
+def test_duplicate_measurement_check_times_raises():
+    class CfgDup(CfgOk):
+        PATIENTS = [
+            {
+                "patient_id": 1,
+                "patient_label": "A",
+                "group_id": -1,
+                "nurse_user_id": 2,
+                "doses": [{"time": "08:00", "text": "Med"}],
+                "measurement_checks": [
+                    {"measure_id": "pressure", "time": "21:00"},
+                    {"measure_id": "pressure", "time": "21:00"},
+                ],
+            }
+        ]
+
+    with pytest.raises(ValueError):
+        validate_config(CfgDup)
+
+

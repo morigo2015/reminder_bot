@@ -127,6 +127,8 @@ class TelegramAdapter:
 
     async def run_polling(self) -> None:
         self.log.debug("polling.run")
+        # Ensure webhooks are disabled before getUpdates; drop any pending updates
+        await self.bot.delete_webhook(drop_pending_updates=True)
         await self.dp.start_polling(self.bot)
 
     # ------------------------------------------------------------------------------
@@ -135,7 +137,7 @@ class TelegramAdapter:
     def build_patient_reply_kb(self, patient: dict) -> ReplyKeyboardMarkup:
         """
         Fixed reply keyboard for the patient.
-        NOTE: Avoid selective=True in supergroups; it causes the keyboard to not show.
+        Uses selective=True because this is a small private group.
         """
         kb = ReplyKeyboardMarkup(
             keyboard=[
@@ -147,6 +149,8 @@ class TelegramAdapter:
             ],
             resize_keyboard=True,
             one_time_keyboard=False,
+            is_persistent=True,
+            selective=True,
             input_field_placeholder="Виберіть дію або введіть значення...",
         )
         return kb
@@ -166,7 +170,7 @@ class TelegramAdapter:
         return kb
 
     def build_force_reply(self) -> ForceReply:
-        """ForceReply for guided input; selective=True as per spec."""
+        """ForceReply for guided input; selective=True as requested."""
         return ForceReply(selective=True)
 
     async def refresh_reply_keyboard(
