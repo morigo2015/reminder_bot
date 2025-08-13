@@ -1,23 +1,28 @@
 # pillsbot/app.py
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 import asyncio
 import logging
-from zoneinfo import ZoneInfo
 
-import config as cfg
-from config import get_bot_token, PATIENTS
+# --------------------------------------------------------------------------------------
+# Ensure project root is in sys.path so "import pillsbot.*" always works
+# --------------------------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from pillsbot.core.reminder_engine import ReminderEngine
-from pillsbot.adapters.telegram_adapter import TelegramAdapter
+import config as cfg  # noqa: E402
+from config import get_bot_token, PATIENTS  # noqa: E402
+from pillsbot.core.reminder_engine import ReminderEngine  # noqa: E402
+from pillsbot.adapters.telegram_adapter import TelegramAdapter  # noqa: E402
+from apscheduler.schedulers.asyncio import AsyncIOScheduler  # noqa: E402
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-
-async def schedule_jobs(engine: ReminderEngine, timezone: ZoneInfo) -> AsyncIOScheduler:
+async def schedule_jobs(engine: ReminderEngine, timezone) -> AsyncIOScheduler:
     """
     Schedule daily dose reminders and measurement checks at exact times from config.
-    Uses a single AsyncIOScheduler instance (no immediate firing).
     """
     sched = AsyncIOScheduler(timezone=timezone)
 
@@ -25,15 +30,14 @@ async def schedule_jobs(engine: ReminderEngine, timezone: ZoneInfo) -> AsyncIOSc
     for p in PATIENTS:
         pid = p["patient_id"]
         for d in p["doses"]:
-            t = d["time"]  # "HH:MM"
-            hh, mm = (int(x) for x in t.split(":"))
+            hh, mm = (int(x) for x in d["time"].split(":"))
             sched.add_job(
-                engine._start_dose_job,  # coroutine supported by AsyncIOScheduler
+                engine._start_dose_job,
                 trigger="cron",
                 hour=hh,
                 minute=mm,
-                kwargs={"patient_id": pid, "time_str": t},
-                id=f"dose:{pid}:{t}",
+                kwargs={"patient_id": pid, "time_str": d["time"]},
+                id=f"dose:{pid}:{d['time']}",
                 replace_existing=True,
                 coalesce=True,
                 misfire_grace_time=300,
@@ -44,8 +48,7 @@ async def schedule_jobs(engine: ReminderEngine, timezone: ZoneInfo) -> AsyncIOSc
     for p in PATIENTS:
         pid = p["patient_id"]
         for chk in p.get("measurement_checks", []):
-            t = chk["time"]
-            hh, mm = (int(x) for x in t.split(":"))
+            hh, mm = (int(x) for x in chk["time"].split(":"))
             sched.add_job(
                 engine._job_measure_check,
                 trigger="cron",
@@ -65,7 +68,8 @@ async def schedule_jobs(engine: ReminderEngine, timezone: ZoneInfo) -> AsyncIOSc
 
 async def main() -> None:
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s"
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
     log = logging.getLogger("pillsbot.app")
     log.info("startup.begin " + f"timezone='{cfg.TIMEZONE}'")
@@ -79,15 +83,15 @@ async def main() -> None:
     adapter = TelegramAdapter(bot_token, engine=engine, patient_groups=patient_groups)
     engine.attach_adapter(adapter)
 
-    # Initialize engine state, but DO NOT pass a scheduler here — we schedule explicitly below
+    # Initialize engine state
     await engine.start(scheduler=None)
 
-    # Proper time-based scheduling (no immediate job runs)
-    _sched = await schedule_jobs(engine, timezone=cfg.TZ)
+    # Proper time-based scheduling
+    await schedule_jobs(engine, timezone=cfg.TZ)
 
     log.info("startup.ready " + f"patients={len(PATIENTS)}")
 
-    # Run a single polling loop for this process
+    # Single polling loop
     await adapter.run_polling()
 
 
