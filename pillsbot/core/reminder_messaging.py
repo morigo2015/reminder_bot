@@ -10,23 +10,18 @@ from pillsbot.core.reminder_state import DoseKey, DoseInstance
 
 # Telegram-only types are optional; keep them encapsulated here.
 try:
-    from aiogram.types import (
-        ReplyKeyboardMarkup,
-        KeyboardButton,
-        InlineKeyboardMarkup,
-        InlineKeyboardButton,
-        ForceReply,
-    )
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton  # noqa:F401
 except Exception:  # pragma: no cover - optional dependency
-    ReplyKeyboardMarkup = KeyboardButton = InlineKeyboardMarkup = (
-        InlineKeyboardButton
-    ) = ForceReply = None
+    InlineKeyboardMarkup = InlineKeyboardButton = None  # type: ignore
 
 
 class ReminderMessenger:
     """
-    Handles all outbound UX: text templates, keyboards, inline buttons, and fallbacks.
-    Engine calls this via simple methods and stays transport-agnostic.
+    Handles all outbound UX: text templates and inline buttons.
+    UI is inline-only per pill_reminder_UI_guide.md.
+
+    This layer **does not** auto-append menus after plain messages.
+    The engine/adapters decide *when* a STEP (inline keyboard) is posted.
     """
 
     def __init__(
@@ -40,20 +35,31 @@ class ReminderMessenger:
         self.inline_confirm_enabled = inline_confirm_enabled
 
     # -- high-level helpers -------------------------------------------------------------
-    async def send_reminder(
-        self, inst: DoseInstance, template_key: str
-    ) -> Optional[int]:
-        """Send reminder/retry message; attach inline 'Confirm Taken' when enabled."""
-        kb_inline = (
-            self.build_confirm_inline_kb(inst.dose_key)
-            if self.inline_confirm_enabled and self._has_telegram()
-            else None
-        )
-        text = (
-            fmt("reminder", pill_text=inst.pill_text)
-            if template_key == "reminder"
-            else fmt("repeat_reminder")
-        )
+    async def send_reminder_step(self, inst: DoseInstance) -> Optional[int]:
+        """
+        Send the actionable STEP for a reminder (text + inline 'Confirm Taken').
+        Retires the previous step before sending the new one (adapter responsibility).
+        """
+        if not self._has_telegram() or not self.inline_confirm_enabled:
+            # Plain fallback (rare)
+            return await self._send_group(
+                inst.group_id,
+                fmt("reminder", pill_text=inst.pill_text),
+                reply_markup=None,
+            )
+
+        kb_inline = self.build_confirm_inline_kb(inst.dose_key)
+        text = fmt("reminder", pill_text=inst.pill_text)
+
+        if self.adapter is not None and hasattr(self.adapter, "send_step_message"):
+            try:
+                return await self.adapter.send_step_message(
+                    inst.group_id, text, kb_inline
+                )
+            except TypeError:
+                pass
+
+        # Fallback: plain group message (no inline step)
         return await self._send_group(inst.group_id, text, reply_markup=kb_inline)
 
     async def send_group_template(
@@ -62,29 +68,6 @@ class ReminderMessenger:
         """Send a plain templated group message (no buttons)."""
         text = fmt(template_key, **fmt_args)
         return await self._send_group(group_id, text, reply_markup=None)
-
-    async def refresh_reply_keyboard(self, patient: dict) -> Optional[int]:
-        """
-        Refresh the fixed reply keyboard. Uses a visible text to make clients keep it.
-        Always sets selective=True (your environment is a small private group).
-        """
-        if not self._has_telegram() or self.adapter is None:
-            self.log.error(
-                "keyboard.refresh.skip " + kv(reason="adapter or telegram missing")
-            )
-            return None
-        try:
-            kb = self.build_patient_reply_kb(patient, selective=True)
-            msg_id = await self._send_group(
-                patient["group_id"], "Оновив кнопки ↓", reply_markup=kb
-            )
-            return msg_id
-        except Exception as e:  # pragma: no cover - adapter-level errors
-            self.log.error(
-                "keyboard.refresh.error "
-                + kv(group_id=patient.get("group_id"), err=str(e))
-            )
-            return None
 
     async def send_escalation(self, inst: DoseInstance) -> None:
         """Group notice + DM to nurse."""
@@ -99,6 +82,33 @@ class ReminderMessenger:
                 pill_text=inst.pill_text,
             ),
         )
+
+    async def send_home_step(
+        self, group_id: int, patient_id: int, *, can_confirm: bool
+    ) -> Optional[int]:
+        """
+        Send the compact Home STEP (inline-only) at the bottom.
+        The adapter builds a context-aware keyboard (confirm button only if can_confirm=True).
+        """
+        kb = None
+        if self.adapter is not None and hasattr(self.adapter, "get_home_keyboard"):
+            try:
+                kb = self.adapter.get_home_keyboard(patient_id, can_confirm=can_confirm)  # type: ignore[arg-type]
+            except TypeError:
+                # Backward compatibility with older signature: get_home_keyboard(patient_id)
+                kb = self.adapter.get_home_keyboard(patient_id)  # type: ignore[misc]
+        if self.adapter is not None and hasattr(self.adapter, "send_step_message"):
+            try:
+                return await self.adapter.send_step_message(
+                    group_id, MESSAGES["home_title"], kb
+                )
+            except TypeError:
+                pass
+        return await self._send_group(group_id, MESSAGES["home_title"])
+
+    async def send_nurse_notice(self, user_id: int, text: str) -> None:
+        """Public wrapper to DM nurse (used for late-confirm notices)."""
+        await self._send_nurse_dm(user_id, text)
 
     # -- low-level adapter calls with fallbacks -----------------------------------------
     async def _send_group(
@@ -123,16 +133,14 @@ class ReminderMessenger:
                 )
             )
             try:
-                # preferred signature
                 msg = await self.adapter.send_group_message(
                     group_id, text, reply_markup=reply_markup
                 )  # type: ignore
                 return getattr(msg, "message_id", None)
             except TypeError:
-                # fallback signature (tests use this)
                 _ = await self.adapter.send_group_message(group_id, text)  # type: ignore
                 return None
-        except Exception as e:  # pragma: no cover - adapter-level errors
+        except Exception as e:  # pragma: no cover
             self.log.error("msg.out.group.error " + kv(group_id=group_id, err=str(e)))
             return None
 
@@ -155,32 +163,8 @@ class ReminderMessenger:
     def _has_telegram(self) -> bool:
         return InlineKeyboardMarkup is not None
 
-    def build_patient_reply_kb(
-        self, patient: dict, *, selective: bool = True
-    ) -> Any | None:
-        """
-        Persistent patient keyboard; selective=True so only the patient sees it.
-        Kept here to isolate Telegram-specifics from the engine.
-        """
-        if ReplyKeyboardMarkup is None:  # non-Telegram channels
-            return None
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [
-                    KeyboardButton(text=MESSAGES["btn_pressure"]),
-                    KeyboardButton(text=MESSAGES["btn_weight"]),
-                ],
-                [KeyboardButton(text=MESSAGES["btn_help"])],
-            ],
-            resize_keyboard=True,
-            one_time_keyboard=False,
-            is_persistent=True,
-            selective=selective,
-            input_field_placeholder="Виберіть дію або введіть значення…",
-        )
-
     def build_confirm_inline_kb(self, dose_key: DoseKey) -> Any | None:
-        """Inline 'confirm taken' button attached to reminder/retry messages."""
+        """Inline 'confirm taken' button attached to reminder/retry STEP."""
         if InlineKeyboardMarkup is None:
             return None
         data = f"confirm:{dose_key.patient_id}:{dose_key.date_str}:{dose_key.time_str}"
@@ -193,9 +177,3 @@ class ReminderMessenger:
                 ]
             ]
         )
-
-    def build_force_reply(self) -> Any | None:
-        """Guided input; selective=True for the patient."""
-        if ForceReply is None:
-            return None
-        return ForceReply(selective=True)
