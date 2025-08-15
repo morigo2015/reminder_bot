@@ -71,7 +71,7 @@ PATIENTS: list[dict[str, Any]] = [
         "group_id": -1002690368389,
         "nurse_user_id": 7391874317,
         "doses": [
-            {"time": "23:41", "text": "Вітамін Д"},
+            {"time": "02:19", "text": "Вітамін Д"},
             {"time": "20:00", "text": "Вітамін Д"},
         ],
         # Optional daily measurement checks (per measure)

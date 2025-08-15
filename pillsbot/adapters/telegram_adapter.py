@@ -22,7 +22,7 @@ from pillsbot.debug_ids import print_group_and_users_best_effort
 
 class TelegramAdapter:
     """
-    aiogram 3.x adapter implementing the v4 inline-only UX:
+    Aiogram 3.x adapter implementing the v4 inline-only UX:
 
     • Single dynamic inline menu at the bottom (flat, no submenus, no pinned message).
     • Exactly one menu message exists in the chat: before posting a new one, delete the old one.
@@ -109,7 +109,9 @@ class TelegramAdapter:
     async def clear_reply_keyboard_once(self, chat_id: int) -> None:
         try:
             await self.bot.send_message(
-                chat_id, " ", reply_markup=ReplyKeyboardRemove(remove_keyboard=True)
+                chat_id,
+                "Оновлення інтерфейсу…",
+                reply_markup=ReplyKeyboardRemove(remove_keyboard=True),
             )
         except Exception:
             # Best-effort, ignore any errors (no rights, etc.)
@@ -153,9 +155,7 @@ class TelegramAdapter:
 
         sent_at_utc = getattr(message, "date", None)
         if sent_at_utc is None:
-            # aiogram delivers timezone-aware datetime; engine treats it as UTC timestamp.
             from datetime import datetime, timezone as _tz
-
             sent_at_utc = datetime.now(_tz.utc)
 
         incoming = IncomingMessage(
@@ -171,8 +171,8 @@ class TelegramAdapter:
         """
         Flat UI actions:
         - ui:TAKE      → confirm (if awaiting)
-        - ui:PRESSURE  → send prompt, then refresh menu
-        - ui:WEIGHT    → send prompt, then refresh menu
+        - ui:PRESSURE  → show hint + menu in ONE message; expect next input as pressure
+        - ui:WEIGHT    → show hint + menu in ONE message; expect next input as weight
         - ui:HELP      → help text, then refresh menu
 
         Only the mapped patient may act. Others are ignored silently (logged).
@@ -191,28 +191,30 @@ class TelegramAdapter:
                 "cb.ignored.nonpatient "
                 + kv(group_id=chat_id, actor=from_user_id, expected=expected_pid)
             )
-            # Ignore silently as per spec (optionally log). Do not toast.
+            # Ignore silently as per spec. Do not toast.
             return
+
+        # Acknowledge the callback to clear the Telegram spinner
+        try:
+            await callback.answer()
+        except Exception:
+            pass
 
         # Route actions
         if data == "ui:TAKE":
             await self.engine.quick_confirm(chat_id, from_user_id)
-            # Engine sends ack and refreshes menu.
             return
 
         if data == "ui:PRESSURE":
-            await self.engine._reply(chat_id, "prompt_pressure")
-            await self.engine.show_current_menu(chat_id)
+            await self.engine.show_hint_menu(chat_id, kind="pressure")
             return
 
         if data == "ui:WEIGHT":
-            await self.engine._reply(chat_id, "prompt_weight")
-            await self.engine.show_current_menu(chat_id)
+            await self.engine.show_hint_menu(chat_id, kind="weight")
             return
 
         if data == "ui:HELP":
-            await self.engine._reply(chat_id, "help_text")
-            await self.engine.show_current_menu(chat_id)
+            await self.engine.show_help(chat_id)
             return
 
     async def on_ids(self, message: Message) -> None:

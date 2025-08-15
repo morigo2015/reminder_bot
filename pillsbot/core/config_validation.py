@@ -1,19 +1,20 @@
 # pillsbot/core/config_validation.py
 from __future__ import annotations
 
+from typing import Any, Dict, List
 from datetime import datetime
-from typing import Any
-import os
 
 
 def validate_config(cfg: Any) -> None:
     """
     Validate runtime configuration before starting the bot.
 
-    - Ensures patient records have required fields.
-    - Ensures dose times are valid HH:MM strings and unique per patient.
-    - Ensures dose text is present.
-    - Ensures measurement configuration (if present) is valid.
+    - PATIENTS must be a non-empty list.
+    - Each patient must have required fields.
+    - Dose times must be valid HH:MM strings and unique per patient.
+    - Dose text must be present (field 'text').
+    - CONFIRM_PATTERNS must be a non-empty list of strings.
+    - MEASURES must be a non-empty dict with minimal required fields.
     """
     required_fields = {
         "patient_id",
@@ -32,6 +33,8 @@ def validate_config(cfg: Any) -> None:
     patients = getattr(cfg, "PATIENTS", None)
     if not isinstance(patients, list):
         raise ValueError("PATIENTS must be a list of patient dictionaries")
+    if len(patients) == 0:
+        raise ValueError("PATIENTS must not be empty")
 
     for p in patients:
         missing = required_fields - set(p.keys())
@@ -57,35 +60,22 @@ def validate_config(cfg: Any) -> None:
                     f"Dose text is required for patient {p['patient_label']} at {t}"
                 )
 
-        # Validate optional measurement checks
-        checks = p.get("measurement_checks", []) or []
-        per_measure_seen: dict[str, set[str]] = {}
-        for chk in checks:
-            mid = chk.get("measure_id")
-            if not mid:
-                raise ValueError(
-                    f"measurement_checks entry missing 'measure_id' for patient {p['patient_label']}"
-                )
-            measures = getattr(cfg, "MEASURES", {})
-            if mid not in measures:
-                raise ValueError(
-                    f"Unknown measure_id '{mid}' in measurement_checks for patient {p['patient_label']}"
-                )
-            t = chk.get("time")
-            if not t:
-                raise ValueError(
-                    f"measurement_checks entry missing 'time' for measure {mid} and patient {p['patient_label']}"
-                )
-            parse_time_str(t)
-            seen = per_measure_seen.setdefault(mid, set())
-            if t in seen:
-                raise ValueError(
-                    f"Duplicate measurement check time for measure {mid} and patient {p['patient_label']}: {t}"
-                )
-            seen.add(t)
+    # Confirm patterns
+    pats = getattr(cfg, "CONFIRM_PATTERNS", None)
+    if not isinstance(pats, list) or not pats:
+        raise ValueError("CONFIRM_PATTERNS must be a non-empty list of strings")
 
-    # Ensure directories for measurement CSVs exist
-    for _, m in (getattr(cfg, "MEASURES", {}) or {}).items():
-        path = m.get("csv_file")
-        if path:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Measures
+    measures = getattr(cfg, "MEASURES", None)
+    if not isinstance(measures, dict) or not measures:
+        raise ValueError("MEASURES must be a non-empty dict")
+    for mid, m in measures.items():
+        if not isinstance(m, dict):
+            raise ValueError(f"Measure '{mid}' must be a dict")
+        if not m.get("label"):
+            raise ValueError(f"Measure '{mid}' is missing 'label'")
+        pats = m.get("patterns")
+        if not isinstance(pats, list) or not pats:
+            raise ValueError(f"Measure '{mid}' must define non-empty 'patterns'")
+        if not m.get("csv_file"):
+            raise ValueError(f"Measure '{mid}' must define 'csv_file'")

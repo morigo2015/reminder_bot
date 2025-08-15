@@ -14,17 +14,17 @@ class MeasureDef:
     label: str
     patterns: List[str]
     csv_file: str
-    parser_kind: str  # "int2" | "float1"
-    separators: Optional[List[str]] = None  # for pressure
-    decimal_commas: Optional[bool] = None  # for weight
+    parser_kind: str  # legacy hints: "int2" | "float1"
+    separators: Optional[List[str]] = None  # legacy for pressure
+    decimal_commas: Optional[bool] = None  # legacy for weight
 
 
 class MeasurementRegistry:
     """
     Central registry for measurement parsing + storage (v4).
 
-    * Start-anchored dispatch by configured patterns.
-    * For pressure, expect exactly TWO integers (systolic/diastolic).
+    * Start-anchored dispatch by configured patterns (typed keywords like "тиск", "вага").
+    * Free-form tolerant parsers are provided below and should be used by the engine.
     * CSV append with header creation.
     * 'has_today' helper for daily checks.
     """
@@ -42,7 +42,7 @@ class MeasurementRegistry:
                 label=m["label"],
                 patterns=m["patterns"],
                 csv_file=m["csv_file"],
-                parser_kind=m["parser_kind"],
+                parser_kind=m.get("parser_kind", ""),
                 separators=m.get("separators"),
                 decimal_commas=m.get("decimal_commas"),
             )
@@ -59,7 +59,7 @@ class MeasurementRegistry:
     def get_label(self, measure_id: str) -> str:
         return self.measures[measure_id].label
 
-    # ---- Dispatch (start-anchored) ----
+    # ---- Dispatch by typed keyword (start-anchored) ----
     def match(self, text: str | None) -> Optional[Tuple[str, str]]:
         t = text or ""
         for mid, rx in self._compiled.items():
@@ -68,49 +68,6 @@ class MeasurementRegistry:
                 body = (m.group("body") or "").strip()
                 return mid, body
         return None
-
-    # ---- Parsing per measure ----
-    def parse(self, measure_id: str, body: str) -> Dict[str, Any]:
-        md = self.measures[measure_id]
-        if md.parser_kind == "int2":
-            # pressure: exactly two integers; separators: space/comma/slash
-            seps = md.separators or [" ", ",", "/"]
-            s = (body or "").strip()
-            if not s:
-                return {"ok": False, "error": "arity"}
-            for sep in seps:
-                s = s.replace(sep, " ")
-            parts = [p for p in s.strip().split() if p]
-            if len(parts) != 2:
-                return {"ok": False, "error": "arity"}
-            vals: List[int] = []
-            for p in parts:
-                if p.startswith("+"):
-                    p = p[1:]
-                if not p.isdigit():
-                    return {"ok": False, "error": "format"}
-                vals.append(int(p))
-            return {"ok": True, "values": tuple(vals)}
-        elif md.parser_kind == "float1":
-            # weight: exactly one number (dot or comma decimal), non-negative
-            tok = (body or "").strip()
-            toks = tok.split()
-            if len(toks) != 1:
-                return {"ok": False, "error": "arity_one"}
-            token = toks[0]
-            if md.decimal_commas:
-                token = token.replace(",", ".")
-            if token.startswith("+"):
-                token = token[1:]
-            try:
-                v = float(token)
-            except ValueError:
-                return {"ok": False, "error": "format_one"}
-            if v < 0 or v != v or v in (float("inf"), float("-inf")):
-                return {"ok": False, "error": "format_one"}
-            return {"ok": True, "values": (v,)}
-        else:
-            raise ValueError(f"Unknown parser_kind for {measure_id}: {md.parser_kind}")
 
     # ---- CSV writing ----
     def append_csv(
@@ -121,6 +78,13 @@ class MeasurementRegistry:
         patient_label: str,
         values: tuple,
     ) -> None:
+        """
+        Appends one row to the measure CSV.
+
+        For 'pressure' we always use the schema:
+          date_time_local,patient_id,patient_label,systolic,diastolic,pulse
+        If pulse is absent, the 'pulse' column is left blank.
+        """
         md = self.measures[measure_id]
         path = md.csv_file
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -130,7 +94,7 @@ class MeasurementRegistry:
             if is_new:
                 if measure_id == "pressure":
                     f.write(
-                        "date_time_local,patient_id,patient_label,systolic,diastolic\n"
+                        "date_time_local,patient_id,patient_label,systolic,diastolic,pulse\n"
                     )
                 elif measure_id == "weight":
                     f.write("date_time_local,patient_id,patient_label,weight\n")
@@ -140,8 +104,14 @@ class MeasurementRegistry:
 
             ts = dt_local.strftime("%Y-%m-%d %H:%M")
             if measure_id == "pressure":
-                sys, dia = values
-                f.write(f"{ts},{patient_id},{patient_label},{sys},{dia}\n")
+                if len(values) == 3:
+                    sys_v, dia_v, pulse_v = values
+                    f.write(f"{ts},{patient_id},{patient_label},{sys_v},{dia_v},{pulse_v}\n")
+                elif len(values) == 2:
+                    sys_v, dia_v = values
+                    f.write(f"{ts},{patient_id},{patient_label},{sys_v},{dia_v},\n")
+                else:
+                    f.write(f"{ts},{patient_id},{patient_label},,,\n")
             elif measure_id == "weight":
                 (w,) = values
                 f.write(f"{ts},{patient_id},{patient_label},{w}\n")
@@ -174,3 +144,83 @@ class MeasurementRegistry:
                 if pid == patient_id and dt.date() == date_local:
                     return True
         return False
+
+
+# ======================================================================================
+# Free-form tolerant parsers used by the engine (Option A)
+# ======================================================================================
+
+_INT_RE = re.compile(r"(?<!\d)(\d{1,3})(?!\d)")
+_FLOAT_RE = re.compile(r"(?<!\d)(\d{1,3}(?:[.,]\d{1,2})?)(?!\d)")
+
+
+def parse_pressure_free(text: str) -> Dict[str, Any]:
+    """
+    Accepts:
+      - 120/80
+      - 120 80
+      - 120-80
+      - 120 на 80
+      - optional 3rd number as pulse: "... 72"
+    Returns:
+      {"ok": True, "sys": int, "dia": int, "pulse": Optional[int]}
+      or {"ok": False, "error": "one_number"|"range"|"unrecognized"}
+    """
+    t = (text or "").strip()
+    # Normalize separators "на" and punctuation to space to make number extraction robust
+    t = (
+        t.replace("/", " ")
+        .replace("-", " ")
+        .replace("—", " ")
+        .replace("–", " ")
+        .replace(":", " ")
+    )
+    t = re.sub(r"\bна\b", " ", t, flags=re.IGNORECASE | re.UNICODE)
+
+    nums = [int(m.group(1)) for m in _INT_RE.finditer(t)]
+    if len(nums) == 1:
+        return {"ok": False, "error": "one_number"}
+    if len(nums) < 2:
+        return {"ok": False, "error": "unrecognized"}
+
+    sys_v = nums[0]
+    dia_v = nums[1]
+    pulse_v = nums[2] if len(nums) >= 3 else None
+
+    # Range checks
+    if not (70 <= sys_v <= 250) or not (40 <= dia_v <= 150):
+        return {"ok": False, "error": "range"}
+    if pulse_v is not None and not (30 <= pulse_v <= 220):
+        return {"ok": False, "error": "range"}
+
+    return {"ok": True, "sys": sys_v, "dia": dia_v, "pulse": pulse_v}
+
+
+def parse_weight_free(text: str) -> Dict[str, Any]:
+    """
+    Accepts one numeric token (dot or comma decimal), units optional (кг/kg).
+    Returns:
+      {"ok": True, "kg": float} or
+      {"ok": False, "error": "likely_pressure"|"range"|"unrecognized"}
+    """
+    t = (text or "").strip()
+    # Strip units
+    t = re.sub(r"\s*(кг|kg)\b", "", t, flags=re.IGNORECASE | re.UNICODE)
+    nums = [m.group(1) for m in _FLOAT_RE.finditer(t)]
+
+    if len(nums) == 0:
+        return {"ok": False, "error": "unrecognized"}
+    if len(nums) > 1:
+        # Two or more numbers usually indicate pressure
+        return {"ok": False, "error": "likely_pressure"}
+
+    token = nums[0].replace(",", ".")
+    try:
+        v = float(token)
+    except ValueError:
+        return {"ok": False, "error": "unrecognized"}
+
+    if not (25.0 <= v <= 300.0):
+        return {"ok": False, "error": "range"}
+
+    return {"ok": True, "kg": v}

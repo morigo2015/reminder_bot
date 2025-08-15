@@ -1,4 +1,4 @@
-# tests/unit/test_preconfirm.py
+# pillsbot/tests/unit/test_preconfirm.py
 import pytest
 from datetime import UTC, datetime
 from pillsbot.core.reminder_engine import ReminderEngine, IncomingMessage
@@ -11,6 +11,9 @@ class FakeAdapter:
 
     async def send_group_message(self, group_id, text, reply_markup=None):
         self.sent.append(("group", group_id, text))
+
+    async def send_menu_message(self, group_id, text, *, can_confirm: bool):
+        self.sent.append(("menu", group_id, text, can_confirm))
 
     async def send_nurse_dm(self, user_id, text):
         self.sent.append(("dm", user_id, text))
@@ -29,4 +32,4 @@ async def test_confirmation_without_awaiting_is_unknown():
     )
     await eng.on_patient_message(msg)
 
-    assert any("Не розпізнав" in t for _, _, t in eng.adapter.sent)
+    assert any("Не вдалося розпізнати" in t for _, _, t, *rest in eng.adapter.sent)

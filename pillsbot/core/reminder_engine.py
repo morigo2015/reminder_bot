@@ -10,9 +10,9 @@ from typing import Any, Optional, Dict, Set
 from zoneinfo import ZoneInfo
 
 from pillsbot.core.matcher import Matcher
-from pillsbot.core.i18n import fmt
+from pillsbot.core.i18n import fmt, MESSAGES
 from pillsbot.core.logging_utils import kv
-from pillsbot.core.measurements import MeasurementRegistry
+from pillsbot.core.measurements import MeasurementRegistry, parse_pressure_free, parse_weight_free
 from pillsbot.core.reminder_state import (
     Clock,
     Status,
@@ -39,6 +39,10 @@ class ReminderEngine:
     """
     v4: Single dynamic inline menu (delete old → post new). The engine ensures that
     after every visible event the last message is the menu.
+
+    Option A: tapping Тиск/Вага shows a short hint with the inline menu in ONE message.
+    The very next patient message is interpreted according to that hint (lightweight,
+    one-shot expectation per chat). No long-lived sessions.
     """
 
     def __init__(self, config: Any, adapter: Any | None, clock: Optional[Clock] = None):
@@ -63,6 +67,9 @@ class ReminderEngine:
         self.group_to_patient: Dict[int, int] = {}
 
         self.retry_mgr: Optional[RetryManager] = None
+
+        # One-shot expectation for next user message after a tap: {"pressure"|"weight"}
+        self._expect_next: Dict[int, str] = {}  # keyed by group_id
 
     def attach_adapter(self, adapter: Any) -> None:
         self.adapter = adapter
@@ -136,56 +143,45 @@ class ReminderEngine:
 
         patient = self.patient_index[pid]
         text = (msg.text or "").strip()
+        group_id = patient["group_id"]
 
-        # Measurements
-        mm = self.measures.match(text)
-        if mm:
-            mid, body = mm
-            parsed = self.measures.parse(mid, body)
-            if parsed.get("ok"):
-                now_local = self.clock.now()
-                self.measures.append_csv(
-                    mid, now_local, pid, patient["patient_label"], parsed["values"]
-                )
-                if mid == "pressure":
-                    sys_v, dia_v = parsed["values"]
-                    await self._reply(
-                        patient["group_id"],
-                        "ack_pressure",
-                        systolic=sys_v,
-                        diastolic=dia_v,
-                    )
-                elif mid == "weight":
-                    (w,) = parsed["values"]
-                    await self._reply(patient["group_id"], "ack_weight", kg=w)
-                else:
-                    await self._reply(patient["group_id"], "unknown_text")
-            else:
-                if mid == "pressure":
-                    await self._reply(patient["group_id"], "err_pressure")
-                elif mid == "weight":
-                    await self._reply(patient["group_id"], "err_weight")
-                else:
-                    await self._reply(patient["group_id"], "unknown_text")
-
-            # After measurement handling, refresh menu
-            await self.show_current_menu(patient["group_id"])
-            return
-
-        # Confirmation via text
+        # --- A) Confirmation via text (CRITICAL INTENT) ---
         if self.matcher.matches_confirmation(text.lower().strip()):
             await self._handle_confirmation_text(patient)
             return
 
-        # Help keyword
+        # --- B) Help commands (should not be blocked by hint expectation) ---
         if text.lower() in {"help", "?", "довідка"}:
-            await self._reply(patient["group_id"], "help_text")
-            await self.show_current_menu(patient["group_id"])
+            await self.show_help(group_id)
             return
 
-        # Fallback
-        await self._reply(patient["group_id"], "unknown_text")
-        await self.show_current_menu(patient["group_id"])
+        # --- C) One-shot expectation set by a recent tap (pressure/weight) ---
+        expect = self._expect_next.pop(group_id, None)
+        if expect == "pressure":
+            await self._handle_pressure_text(patient, text)
+            await self.show_current_menu(group_id)
+            return
+        if expect == "weight":
+            await self._handle_weight_text(patient, text)
+            await self.show_current_menu(group_id)
+            return
+
+        # --- D) Typed keywords (start-anchored), then tolerant parse on the body ---
+        mm = self.measures.match(text)
+        if mm:
+            mid, body = mm
+            if mid == "pressure":
+                await self._handle_pressure_text(patient, body)
+                await self.show_current_menu(group_id)
+                return
+            if mid == "weight":
+                await self._handle_weight_text(patient, body)
+                await self.show_current_menu(group_id)
+                return
+
+        # --- E) Fallback ---
+        await self._reply(group_id, "unknown_text")
+        await self.show_current_menu(group_id)
 
     # ---- menus / actions --------------------------------------------------------------
     async def show_current_menu(self, group_id: int) -> None:
@@ -209,7 +205,32 @@ class ReminderEngine:
             await self.messenger.send_reminder_step(target)
             return
 
-        await self.messenger.send_home_step(group_id, pid, can_confirm=False)
+        await self.messenger.send_home_step(group_id, can_confirm=False)
+
+    async def show_hint_menu(self, group_id: int, *, kind: str) -> None:
+        """
+        Show the short hint (pressure/weight) with the inline menu in ONE message,
+        and set a one-shot expectation for the very next patient message.
+        """
+        pid = self.group_to_patient.get(group_id)
+        if pid is None:
+            return
+        patient = self.patient_index.get(pid)
+        if not patient:
+            return
+
+        # Set expectation
+        if kind in {"pressure", "weight"}:
+            self._expect_next[group_id] = kind
+
+        # Can we show confirm row?
+        target = self.state_mgr.select_target_for_confirmation(self.clock.now(), patient)
+        can_confirm = bool(target and self.state_mgr.status(target) == Status.AWAITING)
+
+        # Which hint text?
+        text = MESSAGES["prompt_pressure"] if kind == "pressure" else MESSAGES["prompt_weight"]
+
+        await self.messenger.send_menu(group_id, text=text, can_confirm=can_confirm)
 
     async def quick_confirm(self, group_id: int, from_user_id: int) -> None:
         """Handle '✅ TAKE' tap; patient-only is enforced upstream in adapter."""
@@ -220,6 +241,10 @@ class ReminderEngine:
         if not patient:
             return
         await self._handle_confirmation_text(patient)
+
+    async def show_help(self, group_id: int) -> None:
+        await self._reply(group_id, "help_text")
+        await self.show_current_menu(group_id)
 
     # ---- jobs / orchestration ----------------------------------------------------------
     async def _start_dose_job(self, *, patient_id: int, time_str: str) -> None:
@@ -264,13 +289,8 @@ class ReminderEngine:
             return
         today = self.clock.now().date()
         if not self.measures.has_today(measure_id, patient_id, today):
-            await self._reply(
-                patient["group_id"],
-                "escalate_group"
-                if measure_id not in {"pressure", "weight"}
-                else "unknown_text",
-            )
-            # Immediately refresh menu after any bot-visible event
+            # Neutral line; menu refresh keeps UI consistent
+            await self._reply(patient["group_id"], "unknown_text")
             await self.show_current_menu(patient["group_id"])
 
     # ---- retry glue -------------------------------------------------------------------
@@ -296,18 +316,18 @@ class ReminderEngine:
 
     async def _on_escalate_wrapper(self, inst: DoseInstance) -> None:
         # Send escalation messages
-        await self.messenger.send_escalation(inst)
+        await self.messenger.send_escalation(inst) if hasattr(self.messenger, "send_escalation") else None
         self._escalated.add(inst.dose_key)
         self._log_outcome_csv(inst, "escalated")
-        # NEW: keep the invariant "menu is last" after escalation.
+        # Keep the invariant "menu is last" after escalation.
         await self.show_current_menu(inst.group_id)
 
     # ---- confirmation handling ---------------------------------------------------------
     async def _handle_confirmation_text(self, patient: dict) -> None:
         now = self.clock.now()
         target = self.state_mgr.select_target_for_confirmation(now, patient)
-        if not target:
-            # Not awaiting → neutral line + refresh menu
+        # Only allow confirmation when a dose is actively awaiting.
+        if (not target) or (self.state_mgr.status(target) != Status.AWAITING):
             await self._reply(patient["group_id"], "unknown_text")
             await self.show_current_menu(patient["group_id"])
             return
@@ -347,6 +367,53 @@ class ReminderEngine:
         # Ack + refresh menu without confirm
         await self._reply(patient["group_id"], "ack_confirm")
         await self.show_current_menu(patient["group_id"])
+
+    # ---- measurement handling ----------------------------------------------------------
+    async def _handle_pressure_text(self, patient: dict, text: str) -> None:
+        parsed = parse_pressure_free(text)
+        gid = patient["group_id"]
+        if parsed.get("ok"):
+            now_local = self.clock.now()
+            sys_v = parsed["sys"]
+            dia_v = parsed["dia"]
+            pulse_v = parsed.get("pulse")
+            vals = (sys_v, dia_v) if pulse_v is None else (sys_v, dia_v, pulse_v)
+            self.measures.append_csv(
+                "pressure", now_local, patient["patient_id"], patient["patient_label"], vals
+            )
+            if pulse_v is None:
+                await self._reply(gid, "ack_pressure", systolic=sys_v, diastolic=dia_v)
+            else:
+                await self._reply(
+                    gid, "ack_pressure_pulse", systolic=sys_v, diastolic=dia_v, pulse=pulse_v
+                )
+        else:
+            err = parsed.get("error")
+            if err == "one_number":
+                await self._reply(gid, "err_pressure_one")
+            elif err == "range":
+                await self._reply(gid, "err_pressure_range")
+            else:
+                await self._reply(gid, "err_pressure_unrec")
+
+    async def _handle_weight_text(self, patient: dict, text: str) -> None:
+        parsed = parse_weight_free(text)
+        gid = patient["group_id"]
+        if parsed.get("ok"):
+            now_local = self.clock.now()
+            kg = parsed["kg"]
+            self.measures.append_csv(
+                "weight", now_local, patient["patient_id"], patient["patient_label"], (kg,)
+            )
+            await self._reply(gid, "ack_weight", kg=kg)
+        else:
+            err = parsed.get("error")
+            if err == "likely_pressure":
+                await self._reply(gid, "err_weight_likely_pressure")
+            elif err == "range":
+                await self._reply(gid, "err_weight_range")
+            else:
+                await self._reply(gid, "err_weight_unrec")
 
     # ---- plain replies ---------------------------------------------------------------
     async def _reply(

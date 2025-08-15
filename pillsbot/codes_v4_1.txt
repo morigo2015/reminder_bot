@@ -1,0 +1,1698 @@
+### FILE: ./adapters/telegram_adapter.py
+# pillsbot/adapters/telegram_adapter.py
+from __future__ import annotations
+
+import logging
+from typing import Any, Iterable
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardRemove,
+)
+
+from pillsbot.core.reminder_engine import IncomingMessage
+from pillsbot.core.logging_utils import kv
+from pillsbot.core.i18n import MESSAGES
+from pillsbot.debug_ids import print_group_and_users_best_effort
+
+
+class TelegramAdapter:
+    """
+    aiogram 3.x adapter implementing the v4 inline-only UX:
+
+    • Single dynamic inline menu at the bottom (flat, no submenus, no pinned message).
+    • Exactly one menu message exists in the chat: before posting a new one, delete the old one.
+    • Accept both tap and text confirmation (engine handles text; adapter routes taps).
+    • Patient-only actions; others are ignored silently (logged).
+    """
+
+    def __init__(
+        self, bot_token: str, engine: Any, patient_groups: Iterable[int]
+    ) -> None:
+        self.bot = Bot(token=bot_token, parse_mode=None)
+        self.dp = Dispatcher()
+
+        self.engine = engine
+        self.patient_groups = set(patient_groups)
+
+        self.log = logging.getLogger("pillsbot.adapter")
+
+        # Per-chat menu lifecycle (v4: delete-then-post)
+        self._last_menu_msg_id: dict[int, int] = {}
+
+        # ---- Handlers (IMPORTANT: commands first, then generic text) ----
+        self.dp.message.register(self.on_start, CommandStart())
+        self.dp.message.register(self.on_ids, Command("ids"))
+        self.dp.message.register(self.on_group_text, F.text)
+        self.dp.callback_query.register(self.on_callback, F.data.startswith("ui:"))
+
+    # ------------------------------------------------------------------------------
+    # Flat inline keyboard (single component; can_confirm toggles first row)
+    # ------------------------------------------------------------------------------
+    def build_menu_keyboard(self, *, can_confirm: bool) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+
+        if can_confirm:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="✅ " + MESSAGES["btn_confirm_taken"],
+                        callback_data="ui:TAKE",
+                    )
+                ]
+            )
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=MESSAGES["btn_pressure"], callback_data="ui:PRESSURE"
+                ),
+                InlineKeyboardButton(
+                    text=MESSAGES["btn_weight"], callback_data="ui:WEIGHT"
+                ),
+            ]
+        )
+        rows.append(
+            [InlineKeyboardButton(text=MESSAGES["btn_help"], callback_data="ui:HELP")]
+        )
+
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    # ------------------------------------------------------------------------------
+    # Menu posting (delete previous first)
+    # ------------------------------------------------------------------------------
+    async def post_menu(self, chat_id: int, text: str, *, can_confirm: bool) -> int:
+        # 1) Try to delete the previous menu message.
+        old = self._last_menu_msg_id.get(chat_id)
+        if old:
+            try:
+                await self.bot.delete_message(chat_id, old)
+            except Exception as e:
+                # Log and proceed to send a fresh menu anyway.
+                self.log.debug("menu.delete.fail " + kv(chat_id=chat_id, err=str(e)))
+
+        # 2) Send the new menu message (text + inline keyboard).
+        kb = self.build_menu_keyboard(can_confirm=can_confirm)
+        msg = await self.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+
+        # 3) Track it as the last menu.
+        self._last_menu_msg_id[chat_id] = msg.message_id
+        return msg.message_id
+
+    # ------------------------------------------------------------------------------
+    # Reply keyboard removal — done on /start (separate message)
+    # ------------------------------------------------------------------------------
+    async def clear_reply_keyboard_once(self, chat_id: int) -> None:
+        try:
+            await self.bot.send_message(
+                chat_id, " ", reply_markup=ReplyKeyboardRemove(remove_keyboard=True)
+            )
+        except Exception:
+            # Best-effort, ignore any errors (no rights, etc.)
+            pass
+
+    # ------------------------------------------------------------------------------
+    # Handlers
+    # ------------------------------------------------------------------------------
+    async def on_start(self, message: Message) -> None:
+        """
+        v4 migration: on /start send a separate message with ReplyKeyboardRemove(),
+        then post the state-appropriate menu (engine decides can_confirm).
+        """
+        chat_id = message.chat.id
+        await self.clear_reply_keyboard_once(chat_id)
+        await self.engine.show_current_menu(chat_id)
+
+    async def on_group_text(self, message: Message) -> None:
+        chat_id = message.chat.id
+        text = message.text or ""
+        sender_user_id = message.from_user.id if message.from_user else 0
+
+        # Fallback guard: if a command slipped through, route it explicitly
+        if text.startswith("/"):
+            cmd = text.split()[0].split("@")[0].lower()
+            if cmd == "/start":
+                await self.on_start(message)
+                return
+            if cmd == "/ids":
+                await self.on_ids(message)
+                return
+
+        self.log.info(
+            "msg.in.group "
+            + kv(group_id=chat_id, sender_user_id=sender_user_id, text=text)
+        )
+
+        if chat_id not in self.patient_groups:
+            self.log.debug("msg.in.ignored " + kv(reason="not a patient group"))
+            return
+
+        sent_at_utc = getattr(message, "date", None)
+        if sent_at_utc is None:
+            # aiogram delivers timezone-aware datetime; engine treats it as UTC timestamp.
+            from datetime import datetime, timezone as _tz
+
+            sent_at_utc = datetime.now(_tz.utc)
+
+        incoming = IncomingMessage(
+            group_id=chat_id,
+            sender_user_id=sender_user_id,
+            text=text,
+            sent_at_utc=sent_at_utc,
+        )
+
+        await self.engine.on_patient_message(incoming)
+
+    async def on_callback(self, callback: CallbackQuery) -> None:
+        """
+        Flat UI actions:
+        - ui:TAKE      → confirm (if awaiting)
+        - ui:PRESSURE  → send prompt, then refresh menu
+        - ui:WEIGHT    → send prompt, then refresh menu
+        - ui:HELP      → help text, then refresh menu
+
+        Only the mapped patient may act. Others are ignored silently (logged).
+        """
+        chat_id = callback.message.chat.id if callback.message else 0
+        from_user_id = callback.from_user.id if callback.from_user else 0
+        data = callback.data or ""
+
+        # Access control: patient-only
+        expected_pid = None
+        pid_mapping = getattr(self.engine, "group_to_patient", None)
+        if isinstance(pid_mapping, dict):
+            expected_pid = pid_mapping.get(chat_id)
+        if expected_pid is not None and from_user_id != expected_pid:
+            self.log.debug(
+                "cb.ignored.nonpatient "
+                + kv(group_id=chat_id, actor=from_user_id, expected=expected_pid)
+            )
+            # Ignore silently as per spec (optionally log). Do not toast.
+            return
+
+        # Route actions
+        if data == "ui:TAKE":
+            await self.engine.quick_confirm(chat_id, from_user_id)
+            # Engine sends ack and refreshes menu.
+            return
+
+        if data == "ui:PRESSURE":
+            await self.engine._reply(chat_id, "prompt_pressure")
+            await self.engine.show_current_menu(chat_id)
+            return
+
+        if data == "ui:WEIGHT":
+            await self.engine._reply(chat_id, "prompt_weight")
+            await self.engine.show_current_menu(chat_id)
+            return
+
+        if data == "ui:HELP":
+            await self.engine._reply(chat_id, "help_text")
+            await self.engine.show_current_menu(chat_id)
+            return
+
+    async def on_ids(self, message: Message) -> None:
+        """
+        Debug command: /ids prints group id and best-effort participants to console only.
+        No chat output, no menu refresh or deletions.
+        """
+        try:
+            # Gather known participants for this group (patient + nurse).
+            known_ids: set[int] = set()
+            chat_id = message.chat.id
+
+            pid_mapping = getattr(self.engine, "group_to_patient", {})
+            pat_idx = getattr(self.engine, "patient_index", {})
+
+            patient_id = pid_mapping.get(chat_id)
+            if isinstance(patient_id, int):
+                known_ids.add(patient_id)
+                pdata = pat_idx.get(patient_id, {})
+                nurse_id = pdata.get("nurse_user_id")
+                if isinstance(nurse_id, int):
+                    known_ids.add(nurse_id)
+
+            await print_group_and_users_best_effort(
+                self.bot, message, known_user_ids=list(known_ids)
+            )
+        except Exception as e:
+            self.log.debug("ids.print.fail " + kv(err=str(e)))
+        # Intentionally do nothing in chat (no reply).
+
+    # ------------------------------------------------------------------------------
+    # Outbound messaging (used by messenger)
+    # ------------------------------------------------------------------------------
+    async def send_group_message(
+        self, group_id: int, text: str, reply_markup: Any | None = None
+    ) -> int:
+        self.log.info("msg.out.group " + kv(group_id=group_id, text=text))
+        msg = await self.bot.send_message(
+            chat_id=group_id, text=text, reply_markup=reply_markup
+        )
+        return msg.message_id
+
+    async def send_nurse_dm(self, user_id: int, text: str) -> None:
+        self.log.info("msg.out.dm " + kv(user_id=user_id, text=text))
+        await self.bot.send_message(chat_id=user_id, text=text)
+
+    # v4 menu hook used by ReminderMessenger
+    async def send_menu_message(
+        self, group_id: int, text: str, *, can_confirm: bool
+    ) -> int:
+        return await self.post_menu(group_id, text, can_confirm=can_confirm)
+
+    async def run_polling(self) -> None:
+        self.log.debug("polling.run")
+        await self.bot.delete_webhook(drop_pending_updates=True)
+        await self.dp.start_polling(self.bot)
+
+
+__all__ = [
+    "TelegramAdapter",
+    "IncomingMessage",
+]
+
+
+### FILE: ./app.py
+# pillsbot/app.py
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+import asyncio
+import logging
+
+# --------------------------------------------------------------------------------------
+# Ensure project root is in sys.path so "import pillsbot.*" always works
+# --------------------------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import config as cfg  # noqa: E402
+from config import get_bot_token, PATIENTS  # noqa: E402
+from pillsbot.core.reminder_engine import ReminderEngine  # noqa: E402
+from pillsbot.adapters.telegram_adapter import TelegramAdapter  # noqa: E402
+from apscheduler.schedulers.asyncio import AsyncIOScheduler  # noqa: E402
+
+
+async def schedule_jobs(engine: ReminderEngine, timezone) -> AsyncIOScheduler:
+    """
+    Schedule daily dose reminders and measurement checks at exact times from config.
+    """
+    sched = AsyncIOScheduler(timezone=timezone)
+
+    # Doses
+    for p in PATIENTS:
+        pid = p["patient_id"]
+        for d in p["doses"]:
+            hh, mm = (int(x) for x in d["time"].split(":"))
+            sched.add_job(
+                engine._start_dose_job,
+                trigger="cron",
+                hour=hh,
+                minute=mm,
+                kwargs={"patient_id": pid, "time_str": d["time"]},
+                id=f"dose:{pid}:{d['time']}",
+                replace_existing=True,
+                coalesce=True,
+                misfire_grace_time=300,
+                max_instances=1,
+            )
+
+    # Daily measurement checks
+    for p in PATIENTS:
+        pid = p["patient_id"]
+        for chk in p.get("measurement_checks", []):
+            hh, mm = (int(x) for x in chk["time"].split(":"))
+            sched.add_job(
+                engine._job_measure_check,
+                trigger="cron",
+                hour=hh,
+                minute=mm,
+                kwargs={"patient_id": pid, "measure_id": chk["measure_id"]},
+                id=f"measure:{pid}:{chk['measure_id']}",
+                replace_existing=True,
+                coalesce=True,
+                misfire_grace_time=300,
+                max_instances=1,
+            )
+
+    sched.start()
+    return sched
+
+
+async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    )
+    log = logging.getLogger("pillsbot.app")
+    log.info("startup.begin " + f"timezone='{cfg.TIMEZONE}'")
+
+    # Build engine FIRST with adapter=None to break circular dependency
+    engine = ReminderEngine(cfg, adapter=None)
+
+    # Build Telegram adapter and attach back to the engine
+    bot_token = get_bot_token()
+    patient_groups = [p["group_id"] for p in PATIENTS]
+    adapter = TelegramAdapter(bot_token, engine=engine, patient_groups=patient_groups)
+    engine.attach_adapter(adapter)
+
+    # Initialize engine state
+    await engine.start(scheduler=None)
+
+    # Proper time-based scheduling
+    await schedule_jobs(engine, timezone=cfg.TZ)
+
+    log.info("startup.ready " + f"patients={len(PATIENTS)}")
+
+    # Single polling loop
+    await adapter.run_polling()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+### FILE: ./config.py
+"""
+Runtime configuration for PillsBot (v4).
+All times for scheduling/logging are Europe/Kyiv.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+from zoneinfo import ZoneInfo
+
+# --------------------------------------------------------------------------------------
+# Core bot settings
+# --------------------------------------------------------------------------------------
+BOT_TOKEN: str | None = (
+    "550433191:AAFkG6atLs_uo0nwphtuiwbwIJeUhwfzCyI"  # fallback if env BOT_TOKEN is not set
+)
+TIMEZONE = "Europe/Kyiv"
+TZ = ZoneInfo(TIMEZONE)
+
+# Retry/escalation configuration
+RETRY_INTERVAL_S = 30
+MAX_RETRY_ATTEMPTS = 3
+TAKING_GRACE_INTERVAL_S = 600  # reserved for future; engine simplified in v4
+
+# --------------------------------------------------------------------------------------
+# Patterns (v4: text confirmation list — case-insensitive/trimmed)
+# --------------------------------------------------------------------------------------
+CONFIRM_PATTERNS = [
+    r"^\s*ок\s*$",
+    r"^\s*\+\s*$",
+    r"^\s*так\s*$",
+    r"^\s*окей\s*$",
+    r"^\s*прийняв\s*$",
+    r"^\s*прийняла\s*$",
+]
+
+# --------------------------------------------------------------------------------------
+# Measurement definitions (v4)
+# --------------------------------------------------------------------------------------
+MEASURES: dict[str, dict[str, Any]] = {
+    "pressure": {
+        "label": "Тиск",
+        "patterns": ["тиск", "давление", "bp", "pressure"],
+        "csv_file": "pillsbot/logs/pressure.csv",
+        "parser_kind": "int2",  # exactly two integers
+        "separators": [" ", ",", "/"],  # allowed separators between the two numbers
+    },
+    "weight": {
+        "label": "Вага",
+        "patterns": ["вага", "вес", "взвешивание", "weight"],
+        "csv_file": "pillsbot/logs/weight.csv",
+        "parser_kind": "float1",  # exactly one number
+        "decimal_commas": True,  # accept "72,5"
+    },
+}
+
+# --------------------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------------------
+LOG_FILE = "pillsbot/logs/pills.csv"
+AUDIT_LOG_FILE = "pillsbot/logs/audit.log"
+
+# --------------------------------------------------------------------------------------
+# Patient roster (example/demo values; replace with real IDs)
+# --------------------------------------------------------------------------------------
+PATIENTS: list[dict[str, Any]] = [
+    {
+        "patient_id": 382163513,
+        "patient_label": "Іван Петров",
+        "group_id": -1002690368389,
+        "nurse_user_id": 7391874317,
+        "doses": [
+            {"time": "23:41", "text": "Вітамін Д"},
+            {"time": "20:00", "text": "Вітамін Д"},
+        ],
+        # Optional daily measurement checks (per measure)
+        "measurement_checks": [
+            {"measure_id": "pressure", "time": "21:00"},
+            {"measure_id": "weight", "time": "21:00"},
+        ],
+    },
+]
+
+
+def get_bot_token() -> str:
+    token = BOT_TOKEN or os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "Bot token is not set. Set BOT_TOKEN in config.py or env var BOT_TOKEN."
+        )
+    return token
+
+
+### FILE: ./core/config_validation.py
+# pillsbot/core/config_validation.py
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+import os
+
+
+def validate_config(cfg: Any) -> None:
+    """
+    Validate runtime configuration before starting the bot.
+
+    - Ensures patient records have required fields.
+    - Ensures dose times are valid HH:MM strings and unique per patient.
+    - Ensures dose text is present.
+    - Ensures measurement configuration (if present) is valid.
+    """
+    required_fields = {
+        "patient_id",
+        "patient_label",
+        "group_id",
+        "nurse_user_id",
+        "doses",
+    }
+
+    def parse_time_str(t: str) -> None:
+        try:
+            datetime.strptime(t, "%H:%M")
+        except ValueError as e:
+            raise ValueError(f"Invalid time '{t}', expected HH:MM") from e
+
+    patients = getattr(cfg, "PATIENTS", None)
+    if not isinstance(patients, list):
+        raise ValueError("PATIENTS must be a list of patient dictionaries")
+
+    for p in patients:
+        missing = required_fields - set(p.keys())
+        if missing:
+            raise ValueError(f"Patient missing fields: {missing}")
+
+        seen_times = set()
+        for d in p.get("doses", []):
+            t = d.get("time")
+            if not t:
+                raise ValueError(
+                    f"Missing 'time' in a dose for patient {p.get('patient_label')}"
+                )
+            if t in seen_times:
+                raise ValueError(
+                    f"Duplicate dose time for patient {p['patient_label']}: {t}"
+                )
+            seen_times.add(t)
+            parse_time_str(t)
+
+            if not d.get("text"):
+                raise ValueError(
+                    f"Dose text is required for patient {p['patient_label']} at {t}"
+                )
+
+        # Validate optional measurement checks
+        checks = p.get("measurement_checks", []) or []
+        per_measure_seen: dict[str, set[str]] = {}
+        for chk in checks:
+            mid = chk.get("measure_id")
+            if not mid:
+                raise ValueError(
+                    f"measurement_checks entry missing 'measure_id' for patient {p['patient_label']}"
+                )
+            measures = getattr(cfg, "MEASURES", {})
+            if mid not in measures:
+                raise ValueError(
+                    f"Unknown measure_id '{mid}' in measurement_checks for patient {p['patient_label']}"
+                )
+            t = chk.get("time")
+            if not t:
+                raise ValueError(
+                    f"measurement_checks entry missing 'time' for measure {mid} and patient {p['patient_label']}"
+                )
+            parse_time_str(t)
+            seen = per_measure_seen.setdefault(mid, set())
+            if t in seen:
+                raise ValueError(
+                    f"Duplicate measurement check time for measure {mid} and patient {p['patient_label']}: {t}"
+                )
+            seen.add(t)
+
+    # Ensure directories for measurement CSVs exist
+    for _, m in (getattr(cfg, "MEASURES", {}) or {}).items():
+        path = m.get("csv_file")
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+
+
+### FILE: ./core/i18n.py
+from __future__ import annotations
+
+# v4 message catalog (UA; concise)
+
+MESSAGES = {
+    # Menu texts
+    "reminder_text": "Час прийняти ліки. Підтвердіть прийом або оберіть дію нижче.",
+    "idle_text": "Що зробимо? Оберіть дію нижче.",
+    # Buttons
+    "btn_confirm_taken": "Ліки вже прийнято",
+    "btn_pressure": "Тиск",
+    "btn_weight": "Вага",
+    "btn_help": "Допомога",
+    # Prompts / Help
+    "prompt_pressure": "Надішліть тиск у форматі 120/80",
+    "prompt_weight": "Надішліть вагу у кілограмах (наприклад 72.5)",
+    "help_text": "Тут можна підтвердити прийом ліків, надіслати тиск або вагу.",
+    # Acks
+    "ack_confirm": "Готово! Зафіксовано, що ліки прийнято.",
+    "ack_pressure": "Записав тиск {systolic}/{diastolic}.",
+    "ack_weight": "Записав вагу {kg} кг.",
+    # Parse errors
+    "err_pressure": "Не вдалося розпізнати тиск. Приклад: 120/80",
+    "err_weight": "Не вдалося розпізнати вагу. Приклад: 72.5",
+    # Fallback for unknown text
+    "unknown_text": "Не розпізнав. Спробуйте кнопки нижче.",
+    # Nurse late confirm notification (unchanged semantics)
+    "nurse_late_confirm_dm": (
+        "пацієнт ({patient_label}) підтвердив прийом ПІСЛЯ ескалації: "
+        "{date} {time}, {pill_text}"
+    ),
+    # Escalation group/nurse texts (kept for retry flow)
+    "escalate_group": "не отримано підтвердження, залучаємо мед.сестру",
+    "escalate_dm": "пацієнт ({patient_label}): пропустив {date} {time}, {pill_text}",
+}
+
+
+def fmt(key: str, **kwargs) -> str:
+    return MESSAGES[key].format(**kwargs)
+
+
+### FILE: ./core/logging_utils.py
+# pillsbot/core/logging_utils.py
+from __future__ import annotations
+
+import logging
+import os
+from logging.handlers import RotatingFileHandler
+from typing import Any
+
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s — %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def setup_logging(cfg: Any) -> logging.Logger:
+    """
+    Configure logging:
+    - Console shows INFO and above (clean runtime output).
+    - Audit log file stores DEBUG and above (full trace).
+    """
+    log_dir = os.path.dirname(cfg.AUDIT_LOG_FILE)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    root = logging.getLogger("pillsbot")
+    root.setLevel(logging.DEBUG)  # Allow DEBUG to propagate to file handler
+
+    fmt = logging.Formatter(LOG_FORMAT, DATE_FORMAT)
+
+    # File handler — DEBUG level, full history
+    fh = RotatingFileHandler(
+        cfg.AUDIT_LOG_FILE, maxBytes=1_000_000, backupCount=10, encoding="utf-8"
+    )
+    fh.setFormatter(fmt)
+    fh.setLevel(logging.DEBUG)
+
+    # Console handler — INFO level, clean output
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    ch.setLevel(logging.INFO)
+
+    root.handlers.clear()
+    root.addHandler(fh)
+    root.addHandler(ch)
+
+    return root
+
+
+def kv(**kwargs: Any) -> str:
+    """Key=value compact formatting (values repr()'d for clarity)."""
+    return " ".join(f"{k}={v!r}" for k, v in kwargs.items())
+
+
+### FILE: ./core/matcher.py
+# pillsbot/core/matcher.py
+from __future__ import annotations
+
+import re
+from typing import Iterable, List, Pattern
+
+
+class Matcher:
+    """
+    Regex-based confirmation matcher (Unicode + case-insensitive).
+    All matching semantics live in the provided patterns (see config.CONFIRM_PATTERNS).
+    No input normalization or pattern rewriting happens here.
+    """
+
+    def __init__(self, patterns: Iterable[str]) -> None:
+        flags = re.IGNORECASE | re.UNICODE
+        self._compiled: List[Pattern[str]] = [re.compile(p, flags) for p in patterns]
+
+    def matches_confirmation(self, text: str | None) -> bool:
+        if not text:
+            return False
+        return any(rx.search(text) for rx in self._compiled)
+
+
+__all__ = ["Matcher"]
+
+
+### FILE: ./core/measurements.py
+# pillsbot/core/measurements.py
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime, date
+from typing import Any, Dict, List, Optional, Tuple
+
+
+@dataclass
+class MeasureDef:
+    id: str
+    label: str
+    patterns: List[str]
+    csv_file: str
+    parser_kind: str  # "int2" | "float1"
+    separators: Optional[List[str]] = None  # for pressure
+    decimal_commas: Optional[bool] = None  # for weight
+
+
+class MeasurementRegistry:
+    """
+    Central registry for measurement parsing + storage (v4).
+
+    * Start-anchored dispatch by configured patterns.
+    * For pressure, expect exactly TWO integers (systolic/diastolic).
+    * CSV append with header creation.
+    * 'has_today' helper for daily checks.
+    """
+
+    def __init__(self, tz, measures_cfg: Dict[str, Dict[str, Any]] | None = None):
+        self.tz = tz
+        self.measures: Dict[str, MeasureDef] = {}
+        self._compiled: Dict[str, re.Pattern[str]] = {}
+        measures_cfg = measures_cfg or {}
+        flags = re.IGNORECASE | re.UNICODE
+
+        for mid, m in measures_cfg.items():
+            md = MeasureDef(
+                id=mid,
+                label=m["label"],
+                patterns=m["patterns"],
+                csv_file=m["csv_file"],
+                parser_kind=m["parser_kind"],
+                separators=m.get("separators"),
+                decimal_commas=m.get("decimal_commas"),
+            )
+            self.measures[mid] = md
+            # ^\s*(kw1|kw2|...)\b[:\-]?\s*(?P<body>.*)?$
+            union = "|".join(re.escape(p) for p in md.patterns)
+            self._compiled[mid] = re.compile(
+                rf"^\s*(?:{union})\b[:\-]?\s*(?P<body>.+)?$", flags
+            )
+
+    def available(self) -> List[str]:
+        return list(self.measures.keys())
+
+    def get_label(self, measure_id: str) -> str:
+        return self.measures[measure_id].label
+
+    # ---- Dispatch (start-anchored) ----
+    def match(self, text: str | None) -> Optional[Tuple[str, str]]:
+        t = text or ""
+        for mid, rx in self._compiled.items():
+            m = rx.match(t)
+            if m:
+                body = (m.group("body") or "").strip()
+                return mid, body
+        return None
+
+    # ---- Parsing per measure ----
+    def parse(self, measure_id: str, body: str) -> Dict[str, Any]:
+        md = self.measures[measure_id]
+        if md.parser_kind == "int2":
+            # pressure: exactly two integers; separators: space/comma/slash
+            seps = md.separators or [" ", ",", "/"]
+            s = (body or "").strip()
+            if not s:
+                return {"ok": False, "error": "arity"}
+            for sep in seps:
+                s = s.replace(sep, " ")
+            parts = [p for p in s.strip().split() if p]
+            if len(parts) != 2:
+                return {"ok": False, "error": "arity"}
+            vals: List[int] = []
+            for p in parts:
+                if p.startswith("+"):
+                    p = p[1:]
+                if not p.isdigit():
+                    return {"ok": False, "error": "format"}
+                vals.append(int(p))
+            return {"ok": True, "values": tuple(vals)}
+        elif md.parser_kind == "float1":
+            # weight: exactly one number (dot or comma decimal), non-negative
+            tok = (body or "").strip()
+            toks = tok.split()
+            if len(toks) != 1:
+                return {"ok": False, "error": "arity_one"}
+            token = toks[0]
+            if md.decimal_commas:
+                token = token.replace(",", ".")
+            if token.startswith("+"):
+                token = token[1:]
+            try:
+                v = float(token)
+            except ValueError:
+                return {"ok": False, "error": "format_one"}
+            if v < 0 or v != v or v in (float("inf"), float("-inf")):
+                return {"ok": False, "error": "format_one"}
+            return {"ok": True, "values": (v,)}
+        else:
+            raise ValueError(f"Unknown parser_kind for {measure_id}: {md.parser_kind}")
+
+    # ---- CSV writing ----
+    def append_csv(
+        self,
+        measure_id: str,
+        dt_local: datetime,
+        patient_id: int,
+        patient_label: str,
+        values: tuple,
+    ) -> None:
+        md = self.measures[measure_id]
+        path = md.csv_file
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        is_new = not os.path.exists(path)
+
+        with open(path, "a", encoding="utf-8") as f:
+            if is_new:
+                if measure_id == "pressure":
+                    f.write(
+                        "date_time_local,patient_id,patient_label,systolic,diastolic\n"
+                    )
+                elif measure_id == "weight":
+                    f.write("date_time_local,patient_id,patient_label,weight\n")
+                else:
+                    cols = ",".join(f"value{i + 1}" for i in range(len(values)))
+                    f.write(f"date_time_local,patient_id,patient_label,{cols}\n")
+
+            ts = dt_local.strftime("%Y-%m-%d %H:%M")
+            if measure_id == "pressure":
+                sys, dia = values
+                f.write(f"{ts},{patient_id},{patient_label},{sys},{dia}\n")
+            elif measure_id == "weight":
+                (w,) = values
+                f.write(f"{ts},{patient_id},{patient_label},{w}\n")
+            else:
+                vals = ",".join(str(x) for x in values)
+                f.write(f"{ts},{patient_id},{patient_label},{vals}\n")
+
+    # ---- Daily check helper ----
+    def has_today(self, measure_id: str, patient_id: int, date_local: date) -> bool:
+        md = self.measures[measure_id]
+        path = md.csv_file
+        if not os.path.exists(path):
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            _ = f.readline()  # header
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                if len(parts) < 3:
+                    continue
+                dt_str = parts[0].strip()
+                pid_str = parts[1].strip()
+                try:
+                    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+                    pid = int(pid_str)
+                except Exception:
+                    continue
+                if pid == patient_id and dt.date() == date_local:
+                    return True
+        return False
+
+
+### FILE: ./core/reminder_engine.py
+# pillsbot/core/reminder_engine.py
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Optional, Dict, Set
+from zoneinfo import ZoneInfo
+
+from pillsbot.core.matcher import Matcher
+from pillsbot.core.i18n import fmt
+from pillsbot.core.logging_utils import kv
+from pillsbot.core.measurements import MeasurementRegistry
+from pillsbot.core.reminder_state import (
+    Clock,
+    Status,
+    DoseKey,
+    DoseInstance,
+    ReminderState,
+)
+from pillsbot.core.reminder_messaging import ReminderMessenger
+from pillsbot.core.reminder_retry import RetryManager
+
+
+# -------------------------------------------------------------------------------------------------
+# Public inbound message type (kept here for backwards-compat imports in tests)
+# -------------------------------------------------------------------------------------------------
+@dataclass
+class IncomingMessage:
+    group_id: int
+    sender_user_id: int
+    text: str
+    sent_at_utc: datetime
+
+
+class ReminderEngine:
+    """
+    v4: Single dynamic inline menu (delete old → post new). The engine ensures that
+    after every visible event the last message is the menu.
+    """
+
+    def __init__(self, config: Any, adapter: Any | None, clock: Optional[Clock] = None):
+        self.cfg = config
+        self.adapter = adapter
+        tz = getattr(config, "TZ", None) or ZoneInfo(
+            getattr(config, "TIMEZONE", "Europe/Kyiv")
+        )
+        self.clock = clock or Clock(tz)
+
+        # Core services
+        self.matcher = Matcher(getattr(config, "CONFIRM_PATTERNS", []))
+        self.measures = MeasurementRegistry(tz, getattr(config, "MEASURES", None))
+        self.log = logging.getLogger("pillsbot.engine")
+
+        # State & messaging
+        self.state_mgr = ReminderState(tz, self.clock)
+        self.messenger = ReminderMessenger(adapter=self.adapter, log=self.log)
+        self._escalated: Set[DoseKey] = set()
+
+        self.patient_index: Dict[int, dict] = {}
+        self.group_to_patient: Dict[int, int] = {}
+
+        self.retry_mgr: Optional[RetryManager] = None
+
+    def attach_adapter(self, adapter: Any) -> None:
+        self.adapter = adapter
+        self.messenger.adapter = adapter
+        self.log.debug("engine.adapter.attached " + kv(kind=type(adapter).__name__))
+
+    async def start(self, scheduler: Any | None) -> None:
+        # Build indices
+        for p in getattr(self.cfg, "PATIENTS", []):
+            pid = p["patient_id"]
+            self.patient_index[pid] = p
+            self.group_to_patient[p["group_id"]] = pid
+            self.state_mgr.ensure_today_instances(p)
+
+        # Wire retry
+        self.retry_mgr = RetryManager(
+            interval_seconds=int(getattr(self.cfg, "RETRY_INTERVAL_S", 30)),
+            max_attempts=int(getattr(self.cfg, "MAX_RETRY_ATTEMPTS", 3)),
+            send_repeat=self._send_repeat_wrapper,
+            on_escalate=self._on_escalate_wrapper,
+            set_status=self.state_mgr.set_status,
+            get_status=self.state_mgr.status,
+            logger=self.log,
+        )
+
+        # Optional scheduler passthrough kept for compatibility
+        if scheduler is not None:
+            try:
+                for p in getattr(self.cfg, "PATIENTS", []):
+                    for d in p["doses"]:
+                        scheduler.add_job(
+                            self._start_dose_job,
+                            kwargs={
+                                "patient_id": p["patient_id"],
+                                "time_str": d["time"],
+                            },
+                        )
+                    for chk in p.get("measurement_checks", []):
+                        scheduler.add_job(
+                            self._job_measure_check,
+                            kwargs={
+                                "patient_id": p["patient_id"],
+                                "measure_id": chk["measure_id"],
+                            },
+                        )
+            except Exception:
+                pass
+
+    # ---- incoming from adapter --------------------------------------------------------
+    async def on_patient_message(self, msg: IncomingMessage) -> None:
+        self.log.info(
+            "msg.engine.in "
+            + kv(
+                group_id=msg.group_id,
+                sender_user_id=msg.sender_user_id,
+                text=(msg.text or ""),
+            )
+        )
+
+        pid = self.group_to_patient.get(msg.group_id)
+        if pid is None or pid != msg.sender_user_id:
+            self.log.debug(
+                "msg.engine.reject "
+                + kv(
+                    reason="patient-only",
+                    group_id=msg.group_id,
+                    sender_user_id=msg.sender_user_id,
+                )
+            )
+            return
+
+        patient = self.patient_index[pid]
+        text = (msg.text or "").strip()
+
+        # Measurements
+        mm = self.measures.match(text)
+        if mm:
+            mid, body = mm
+            parsed = self.measures.parse(mid, body)
+            if parsed.get("ok"):
+                now_local = self.clock.now()
+                self.measures.append_csv(
+                    mid, now_local, pid, patient["patient_label"], parsed["values"]
+                )
+                if mid == "pressure":
+                    sys_v, dia_v = parsed["values"]
+                    await self._reply(
+                        patient["group_id"],
+                        "ack_pressure",
+                        systolic=sys_v,
+                        diastolic=dia_v,
+                    )
+                elif mid == "weight":
+                    (w,) = parsed["values"]
+                    await self._reply(patient["group_id"], "ack_weight", kg=w)
+                else:
+                    await self._reply(patient["group_id"], "unknown_text")
+            else:
+                if mid == "pressure":
+                    await self._reply(patient["group_id"], "err_pressure")
+                elif mid == "weight":
+                    await self._reply(patient["group_id"], "err_weight")
+                else:
+                    await self._reply(patient["group_id"], "unknown_text")
+
+            # After measurement handling, refresh menu
+            await self.show_current_menu(patient["group_id"])
+            return
+
+        # Confirmation via text
+        if self.matcher.matches_confirmation(text.lower().strip()):
+            await self._handle_confirmation_text(patient)
+            return
+
+        # Help keyword
+        if text.lower() in {"help", "?", "довідка"}:
+            await self._reply(patient["group_id"], "help_text")
+            await self.show_current_menu(patient["group_id"])
+            return
+
+        # Fallback
+        await self._reply(patient["group_id"], "unknown_text")
+        await self.show_current_menu(patient["group_id"])
+
+    # ---- menus / actions --------------------------------------------------------------
+    async def show_current_menu(self, group_id: int) -> None:
+        """
+        Post exactly one menu at the bottom:
+        - If a dose is actively AWAITING → show reminder text + menu with Confirm.
+        - Otherwise → show idle text + menu without Confirm.
+        """
+        pid = self.group_to_patient.get(group_id)
+        if pid is None:
+            return
+        patient = self.patient_index.get(pid)
+        if not patient:
+            return
+
+        target = self.state_mgr.select_target_for_confirmation(
+            self.clock.now(), patient
+        )
+
+        if target and self.state_mgr.status(target) == Status.AWAITING:
+            await self.messenger.send_reminder_step(target)
+            return
+
+        await self.messenger.send_home_step(group_id, pid, can_confirm=False)
+
+    async def quick_confirm(self, group_id: int, from_user_id: int) -> None:
+        """Handle '✅ TAKE' tap; patient-only is enforced upstream in adapter."""
+        pid = self.group_to_patient.get(group_id)
+        if pid is None or pid != from_user_id:
+            return
+        patient = self.patient_index.get(pid)
+        if not patient:
+            return
+        await self._handle_confirmation_text(patient)
+
+    # ---- jobs / orchestration ----------------------------------------------------------
+    async def _start_dose_job(self, *, patient_id: int, time_str: str) -> None:
+        patient = self.patient_index.get(patient_id)
+        if not patient:
+            self.log.debug(
+                "job.trigger.miss "
+                + kv(reason="unknown patient", patient_id=patient_id)
+            )
+            return
+
+        key = DoseKey(patient_id, self.clock.today_str(), time_str)
+        inst = self.state_mgr.get(key)
+        if inst is None:
+            self.state_mgr.ensure_today_instances(patient)
+            inst = self.state_mgr.get(key)
+            if inst is None:
+                self.log.error(
+                    "job.trigger.miss "
+                    + kv(
+                        patient_id=patient_id, time=time_str, reason="state not created"
+                    )
+                )
+                return
+
+        if self.state_mgr.status(inst) == Status.CONFIRMED:
+            self.log.debug(
+                "job.trigger.skip "
+                + kv(patient_id=patient_id, time=time_str, reason="confirmed")
+            )
+            return
+
+        self.state_mgr.set_status(inst, Status.AWAITING)
+        inst.attempts_sent = 1
+
+        await self.messenger.send_reminder_step(inst)
+        await self._start_retry(inst)
+
+    async def _job_measure_check(self, *, patient_id: int, measure_id: str) -> None:
+        patient = self.patient_index.get(patient_id)
+        if not patient:
+            return
+        today = self.clock.now().date()
+        if not self.measures.has_today(measure_id, patient_id, today):
+            await self._reply(
+                patient["group_id"],
+                "escalate_group"
+                if measure_id not in {"pressure", "weight"}
+                else "unknown_text",
+            )
+            # Immediately refresh menu after any bot-visible event
+            await self.show_current_menu(patient["group_id"])
+
+    # ---- retry glue -------------------------------------------------------------------
+    async def _start_retry(self, inst: DoseInstance) -> None:
+        if self.retry_mgr is None:
+            return
+        await self._stop_retry(inst)
+        inst.retry_task = asyncio.create_task(self.retry_mgr.run(inst))
+
+    async def _stop_retry(self, inst: DoseInstance) -> None:
+        t = inst.retry_task
+        if t and not t.done():
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
+        inst.retry_task = None
+
+    async def _send_repeat_wrapper(self, inst: DoseInstance) -> None:
+        # v4: final pre-send status check — if not AWAITING, do not send the retry.
+        if self.state_mgr.status(inst) != Status.AWAITING:
+            return
+        await self.messenger.send_reminder_step(inst)
+
+    async def _on_escalate_wrapper(self, inst: DoseInstance) -> None:
+        # Send escalation messages
+        await self.messenger.send_escalation(inst)
+        self._escalated.add(inst.dose_key)
+        self._log_outcome_csv(inst, "escalated")
+        # NEW: keep the invariant "menu is last" after escalation.
+        await self.show_current_menu(inst.group_id)
+
+    # ---- confirmation handling ---------------------------------------------------------
+    async def _handle_confirmation_text(self, patient: dict) -> None:
+        now = self.clock.now()
+        target = self.state_mgr.select_target_for_confirmation(now, patient)
+        if not target:
+            # Not awaiting → neutral line + refresh menu
+            await self._reply(patient["group_id"], "unknown_text")
+            await self.show_current_menu(patient["group_id"])
+            return
+
+        # Idempotent confirm
+        if self.state_mgr.status(target) == Status.CONFIRMED:
+            await self._reply(patient["group_id"], "ack_confirm")
+            await self.show_current_menu(patient["group_id"])
+            return
+
+        self.state_mgr.set_status(target, Status.CONFIRMED)
+        await self._stop_retry(target)
+        self.log.info(
+            "dose.confirm "
+            + kv(
+                patient_id=target.patient_id,
+                time=target.dose_key.time_str,
+                source="tap/text",
+            )
+        )
+
+        if target.dose_key in self._escalated:
+            await self.messenger.send_nurse_notice(
+                target.nurse_user_id,
+                fmt(
+                    "nurse_late_confirm_dm",
+                    patient_label=target.patient_label,
+                    date=target.dose_key.date_str,
+                    time=target.dose_key.time_str,
+                    pill_text=target.pill_text,
+                ),
+            )
+            self._escalated.discard(target.dose_key)
+
+        self._log_outcome_csv(target, "confirmed")
+
+        # Ack + refresh menu without confirm
+        await self._reply(patient["group_id"], "ack_confirm")
+        await self.show_current_menu(patient["group_id"])
+
+    # ---- plain replies ---------------------------------------------------------------
+    async def _reply(
+        self, group_id: int, template_key: str, **fmt_args: Any
+    ) -> Optional[int]:
+        """Send a plain group message using i18n template (menu is managed by callers)."""
+        return await self.messenger.send_group_template(
+            group_id, template_key, **fmt_args
+        )
+
+    # ---- misc -------------------------------------------------------------------------
+    def _log_outcome_csv(self, inst: DoseInstance, status: str) -> None:
+        line = (
+            f"{inst.scheduled_dt_local.strftime('%Y-%m-%d %H:%M')}, "
+            f"{inst.patient_id}, {inst.patient_label}, {inst.pill_text}, {status}, {inst.attempts_sent}\n"
+        )
+        path = getattr(self.cfg, "LOG_FILE", "pillsbot/logs/pills.csv")
+        import os
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+    @property
+    def state(self):
+        return self.state_mgr.mapping
+
+
+### FILE: ./core/reminder_messaging.py
+# pillsbot/core/reminder_messaging.py
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional
+
+from pillsbot.core.i18n import fmt, MESSAGES
+from pillsbot.core.logging_utils import kv
+from pillsbot.core.reminder_state import DoseInstance
+
+
+class ReminderMessenger:
+    """
+    Handles all outbound UX. In v4, there is a single flat menu message
+    at the bottom of the chat. Before posting a new menu, the old one is deleted.
+    """
+
+    def __init__(
+        self,
+        adapter: Any | None,
+        log: logging.Logger,
+        inline_confirm_enabled: bool = True,  # kept for compatibility; not used in v4 logic
+    ):
+        self.adapter = adapter
+        self.log = log
+        self.inline_confirm_enabled = inline_confirm_enabled
+
+    # -- v4 menu ---------------------------------------------------------
+    async def send_menu(
+        self, group_id: int, *, text: str, can_confirm: bool
+    ) -> Optional[int]:
+        """
+        Ask the adapter to post the single menu message (delete old → post new).
+        Returns new message_id when available.
+        """
+        if self.adapter is None or not hasattr(self.adapter, "send_menu_message"):
+            return await self._send_group(group_id, text)
+        try:
+            return await self.adapter.send_menu_message(
+                group_id, text, can_confirm=can_confirm
+            )
+        except Exception as e:  # defensive
+            self.log.error("menu.send.error " + kv(group_id=group_id, err=str(e)))
+            return await self._send_group(group_id, text)
+
+    async def send_reminder_step(self, inst: DoseInstance) -> Optional[int]:
+        """Send reminder text + menu with confirm."""
+        return await self.send_menu(
+            inst.group_id, text=MESSAGES["reminder_text"], can_confirm=True
+        )
+
+    async def send_home_step(
+        self, group_id: int, patient_id: int, *, can_confirm: bool
+    ) -> Optional[int]:
+        """Send idle text + menu (confirm only if can_confirm=True)."""
+        return await self.send_menu(
+            group_id, text=MESSAGES["idle_text"], can_confirm=can_confirm
+        )
+
+    # -- other messaging -------------------------------------------------
+    async def send_group_template(
+        self, group_id: int, template_key: str, **fmt_args: Any
+    ) -> Optional[int]:
+        """Send a plain templated group message (no buttons)."""
+        text = fmt(template_key, **fmt_args)
+        return await self._send_group(group_id, text, reply_markup=None)
+
+    async def send_escalation(self, inst: DoseInstance) -> None:
+        """Group notice + DM to nurse."""
+        await self._send_group(inst.group_id, MESSAGES["escalate_group"])
+        await self._send_nurse_dm(
+            inst.nurse_user_id,
+            fmt(
+                "escalate_dm",
+                patient_label=inst.patient_label,
+                date=inst.dose_key.date_str,
+                time=inst.dose_key.time_str,
+                pill_text=inst.pill_text,
+            ),
+        )
+
+    async def send_nurse_notice(self, user_id: int, text: str) -> None:
+        await self._send_nurse_dm(user_id, text)
+
+    # -- low-level adapter calls with fallbacks --------------------------
+    async def _send_group(
+        self, group_id: int, text: str, reply_markup: Any | None = None
+    ) -> Optional[int]:
+        if self.adapter is None:
+            self.log.error(
+                "msg.out.group.error "
+                + kv(group_id=group_id, err="adapter not attached")
+            )
+            return None
+        try:
+            self.log.info(
+                "msg.out.group "
+                + kv(
+                    group_id=group_id, text=text[:64] + ("…" if len(text) > 64 else "")
+                )
+            )
+            msg = await self.adapter.send_group_message(
+                group_id, text, reply_markup=reply_markup
+            )
+            return getattr(msg, "message_id", None)
+        except Exception as e:  # pragma: no cover
+            self.log.error("msg.out.group.error " + kv(group_id=group_id, err=str(e)))
+            return None
+
+    async def _send_nurse_dm(self, user_id: int, text: str) -> None:
+        if self.adapter is None:
+            self.log.error(
+                "msg.out.dm.error " + kv(user_id=user_id, err="adapter not attached")
+            )
+            return
+        try:
+            self.log.info(
+                "msg.out.dm "
+                + kv(user_id=user_id, text=text[:64] + ("…" if len(text) > 64 else ""))
+            )
+            await self.adapter.send_nurse_dm(user_id, text)
+        except Exception as e:  # pragma: no cover
+            self.log.error("msg.out.dm.error " + kv(user_id=user_id, err=str(e)))
+
+
+### FILE: ./core/reminder_retry.py
+# pillsbot/core/reminder_retry.py
+from __future__ import annotations
+
+import asyncio
+from typing import Callable, Awaitable
+from pillsbot.core.logging_utils import kv
+from pillsbot.core.reminder_state import Status, DoseInstance
+
+
+class RetryManager:
+    """
+    Runs the retry loop for a DoseInstance, escalating at the end.
+    Keeps all timing policy here so engines stay small and testable.
+    """
+
+    def __init__(
+        self,
+        interval_seconds: int,
+        max_attempts: int,
+        *,
+        send_repeat: Callable[[DoseInstance], Awaitable[None]],
+        on_escalate: Callable[[DoseInstance], Awaitable[None]],
+        set_status: Callable[[DoseInstance, Status], None],
+        get_status: Callable[[DoseInstance], Status],
+        logger,
+    ) -> None:
+        self.interval_seconds = interval_seconds
+        self.max_attempts = max_attempts
+        self.send_repeat = send_repeat
+        self.on_escalate = on_escalate
+        self.set_status = set_status
+        self.get_status = get_status
+        self.log = logger
+
+    async def run(self, inst: DoseInstance) -> None:
+        """
+        Retry until confirmed or attempts exhausted. On exhaustion, escalate.
+        Final pre-send status check happens in send_repeat wrapper.
+        """
+        try:
+            while self.get_status(inst) not in (Status.CONFIRMED, Status.ESCALATED):
+                await asyncio.sleep(self.interval_seconds)
+
+                if self.get_status(inst) in (Status.CONFIRMED, Status.ESCALATED):
+                    break
+
+                inst.attempts_sent += 1
+                if inst.attempts_sent > self.max_attempts:
+                    self.set_status(inst, Status.ESCALATED)
+                    self.log.info(
+                        "retry.escalate "
+                        + kv(
+                            patient_id=inst.patient_id,
+                            time=inst.dose_key.time_str,
+                            attempts=inst.attempts_sent,
+                        )
+                    )
+                    await self.on_escalate(inst)
+                    break
+
+                self.log.debug(
+                    "retry.repeat "
+                    + kv(
+                        patient_id=inst.patient_id,
+                        time=inst.dose_key.time_str,
+                        attempt=inst.attempts_sent,
+                    )
+                )
+                await self.send_repeat(inst)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # defensive
+            self.log.error(
+                "retry.loop.error "
+                + kv(
+                    patient_id=inst.patient_id, time=inst.dose_key.time_str, err=str(e)
+                )
+            )
+
+
+### FILE: ./core/reminder_state.py
+# pillsbot/core/reminder_state.py
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Dict, Optional, Tuple, Iterable
+from zoneinfo import ZoneInfo
+
+
+class Status(str, Enum):
+    PENDING = "pending"
+    AWAITING = "awaiting"
+    CONFIRMED = "confirmed"
+    ESCALATED = "escalated"
+
+
+@dataclass(frozen=True)
+class DoseKey:
+    """Stable identity for a single scheduled dose."""
+
+    patient_id: int
+    date_str: str  # YYYY-MM-DD (engine-local date string)
+    time_str: str  # HH:MM
+
+
+@dataclass
+class DoseInstance:
+    """Mutable runtime state for a scheduled dose occurrence."""
+
+    dose_key: DoseKey
+    patient_id: int
+    patient_label: str
+    group_id: int
+    nurse_user_id: int
+    pill_text: str
+    scheduled_dt_local: datetime
+    status: str = Status.PENDING.value
+    attempts_sent: int = 0
+    preconfirmed: bool = False
+    retry_task: Optional[asyncio.Task] = None
+    last_message_ids: list[int] = field(default_factory=list)  # debug/trace only
+
+
+class Clock:
+    """Injectable, testable clock bound to a timezone."""
+
+    def __init__(self, tz: ZoneInfo):
+        self.tz = tz
+
+    def now(self) -> datetime:
+        return datetime.now(self.tz)
+
+    def today_str(self) -> str:
+        return self.now().strftime("%Y-%m-%d")
+
+
+class ReminderState:
+    """
+    Owns the in-memory state and selection logic.
+    Only manipulates DoseInstance objects; orchestration lives in the engine.
+    """
+
+    def __init__(self, tz: ZoneInfo, clock: Clock):
+        self.tz = tz
+        self.clock = clock
+        self._state: Dict[DoseKey, DoseInstance] = {}
+
+    # -- dict-like read access for compatibility with existing tests --
+    def get(self, key: DoseKey) -> Optional[DoseInstance]:
+        return self._state.get(key)
+
+    def values(self) -> Iterable[DoseInstance]:
+        return self._state.values()
+
+    def keys(self) -> Iterable[DoseKey]:
+        return self._state.keys()
+
+    @property
+    def mapping(self) -> Dict[DoseKey, DoseInstance]:
+        """Expose the raw mapping for compat with tests (read/write by engine only)."""
+        return self._state
+
+    # -- lifecycle ------------------------------------------------------
+    def ensure_today_instances(self, patient: dict) -> None:
+        """Create DoseInstance entries for today's date if missing."""
+        today = self.clock.today_str()
+        pid = patient["patient_id"]
+        group_id = patient["group_id"]
+        nurse_user_id = patient["nurse_user_id"]
+        label = patient["patient_label"]
+
+        for d in patient["doses"]:
+            t_str: str = d["time"]
+            pill_text: str = d["text"]
+            key = DoseKey(pid, today, t_str)
+            if key in self._state:
+                continue
+            dt_local = self._combine(today, t_str)
+            self._state[key] = DoseInstance(
+                dose_key=key,
+                patient_id=pid,
+                patient_label=label,
+                group_id=group_id,
+                nurse_user_id=nurse_user_id,
+                pill_text=pill_text,
+                scheduled_dt_local=dt_local,
+            )
+
+    # -- status helpers -------------------------------------------------
+    def set_status(self, inst: DoseInstance, status: Status) -> None:
+        inst.status = status.value
+
+    def status(self, inst: DoseInstance) -> Status:
+        return Status(inst.status)
+
+    # -- selection logic ------------------------------------------------
+    def select_target_for_confirmation(
+        self, now_local: datetime, patient: dict
+    ) -> Optional[DoseInstance]:
+        """
+        Prefer actively waiting; else the nearest upcoming (same day),
+        excluding already confirmed/escalated.
+        """
+        pid = patient["patient_id"]
+        today = self.clock.today_str()
+
+        # 1) Actively waiting
+        for d in patient["doses"]:
+            key = DoseKey(pid, today, d["time"])
+            inst = self._state.get(key)
+            if inst and self.status(inst) == Status.AWAITING:
+                return inst
+
+        # 2) Nearest upcoming today (not confirmed/escalated)
+        best: Tuple[Optional[DoseInstance], Optional[datetime]] = (None, None)
+        for d in patient["doses"]:
+            key = DoseKey(pid, today, d["time"])
+            inst = self._state.get(key)
+            if not inst or self.status(inst) in (Status.CONFIRMED, Status.ESCALATED):
+                continue
+            dt = inst.scheduled_dt_local
+            if dt >= now_local and (best[1] is None or dt < best[1]):
+                best = (inst, dt)
+
+        return best[0]
+
+    # -- utilities ------------------------------------------------------
+    def _combine(self, yyyy_mm_dd: str, hh_mm: str) -> datetime:
+        y, m, d = (int(x) for x in yyyy_mm_dd.split("-"))
+        hh, mm = (int(x) for x in hh_mm.split(":"))
+        return datetime(y, m, d, hh, mm, tzinfo=self.tz)
+
+
+### FILE: ./debug_ids.py
+# pillsbot/debug_ids.py
+from __future__ import annotations
+
+import sys
+from typing import Iterable, Optional, Dict, Tuple
+
+from aiogram.types import Message
+from aiogram import Bot
+
+
+async def _name_tuple_from_user(u) -> Tuple[Optional[str], Optional[str]]:
+    username = u.username or None
+    realname = f"{u.first_name or ''} {u.last_name or ''}".strip() or None
+    return username, realname
+
+
+async def print_group_and_users_best_effort(
+    bot: Bot,
+    message: Message,
+    known_user_ids: Optional[Iterable[int]] = None,
+) -> None:
+    """
+    Print to stdout:
+      - group_id
+      - For each participant we can discover: user_id, @username, real name
+    No messages are sent or deleted in chat; no state is changed.
+
+    Strategy (best-effort, platform-appropriate):
+      1) Include chat administrators (get_chat_administrators).
+      2) Include the message sender (if any).
+      3) Include the bot itself.
+      4) Include any known user ids (e.g., patient, nurse) via get_chat_member.
+         This covers non-admin, silent members (like a nurse who hasn't spoken).
+    """
+    chat = message.chat
+    group_id = chat.id
+
+    users: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
+
+    # 1) Admins
+    try:
+        admins = await bot.get_chat_administrators(group_id)
+        for a in admins:
+            u = a.user
+            users[u.id] = await _name_tuple_from_user(u)
+    except Exception:
+        pass  # ignore, proceed with other sources
+
+    # 2) Sender
+    if message.from_user:
+        u = message.from_user
+        users.setdefault(u.id, await _name_tuple_from_user(u))
+
+    # 3) Bot itself
+    try:
+        me = await bot.get_me()
+        users.setdefault(me.id, await _name_tuple_from_user(me))
+    except Exception:
+        pass
+
+    # 4) Known user ids (patient, nurse) — fetch membership info even if not admins/senders
+    if known_user_ids:
+        for uid in known_user_ids:
+            try:
+                member = await bot.get_chat_member(group_id, uid)
+                u = member.user
+                users.setdefault(u.id, await _name_tuple_from_user(u))
+            except Exception:
+                # If not found or inaccessible, still record the raw uid
+                users.setdefault(uid, (None, None))
+
+    # Print to console/stdout
+    print(f"group_id={group_id}", file=sys.stdout, flush=True)
+    for uid, (uname, realname) in users.items():
+        print(
+            f"user_id={uid} username={uname!r} name={realname!r}",
+            file=sys.stdout,
+            flush=True,
+        )
+
+
+### FILE: ./__init__.py
+
+
