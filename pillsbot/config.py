@@ -1,5 +1,5 @@
 """
-Runtime configuration for PillsBot.
+Runtime configuration for PillsBot (v4).
 All times for scheduling/logging are Europe/Kyiv.
 """
 
@@ -19,53 +19,46 @@ TIMEZONE = "Europe/Kyiv"
 TZ = ZoneInfo(TIMEZONE)
 
 # Retry/escalation configuration
-RETRY_INTERVAL_S = 30  # I
-MAX_RETRY_ATTEMPTS = 3  # N
-TAKING_GRACE_INTERVAL_S = 600  # pre-confirm grace period in seconds
+RETRY_INTERVAL_S = 30
+MAX_RETRY_ATTEMPTS = 3
+TAKING_GRACE_INTERVAL_S = 600  # reserved for future; engine simplified in v4
 
 # --------------------------------------------------------------------------------------
-# Patterns (centralized: confirmations + measurements)
+# Patterns (v4: text confirmation list — case-insensitive/trimmed)
 # --------------------------------------------------------------------------------------
-# Confirmation patterns (search-anywhere). Existing behavior unchanged.
 CONFIRM_PATTERNS = [
-    r"[OoОо][KkКк]",
-    r"\bok\b",
-    r"\bок\b",
-    r"\bтак\b",
-    r"\bвже\b",
-    r"\bда\b",
-    r"\bокей\b",
-    r"\bдобре\b",
-    r"\+",
-    r"^\s*(✅|✔️|👍)\s*$",
-    r"\bdone\b",
+    r"^\s*ок\s*$",
+    r"^\s*\+\s*$",
+    r"^\s*так\s*$",
+    r"^\s*окей\s*$",
+    r"^\s*прийняв\s*$",
+    r"^\s*прийняла\s*$",
 ]
 
-# Measurement definitions (start-anchored; config-only extensibility)
+# --------------------------------------------------------------------------------------
+# Measurement definitions (v4)
+# --------------------------------------------------------------------------------------
 MEASURES: dict[str, dict[str, Any]] = {
     "pressure": {
         "label": "Тиск",
-        "patterns": ["тиск", "давление", "BP", "pressure"],
+        "patterns": ["тиск", "давление", "bp", "pressure"],
         "csv_file": "pillsbot/logs/pressure.csv",
-        "parser_kind": "int3",  # exactly three integers
-        "separators": [" ", ",", "/"],  # allowed separators between the three numbers
+        "parser_kind": "int2",  # exactly two integers
+        "separators": [" ", ",", "/"],  # allowed separators between the two numbers
     },
     "weight": {
         "label": "Вага",
         "patterns": ["вага", "вес", "взвешивание", "weight"],
         "csv_file": "pillsbot/logs/weight.csv",
         "parser_kind": "float1",  # exactly one number
-        "decimal_commas": True,  # accept "102,4"
+        "decimal_commas": True,  # accept "72,5"
     },
 }
 
 # --------------------------------------------------------------------------------------
 # Logging
 # --------------------------------------------------------------------------------------
-# CSV outcome file (unchanged name for backward compatibility with tests/tools)
 LOG_FILE = "pillsbot/logs/pills.csv"
-
-# Human-readable audit trail (separate from CSV)
 AUDIT_LOG_FILE = "pillsbot/logs/audit.log"
 
 # --------------------------------------------------------------------------------------
@@ -78,7 +71,7 @@ PATIENTS: list[dict[str, Any]] = [
         "group_id": -1002690368389,
         "nurse_user_id": 7391874317,
         "doses": [
-            {"time": "15:50", "text": "Вітамін Д"},
+            {"time": "23:41", "text": "Вітамін Д"},
             {"time": "20:00", "text": "Вітамін Д"},
         ],
         # Optional daily measurement checks (per measure)

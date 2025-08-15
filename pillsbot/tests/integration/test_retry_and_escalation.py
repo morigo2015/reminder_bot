@@ -1,16 +1,16 @@
+# tests/integration/test_retry_and_escalation.py
 import asyncio
 import pytest
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
-from pillsbot.core.reminder_engine import ReminderEngine, IncomingMessage
+from pillsbot.core.reminder_engine import ReminderEngine
 from pillsbot import config as cfg
 
 class FakeAdapter:
     def __init__(self):
         self.sent = []
 
-    async def send_group_message(self, group_id, text):
+    async def send_group_message(self, group_id, text, reply_markup=None):
         self.sent.append(("group", group_id, text))
 
     async def send_nurse_dm(self, user_id, text):
@@ -45,8 +45,9 @@ async def test_retry_and_escalation():
     eng = make_engine(interval=0.05, max_attempts=2)
     await eng.start(NoOpScheduler())
     # Manually trigger the job (simulate scheduler firing)
-    await eng._start_dose_job(patient_id=10, time_str=list(eng.state.keys())[0].time_str)
+    dose_key = list(eng.state.keys())[0]
+    await eng._start_dose_job(patient_id=dose_key.patient_id, time_str=dose_key.time_str)
     # Wait enough for retries + escalation
-    await asyncio.sleep(0.2)
-    # Check an escalation happened
-    assert any(kind=="dm" for (kind, _, _) in eng.adapter.sent)
+    await asyncio.sleep(0.25)
+    # Check an escalation happened (nurse DM sent)
+    assert any(kind == "dm" for (kind, _, _) in eng.adapter.sent)

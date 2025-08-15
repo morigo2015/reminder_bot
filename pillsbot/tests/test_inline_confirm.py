@@ -1,26 +1,41 @@
-# pillsbot/tests/test_inline_confirm.py
+# tests/test_inline_confirm.py
 import pytest
 from pillsbot.core.reminder_engine import ReminderEngine, DoseKey, Status
 import pillsbot.config as cfg
-from pillsbot.core.i18n import fmt  # import the i18n formatter
+
+
+class FakeAdapter:
+    def __init__(self):
+        self.sent = []  # (kind, id, text)
+
+    async def send_group_message(self, group_id, text, reply_markup=None):
+        self.sent.append(("group", group_id, text))
+
+    async def send_nurse_dm(self, user_id, text):
+        self.sent.append(("dm", user_id, text))
 
 
 @pytest.mark.asyncio
-async def test_inline_confirm_falls_back_to_selection():
-    eng = ReminderEngine(cfg, adapter=None)
+async def test_text_confirmation_confirms_when_awaiting():
+    eng = ReminderEngine(cfg, adapter=FakeAdapter())
     await eng.start(None)
 
+    # Pick first patient & dose and mark it as awaiting
     patient = list(eng.patient_index.values())[0]
-    key = DoseKey(patient["patient_id"], eng._today_str(), patient["doses"][0]["time"])
+    key = DoseKey(patient["patient_id"], eng.clock.today_str(), patient["doses"][0]["time"])
     inst = eng.state_mgr.get(key)
     eng.state_mgr.set_status(inst, Status.AWAITING)
 
-    result = await eng.on_inline_confirm(
+    # Send a confirmation text
+    from datetime import UTC, datetime as dt
+    msg = type("Msg", (), dict(
         group_id=patient["group_id"],
-        from_user_id=patient["patient_id"],
-        data="confirm:999:2020-01-01:00:00",  # invalid key to force fallback
-        message_id=None,
-    )
+        sender_user_id=patient["patient_id"],
+        text="ок",
+        sent_at_utc=dt.now(UTC),
+    ))()
+    await eng.on_patient_message(msg)
 
-    assert fmt("cb_late_ok") in result["cb_text"]
+    # Engine should confirm and send an ack
     assert eng.state_mgr.status(inst) == Status.CONFIRMED
+    assert any("Готово! Зафіксовано" in t for _, _, t in eng.adapter.sent)

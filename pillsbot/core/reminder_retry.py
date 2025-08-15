@@ -35,21 +35,17 @@ class RetryManager:
     async def run(self, inst: DoseInstance) -> None:
         """
         Retry until confirmed or attempts exhausted. On exhaustion, escalate.
-        Caller is responsible for storing/ cancelling the created task.
+        Final pre-send status check happens in send_repeat wrapper.
         """
         try:
             while self.get_status(inst) not in (Status.CONFIRMED, Status.ESCALATED):
-                # Wait for the configured interval
                 await asyncio.sleep(self.interval_seconds)
 
-                # Maybe user confirmed in the meantime
                 if self.get_status(inst) in (Status.CONFIRMED, Status.ESCALATED):
                     break
 
-                # Attempt another reminder
                 inst.attempts_sent += 1
                 if inst.attempts_sent > self.max_attempts:
-                    # Escalate
                     self.set_status(inst, Status.ESCALATED)
                     self.log.info(
                         "retry.escalate "
@@ -71,9 +67,9 @@ class RetryManager:
                     )
                 )
                 await self.send_repeat(inst)
-        except asyncio.CancelledError:  # normal shutdown path
+        except asyncio.CancelledError:
             raise
-        except Exception as e:  # pragma: no cover - defensive
+        except Exception as e:  # defensive
             self.log.error(
                 "retry.loop.error "
                 + kv(

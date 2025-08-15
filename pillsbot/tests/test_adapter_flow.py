@@ -1,4 +1,4 @@
-# pillsbot/tests/test_adapter_flow.py
+# tests/test_adapter_flow.py
 import pytest
 from unittest.mock import AsyncMock, Mock
 from pillsbot.adapters.telegram_adapter import TelegramAdapter

@@ -1,4 +1,4 @@
-# pillsbot/tests/unit/test_measurements_parsing.py
+# tests/unit/test_measurements_parsing.py
 from pillsbot.core.measurements import MeasurementRegistry
 from pillsbot import config as cfg
 
@@ -9,31 +9,31 @@ def make_registry():
 
 def test_pressure_positive_cases():
     reg = make_registry()
-    mid, body = reg.match("тиск 120 80 60")
+    mid, body = reg.match("тиск 120 80")
     assert mid == "pressure"
     assert reg.parse(mid, body)["ok"]
 
-    mid, body = reg.match("BP 118/79/62")
+    mid, body = reg.match("BP 118/79")
     assert mid == "pressure"
     assert reg.parse(mid, body)["ok"]
 
-    mid, body = reg.match("давление 125,85,59")
+    mid, body = reg.match("давление 125,85")
     assert mid == "pressure"
     assert reg.parse(mid, body)["ok"]
 
-    # NEW: punctuation after keyword
-    mid, body = reg.match("BP: 120/80/60")
+    # punctuation after keyword
+    mid, body = reg.match("BP: 120/80")
     assert mid == "pressure"
     assert reg.parse(mid, body)["ok"]
 
 
 def test_pressure_negative_cases():
     reg = make_registry()
-    mid, body = reg.match("pressure 120/80")  # missing one
+    mid, body = reg.match("pressure 120")  # missing one value
     assert mid == "pressure"
     assert not reg.parse(mid, body)["ok"]
 
-    mid, body = reg.match("давление 120.5/80/60")  # decimal not allowed
+    mid, body = reg.match("давление 120.5/80")  # decimal not allowed
     assert mid == "pressure"
     assert not reg.parse(mid, body)["ok"]
 
@@ -52,7 +52,7 @@ def test_weight_positive_cases():
     assert mid == "weight"
     assert reg.parse(mid, body)["ok"]
 
-    # NEW: boundaries
+    # boundaries
     mid, body = reg.match("weight 0")
     assert reg.parse(mid, body)["ok"]
 
@@ -76,4 +76,4 @@ def test_weight_negative_cases():
 
 def test_start_anchored():
     reg = make_registry()
-    assert reg.match("моє давление 120 80 60") is None
+    assert reg.match("моє давление 120 80") is None

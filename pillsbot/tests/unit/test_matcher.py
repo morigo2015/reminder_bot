@@ -1,4 +1,4 @@
-# pillsbot/tests/unit/test_matcher.py
+# tests/unit/test_matcher.py
 from pillsbot.core.matcher import Matcher
 from pillsbot import config as cfg
 
@@ -6,7 +6,7 @@ from pillsbot import config as cfg
 def test_matcher_positive_cases():
     # Use the same patterns as production config to keep tests realistic
     m = Matcher(cfg.CONFIRM_PATTERNS)
-    for txt in ["Ок", "все ок!", "+", "да", "вже"]:
+    for txt in ["Ок", "+", "так", "окей", "прийняв", "прийняла"]:
         assert m.matches_confirmation(txt)
 
 

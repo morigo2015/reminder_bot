@@ -14,18 +14,17 @@ class MeasureDef:
     label: str
     patterns: List[str]
     csv_file: str
-    parser_kind: str  # "int3" | "float1"
+    parser_kind: str  # "int2" | "float1"
     separators: Optional[List[str]] = None  # for pressure
     decimal_commas: Optional[bool] = None  # for weight
 
 
 class MeasurementRegistry:
     """
-    Central registry for measurement parsing + storage.
+    Central registry for measurement parsing + storage (v4).
 
     * Start-anchored dispatch by configured patterns.
-    * Optional punctuation after keyword (':' or '-') is allowed.
-    * Per-measure syntax validation/parsing.
+    * For pressure, expect exactly TWO integers (systolic/diastolic).
     * CSV append with header creation.
     * 'has_today' helper for daily checks.
     """
@@ -73,16 +72,16 @@ class MeasurementRegistry:
     # ---- Parsing per measure ----
     def parse(self, measure_id: str, body: str) -> Dict[str, Any]:
         md = self.measures[measure_id]
-        if md.parser_kind == "int3":
-            # pressure: exactly three integers; separators: space/comma/slash
+        if md.parser_kind == "int2":
+            # pressure: exactly two integers; separators: space/comma/slash
             seps = md.separators or [" ", ",", "/"]
-            s = body.strip()
+            s = (body or "").strip()
             if not s:
                 return {"ok": False, "error": "arity"}
             for sep in seps:
                 s = s.replace(sep, " ")
             parts = [p for p in s.strip().split() if p]
-            if len(parts) != 3:
+            if len(parts) != 2:
                 return {"ok": False, "error": "arity"}
             vals: List[int] = []
             for p in parts:
@@ -131,7 +130,7 @@ class MeasurementRegistry:
             if is_new:
                 if measure_id == "pressure":
                     f.write(
-                        "date_time_local,patient_id,patient_label,systolic,diastolic,pulse\n"
+                        "date_time_local,patient_id,patient_label,systolic,diastolic\n"
                     )
                 elif measure_id == "weight":
                     f.write("date_time_local,patient_id,patient_label,weight\n")
@@ -141,8 +140,8 @@ class MeasurementRegistry:
 
             ts = dt_local.strftime("%Y-%m-%d %H:%M")
             if measure_id == "pressure":
-                sys, dia, pul = values
-                f.write(f"{ts},{patient_id},{patient_label},{sys},{dia},{pul}\n")
+                sys, dia = values
+                f.write(f"{ts},{patient_id},{patient_label},{sys},{dia}\n")
             elif measure_id == "weight":
                 (w,) = values
                 f.write(f"{ts},{patient_id},{patient_label},{w}\n")

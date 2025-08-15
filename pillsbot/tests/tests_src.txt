@@ -1,0 +1,596 @@
+### FILE: ./conftest.py
+# pillsbot/tests/conftest.py
+import sys
+from pathlib import Path
+
+# Add project root (the parent of 'pillsbot') to sys.path
+ROOT = Path(__file__).resolve().parent.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+### FILE: ./integration/test_measure_unknown_behaviour.py
+# pillsbot/tests/integration/test_measure_unknown_behavior.py
+import pytest
+from datetime import UTC, datetime
+from pillsbot.core.reminder_engine import ReminderEngine, IncomingMessage
+from pillsbot import config as cfg
+
+
+class FakeAdapter:
+    def __init__(self):
+        self.sent = []  # (kind, id, text)
+
+    async def send_group_message(self, group_id, text):
+        self.sent.append(("group", group_id, text))
+
+    async def send_nurse_dm(self, user_id, text):
+        self.sent.append(("dm", user_id, text))
+
+
+class NoOpScheduler:
+    def add_job(self, *args, **kwargs):
+        pass
+
+
+def make_engine():
+    class Cfg:
+        TZ = cfg.TZ
+        LOG_FILE = cfg.LOG_FILE
+        CONFIRM_PATTERNS = cfg.CONFIRM_PATTERNS
+        MEASURES = cfg.MEASURES
+        RETRY_INTERVAL_S = 0.05
+        MAX_RETRY_ATTEMPTS = 2
+        TAKING_GRACE_INTERVAL_S = 60
+        PATIENTS = [
+            {
+                "patient_id": 10,
+                "patient_label": "P",
+                "group_id": -10,
+                "nurse_user_id": 20,
+                "doses": [],  # none to avoid confirm effects
+            }
+        ]
+
+    return ReminderEngine(Cfg, FakeAdapter())
+
+
+@pytest.mark.asyncio
+async def test_unknown_when_not_measure_nor_confirmation():
+    eng = make_engine()
+    await eng.start(NoOpScheduler())
+
+    msg = IncomingMessage(
+        group_id=-10,
+        sender_user_id=10,
+        text="hello there",
+        sent_at_utc=datetime.now(UTC),
+    )
+    await eng.on_patient_message(msg)
+
+    assert any("невідомий показник" in t for _, _, t in eng.adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_no_unknown_for_confirmation():
+    eng = make_engine()
+    await eng.start(NoOpScheduler())
+
+    msg = IncomingMessage(
+        group_id=-10, sender_user_id=10, text="ok", sent_at_utc=datetime.now(UTC)
+    )
+    await eng.on_patient_message(msg)
+
+    # For confirmation with no target doses, engine replies "too_early" instead of measure_unknown
+    assert any("ще не на часі" in t for _, _, t in eng.adapter.sent)
+    assert all("невідомий показник" not in t for _, _, t in eng.adapter.sent)
+
+
+### FILE: ./integration/test_retry_and_escalation.py
+import asyncio
+import pytest
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from pillsbot.core.reminder_engine import ReminderEngine, IncomingMessage
+from pillsbot import config as cfg
+
+class FakeAdapter:
+    def __init__(self):
+        self.sent = []
+
+    async def send_group_message(self, group_id, text):
+        self.sent.append(("group", group_id, text))
+
+    async def send_nurse_dm(self, user_id, text):
+        self.sent.append(("dm", user_id, text))
+
+class NoOpScheduler:
+    def __init__(self): pass
+    def add_job(self, *args, **kwargs): pass
+
+def make_engine(interval=0.05, max_attempts=2):
+    now = datetime.now(cfg.TZ)
+    dose_time = (now + timedelta(seconds=0.1)).strftime("%H:%M")
+    class Cfg:
+        TZ = cfg.TZ
+        LOG_FILE = cfg.LOG_FILE
+        CONFIRM_PATTERNS = cfg.CONFIRM_PATTERNS
+        RETRY_INTERVAL_S = interval
+        MAX_RETRY_ATTEMPTS = max_attempts
+        TAKING_GRACE_INTERVAL_S = 0
+        PATIENTS = [{
+            "patient_id": 10,
+            "patient_label": "P",
+            "group_id": -10,
+            "nurse_user_id": 20,
+            "doses": [{"time": dose_time, "text": "X"}],
+        }]
+    eng = ReminderEngine(Cfg, FakeAdapter())
+    return eng
+
+@pytest.mark.asyncio
+async def test_retry_and_escalation():
+    eng = make_engine(interval=0.05, max_attempts=2)
+    await eng.start(NoOpScheduler())
+    # Manually trigger the job (simulate scheduler firing)
+    await eng._start_dose_job(patient_id=10, time_str=list(eng.state.keys())[0].time_str)
+    # Wait enough for retries + escalation
+    await asyncio.sleep(0.2)
+    # Check an escalation happened
+    assert any(kind=="dm" for (kind, _, _) in eng.adapter.sent)
+
+
+### FILE: ./test_adapter_flow.py
+# pillsbot/tests/test_adapter_flow.py
+import pytest
+from unittest.mock import AsyncMock, Mock
+from pillsbot.adapters.telegram_adapter import TelegramAdapter
+
+
+@pytest.mark.asyncio
+async def test_on_group_text_forwards_to_engine(monkeypatch):
+    # Patch aiogram.Bot to avoid network/token validation
+    class DummyBot:
+        def __init__(self, *a, **k):
+            pass
+
+    # Fake Dispatcher with non-async register methods to avoid warnings
+    class DummyDispatcher:
+        def __init__(self):
+            self.message = Mock()
+            self.callback_query = Mock()
+
+        def start_polling(self, bot):
+            pass
+
+    monkeypatch.setattr("pillsbot.adapters.telegram_adapter.Bot", DummyBot)
+    monkeypatch.setattr(
+        "pillsbot.adapters.telegram_adapter.Dispatcher", DummyDispatcher
+    )
+
+    mock_engine = AsyncMock()
+    adapter = TelegramAdapter(
+        "123456:ABCDEF-test", engine=mock_engine, patient_groups=[-100]
+    )
+
+    msg = type("M", (), {})()
+    msg.chat = type("C", (), {"id": -100})()
+    msg.text = "hi"
+    msg.from_user = type("U", (), {"id": 1})()
+
+    await adapter.on_group_text(msg)
+    assert mock_engine.on_patient_message.await_count == 1
+
+
+### FILE: ./test_inline_confirm.py
+# pillsbot/tests/test_inline_confirm.py
+import pytest
+from pillsbot.core.reminder_engine import ReminderEngine, DoseKey, Status
+import pillsbot.config as cfg
+from pillsbot.core.i18n import fmt  # import the i18n formatter
+
+
+@pytest.mark.asyncio
+async def test_inline_confirm_falls_back_to_selection():
+    eng = ReminderEngine(cfg, adapter=None)
+    await eng.start(None)
+
+    patient = list(eng.patient_index.values())[0]
+    key = DoseKey(patient["patient_id"], eng._today_str(), patient["doses"][0]["time"])
+    inst = eng.state_mgr.get(key)
+    eng.state_mgr.set_status(inst, Status.AWAITING)
+
+    result = await eng.on_inline_confirm(
+        group_id=patient["group_id"],
+        from_user_id=patient["patient_id"],
+        data="confirm:999:2020-01-01:00:00",  # invalid key to force fallback
+        message_id=None,
+    )
+
+    assert fmt("cb_late_ok") in result["cb_text"]
+    assert eng.state_mgr.status(inst) == Status.CONFIRMED
+
+
+### FILE: ./test_preconfirm.py
+# tests/test_preconfirm.py
+import pytest
+from datetime import timedelta
+from pillsbot.core.reminder_engine import ReminderEngine, DoseKey, Status
+import pillsbot.config as cfg
+
+
+@pytest.mark.asyncio
+async def test_preconfirm_within_grace():
+    eng = ReminderEngine(cfg, adapter=None)
+    await eng.start(None)
+
+    patient = list(eng.patient_index.values())[0]
+    key = DoseKey(patient["patient_id"], eng._today_str(), patient["doses"][0]["time"])
+    inst = eng.state_mgr.get(key)
+    inst.scheduled_dt_local = eng.clock.now() + timedelta(
+        seconds=eng.cfg.TAKING_GRACE_INTERVAL_S - 1
+    )
+
+    await eng._handle_confirmation_text(patient)
+
+    assert eng.state_mgr.status(inst) == Status.CONFIRMED
+    assert inst.preconfirmed
+
+
+### FILE: ./test_scheduler_wiring.py
+
+
+### FILE: ./unit/test_matcher.py
+# pillsbot/tests/unit/test_matcher.py
+from pillsbot.core.matcher import Matcher
+from pillsbot import config as cfg
+
+
+def test_matcher_positive_cases():
+    # Use the same patterns as production config to keep tests realistic
+    m = Matcher(cfg.CONFIRM_PATTERNS)
+    for txt in ["Ок", "все ок!", "+", "да", "вже"]:
+        assert m.matches_confirmation(txt)
+
+
+def test_matcher_negative_cases():
+    # Narrow pattern to ensure boundaries work as intended
+    m = Matcher([r"\bтак\b"])
+    assert not m.matches_confirmation("також")  # word boundary prevents false positive
+    assert not m.matches_confirmation("random text")
+
+
+### FILE: ./unit/test_measurements_flow.py
+# pillsbot/tests/unit/test_measurements_flow.py
+import os
+from datetime import UTC, datetime
+
+from pillsbot.core.reminder_engine import ReminderEngine, IncomingMessage
+from pillsbot import config as cfg
+
+
+class FakeAdapter:
+    def __init__(self):
+        self.sent = []  # (kind, id, text)
+
+    async def send_group_message(self, group_id, text):
+        self.sent.append(("group", group_id, text))
+
+    async def send_nurse_dm(self, user_id, text):
+        self.sent.append(("dm", user_id, text))
+
+
+class NoOpScheduler:
+    def add_job(self, *args, **kwargs):
+        pass
+
+
+def _cleanup_csvs(tmp_suffix: str):
+    paths = [
+        f"pillsbot/logs/pressure_{tmp_suffix}.csv",
+        f"pillsbot/logs/weight_{tmp_suffix}.csv",
+    ]
+    for p in paths:
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+
+
+def make_engine(tmp_suffix="x"):
+    # Ensure a clean slate for this test run
+    _cleanup_csvs(tmp_suffix)
+
+    # Use test-specific CSV paths to avoid touching prod logs
+    MEASURES = {k: dict(v) for k, v in cfg.MEASURES.items()}
+    MEASURES["pressure"] = dict(
+        MEASURES["pressure"], csv_file=f"pillsbot/logs/pressure_{tmp_suffix}.csv"
+    )
+    MEASURES["weight"] = dict(
+        MEASURES["weight"], csv_file=f"pillsbot/logs/weight_{tmp_suffix}.csv"
+    )
+
+    class Cfg:
+        TZ = cfg.TZ
+        LOG_FILE = cfg.LOG_FILE
+        CONFIRM_PATTERNS = cfg.CONFIRM_PATTERNS
+        MEASURES = {}  # set right after the class definition
+        RETRY_INTERVAL_S = 0.05
+        MAX_RETRY_ATTEMPTS = 2
+        TAKING_GRACE_INTERVAL_S = 60
+        PATIENTS = [
+            {
+                "patient_id": 100,
+                "patient_label": "P",
+                "group_id": -100,
+                "nurse_user_id": 200,
+                "doses": [],
+                "measurement_checks": [{"measure_id": "pressure", "time": "23:59"}],
+            }
+        ]
+
+    # IMPORTANT: assign here to avoid NameError inside class scope
+    Cfg.MEASURES = MEASURES
+
+    eng = ReminderEngine(Cfg, FakeAdapter())
+    return eng
+
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_measurement_ack_and_csv():
+    eng = make_engine(tmp_suffix="flow1")
+    await eng.start(NoOpScheduler())
+    # Send a good pressure message
+    msg = IncomingMessage(
+        group_id=-100,
+        sender_user_id=100,
+        text="BP 120/80/60",
+        sent_at_utc=datetime.now(UTC),
+    )
+    await eng.on_patient_message(msg)
+    # Should have ack
+    assert any("отримано показник" in t for _, _, t in eng.adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_daily_missing_then_ok():
+    eng = make_engine(tmp_suffix="flow2")
+    await eng.start(NoOpScheduler())
+
+    # First check: no entry today -> missing reminder
+    await eng._measurement_check_job(100, "pressure")
+    assert any("сьогодні не отримано показник" in t for _, _, t in eng.adapter.sent)
+    eng.adapter.sent.clear()
+
+    # Now record a measurement (this will produce an ACK message)
+    msg = IncomingMessage(
+        group_id=-100,
+        sender_user_id=100,
+        text="pressure 120 80 60",
+        sent_at_utc=datetime.now(UTC),
+    )
+    await eng.on_patient_message(msg)
+    assert any("отримано показник" in t for _, _, t in eng.adapter.sent)
+
+    # Check again: should NOT send a "missing" reminder and should NOT append any new messages
+    before = len(eng.adapter.sent)
+    await eng._measurement_check_job(100, "pressure")
+    after = len(eng.adapter.sent)
+    assert before == after  # no additional messages
+    # and specifically no "missing" text present
+    assert not any("сьогодні не отримано показник" in t for _, _, t in eng.adapter.sent)
+
+
+### FILE: ./unit/test_measurements_parsing.py
+# pillsbot/tests/unit/test_measurements_parsing.py
+from pillsbot.core.measurements import MeasurementRegistry
+from pillsbot import config as cfg
+
+
+def make_registry():
+    return MeasurementRegistry(cfg.TZ, cfg.MEASURES)
+
+
+def test_pressure_positive_cases():
+    reg = make_registry()
+    mid, body = reg.match("тиск 120 80 60")
+    assert mid == "pressure"
+    assert reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("BP 118/79/62")
+    assert mid == "pressure"
+    assert reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("давление 125,85,59")
+    assert mid == "pressure"
+    assert reg.parse(mid, body)["ok"]
+
+    # NEW: punctuation after keyword
+    mid, body = reg.match("BP: 120/80/60")
+    assert mid == "pressure"
+    assert reg.parse(mid, body)["ok"]
+
+
+def test_pressure_negative_cases():
+    reg = make_registry()
+    mid, body = reg.match("pressure 120/80")  # missing one
+    assert mid == "pressure"
+    assert not reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("давление 120.5/80/60")  # decimal not allowed
+    assert mid == "pressure"
+    assert not reg.parse(mid, body)["ok"]
+
+
+def test_weight_positive_cases():
+    reg = make_registry()
+    mid, body = reg.match("вага 102,4")
+    assert mid == "weight"
+    assert reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("weight 73.0")
+    assert mid == "weight"
+    assert reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("вес 80")
+    assert mid == "weight"
+    assert reg.parse(mid, body)["ok"]
+
+    # NEW: boundaries
+    mid, body = reg.match("weight 0")
+    assert reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("weight 0.0")
+    assert reg.parse(mid, body)["ok"]
+
+    mid, body = reg.match("weight 350.1234")
+    assert reg.parse(mid, body)["ok"]
+
+
+def test_weight_negative_cases():
+    reg = make_registry()
+    mid, body = reg.match("weight -5")
+    r = reg.parse(mid, body)
+    assert not r["ok"]
+
+    mid, body = reg.match("взвешивание 80 кг")
+    r = reg.parse(mid, body)
+    assert not r["ok"]
+
+
+def test_start_anchored():
+    reg = make_registry()
+    assert reg.match("моє давление 120 80 60") is None
+
+
+### FILE: ./unit/test_preconfirm_logic.py
+from datetime import datetime, timedelta
+
+from pillsbot.core.reminder_engine import ReminderEngine, IncomingMessage
+from pillsbot import config as cfg
+
+
+class FakeAdapter:
+    def __init__(self):
+        self.sent = []  # (chat_id, text)
+
+    async def send_group_message(self, group_id, text):
+        self.sent.append(("group", group_id, text))
+
+    async def send_nurse_dm(self, user_id, text):
+        self.sent.append(("dm", user_id, text))
+
+
+def make_engine():
+    class Cfg:
+        TZ = cfg.TZ
+        LOG_FILE = cfg.LOG_FILE
+        CONFIRM_PATTERNS = cfg.CONFIRM_PATTERNS
+        RETRY_INTERVAL_S = 1
+        MAX_RETRY_ATTEMPTS = 2
+        TAKING_GRACE_INTERVAL_S = 60
+        PATIENTS = [
+            {
+                "patient_id": 1,
+                "patient_label": "Test Patient",
+                "group_id": -1,
+                "nurse_user_id": 2,
+                "doses": [
+                    {
+                        "time": (datetime.now(cfg.TZ) + timedelta(minutes=1)).strftime(
+                            "%H:%M"
+                        ),
+                        "text": "Vit D",
+                    }
+                ],
+            }
+        ]
+
+    adapter = FakeAdapter()
+    eng = ReminderEngine(Cfg, adapter)
+    return eng, adapter
+
+
+import pytest  # noqa: E402
+from datetime import UTC  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_preconfirm_within_grace():
+    eng, ad = make_engine()
+    await eng.start(
+        scheduler=type("S", (), {"add_job": lambda *a, **k: None})()
+    )  # no-op scheduler
+    # Send a confirmation now; next dose is within 60s
+    msg = IncomingMessage(
+        group_id=-1,
+        sender_user_id=1,
+        text="ок",
+        sent_at_utc=datetime.now(UTC),
+    )
+    await eng.on_patient_message(msg)
+    # Expect preconfirm ack
+    assert any("заздалегідь" in t for _, _, t in ad.sent)
+
+
+### FILE: ./unit/test_retry_semantics.py
+
+
+### FILE: ./unit/test_validation_config.py
+# pillsbot/tests/unit/test_validation_config.py
+import pytest
+from pillsbot.core.config_validation import validate_config
+from zoneinfo import ZoneInfo
+
+
+class CfgOk:
+    TZ = ZoneInfo("Europe/Kyiv")
+    MEASURES = {
+        "pressure": {
+            "label": "Тиск",
+            "patterns": ["тиск", "давление", "BP", "pressure"],
+            "csv_file": "pillsbot/logs/pressure_test.csv",
+            "parser_kind": "int3",
+            "separators": [" ", ",", "/"],
+        }
+    }
+    PATIENTS = [
+        {
+            "patient_id": 1,
+            "patient_label": "A",
+            "group_id": -1,
+            "nurse_user_id": 2,
+            "doses": [{"time": "08:00", "text": "Med"}],
+            "measurement_checks": [{"measure_id": "pressure", "time": "21:00"}],
+        }
+    ]
+
+
+def test_validate_ok():
+    validate_config(CfgOk)
+
+
+def test_duplicate_measurement_check_times_raises():
+    class CfgDup(CfgOk):
+        PATIENTS = [
+            {
+                "patient_id": 1,
+                "patient_label": "A",
+                "group_id": -1,
+                "nurse_user_id": 2,
+                "doses": [{"time": "08:00", "text": "Med"}],
+                "measurement_checks": [
+                    {"measure_id": "pressure", "time": "21:00"},
+                    {"measure_id": "pressure", "time": "21:00"},
+                ],
+            }
+        ]
+
+    with pytest.raises(ValueError):
+        validate_config(CfgDup)
+
+

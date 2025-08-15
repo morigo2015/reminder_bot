@@ -1,4 +1,4 @@
-# pillsbot/tests/unit/test_validation_config.py
+# tests/unit/test_validation_config.py
 import pytest
 from pillsbot.core.config_validation import validate_config
 from zoneinfo import ZoneInfo
@@ -11,7 +11,7 @@ class CfgOk:
             "label": "Тиск",
             "patterns": ["тиск", "давление", "BP", "pressure"],
             "csv_file": "pillsbot/logs/pressure_test.csv",
-            "parser_kind": "int3",
+            "parser_kind": "int2",  # v4: two integers (systolic, diastolic)
             "separators": [" ", ",", "/"],
         }
     }

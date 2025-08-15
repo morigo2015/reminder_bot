@@ -5,12 +5,12 @@ import asyncio
 import contextlib
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Optional, Dict, Set
 from zoneinfo import ZoneInfo
 
 from pillsbot.core.matcher import Matcher
-from pillsbot.core.i18n import fmt, MESSAGES
+from pillsbot.core.i18n import fmt
 from pillsbot.core.logging_utils import kv
 from pillsbot.core.measurements import MeasurementRegistry
 from pillsbot.core.reminder_state import (
@@ -37,8 +37,8 @@ class IncomingMessage:
 
 class ReminderEngine:
     """
-    Orchestrates reminder jobs, callback resolution, and state transitions.
-    UI guide compliant: a single actionable STEP at the bottom when appropriate.
+    v4: Single dynamic inline menu (delete old → post new). The engine ensures that
+    after every visible event the last message is the menu.
     """
 
     def __init__(self, config: Any, adapter: Any | None, clock: Optional[Clock] = None):
@@ -56,12 +56,7 @@ class ReminderEngine:
 
         # State & messaging
         self.state_mgr = ReminderState(tz, self.clock)
-        self.messenger = ReminderMessenger(
-            adapter=self.adapter,
-            log=self.log,
-            inline_confirm_enabled=getattr(self.cfg, "INLINE_CONFIRM_ENABLED", True),
-        )
-        self._msg_to_key: Dict[int, DoseKey] = {}
+        self.messenger = ReminderMessenger(adapter=self.adapter, log=self.log)
         self._escalated: Set[DoseKey] = set()
 
         self.patient_index: Dict[int, dict] = {}
@@ -93,7 +88,7 @@ class ReminderEngine:
             logger=self.log,
         )
 
-        # Optional scheduler
+        # Optional scheduler passthrough kept for compatibility
         if scheduler is not None:
             try:
                 for p in getattr(self.cfg, "PATIENTS", []):
@@ -132,7 +127,7 @@ class ReminderEngine:
             self.log.debug(
                 "msg.engine.reject "
                 + kv(
-                    reason="unauthorized or unknown group",
+                    reason="patient-only",
                     group_id=msg.group_id,
                     sender_user_id=msg.sender_user_id,
                 )
@@ -141,18 +136,6 @@ class ReminderEngine:
 
         patient = self.patient_index[pid]
         text = (msg.text or "").strip()
-        low = text.lower()
-
-        # Legacy quick actions (text aliases; UI uses inline buttons now)
-        if low == MESSAGES["btn_pressure"].lower():
-            await self._prompt(patient["group_id"], "prompt_pressure", patient=patient)
-            return
-        if low == MESSAGES["btn_weight"].lower():
-            await self._prompt(patient["group_id"], "prompt_weight", patient=patient)
-            return
-        if low == MESSAGES["btn_help"].lower():
-            await self._reply(patient["group_id"], "help_brief")
-            return
 
         # Measurements
         mm = self.measures.match(text)
@@ -164,38 +147,52 @@ class ReminderEngine:
                 self.measures.append_csv(
                     mid, now_local, pid, patient["patient_label"], parsed["values"]
                 )
-                await self._reply(
-                    patient["group_id"],
-                    "measure_ack",
-                    measure_label=self.measures.get_label(mid),
-                )
-            else:
-                err = parsed.get("error")
-                if err == "arity_one":
-                    await self._reply(patient["group_id"], "measure_error_one")
-                elif err == "arity":
-                    expected = parsed.get("expected", 3)
+                if mid == "pressure":
+                    sys_v, dia_v = parsed["values"]
                     await self._reply(
-                        patient["group_id"], "measure_error_arity", expected=expected
+                        patient["group_id"],
+                        "ack_pressure",
+                        systolic=sys_v,
+                        diastolic=dia_v,
                     )
+                elif mid == "weight":
+                    (w,) = parsed["values"]
+                    await self._reply(patient["group_id"], "ack_weight", kg=w)
                 else:
-                    await self._reply(patient["group_id"], "measure_unknown")
+                    await self._reply(patient["group_id"], "unknown_text")
+            else:
+                if mid == "pressure":
+                    await self._reply(patient["group_id"], "err_pressure")
+                elif mid == "weight":
+                    await self._reply(patient["group_id"], "err_weight")
+                else:
+                    await self._reply(patient["group_id"], "unknown_text")
+
+            # After measurement handling, refresh menu
+            await self.show_current_menu(patient["group_id"])
             return
 
         # Confirmation via text
-        if self.matcher.matches_confirmation(text):
+        if self.matcher.matches_confirmation(text.lower().strip()):
             await self._handle_confirmation_text(patient)
             return
 
+        # Help keyword
+        if text.lower() in {"help", "?", "довідка"}:
+            await self._reply(patient["group_id"], "help_text")
+            await self.show_current_menu(patient["group_id"])
+            return
+
         # Fallback
-        await self._reply(patient["group_id"], "measure_unknown")
+        await self._reply(patient["group_id"], "unknown_text")
+        await self.show_current_menu(patient["group_id"])
 
     # ---- menus / actions --------------------------------------------------------------
     async def show_current_menu(self, group_id: int) -> None:
         """
-        Post exactly one actionable STEP at the bottom:
-        - If a dose is actively AWAITING → show reminder STEP (with Confirm).
-        - Otherwise → show the compact Home STEP (no Confirm button).
+        Post exactly one menu at the bottom:
+        - If a dose is actively AWAITING → show reminder text + menu with Confirm.
+        - Otherwise → show idle text + menu without Confirm.
         """
         pid = self.group_to_patient.get(group_id)
         if pid is None:
@@ -209,17 +206,13 @@ class ReminderEngine:
         )
 
         if target and self.state_mgr.status(target) == Status.AWAITING:
-            msg_id = await self.messenger.send_reminder_step(target)
-            if msg_id is not None:
-                target.last_message_ids.append(msg_id)
-                self._msg_to_key[msg_id] = target.dose_key
+            await self.messenger.send_reminder_step(target)
             return
 
-        # Idle: Home with no Confirm
         await self.messenger.send_home_step(group_id, pid, can_confirm=False)
 
     async def quick_confirm(self, group_id: int, from_user_id: int) -> None:
-        """Handle 'I took it' from Home when Confirm is present (guarded upstream)."""
+        """Handle '✅ TAKE' tap; patient-only is enforced upstream in adapter."""
         pid = self.group_to_patient.get(group_id)
         if pid is None or pid != from_user_id:
             return
@@ -227,62 +220,6 @@ class ReminderEngine:
         if not patient:
             return
         await self._handle_confirmation_text(patient)
-
-    # ---- inline button callback from adapter ------------------------------------------
-    async def on_inline_confirm(
-        self,
-        *,
-        group_id: int,
-        from_user_id: int,
-        data: str,
-        message_id: Optional[int] = None,
-    ) -> dict:
-        """
-        Inline button confirm. Returns dict for adapter:
-        {'cb_text': str|None, 'show_alert': bool}.
-        """
-        expected_pid = self.group_to_patient.get(group_id)
-        if expected_pid is None or from_user_id != expected_pid:
-            return {"cb_text": fmt("cb_only_patient"), "show_alert": False}
-
-        inst: Optional[DoseInstance] = None
-
-        # 1) Resolve by message_id
-        if message_id is not None:
-            key = self._msg_to_key.get(message_id)
-            if key:
-                inst = self.state_mgr.get(key)
-
-        # 2) Parse payload
-        if inst is None and data.startswith("confirm:"):
-            try:
-                _, pid_s, date_s, time_s = data.split(":")
-                key = DoseKey(int(pid_s), date_s, time_s)
-                inst = self.state_mgr.get(key)
-            except Exception:
-                pass
-
-        # 3) Fallback
-        if inst is None:
-            patient = self.patient_index.get(expected_pid)
-            if patient:
-                inst = self.state_mgr.select_target_for_confirmation(
-                    self.clock.now(), patient
-                )
-
-        if not inst:
-            return {"cb_text": fmt("cb_no_target"), "show_alert": False}
-
-        # Idempotent confirm
-        if self.state_mgr.status(inst) == Status.CONFIRMED:
-            return {"cb_text": fmt("cb_already_done"), "show_alert": False}
-
-        await self._confirm_and_finalize(inst, source="inline")
-
-        # Public ack only; DO NOT show next reminder automatically
-        await self._reply(group_id, "confirm_ack")
-
-        return {"cb_text": fmt("cb_late_ok"), "show_alert": False}
 
     # ---- jobs / orchestration ----------------------------------------------------------
     async def _start_dose_job(self, *, patient_id: int, time_str: str) -> None:
@@ -311,22 +248,15 @@ class ReminderEngine:
         if self.state_mgr.status(inst) == Status.CONFIRMED:
             self.log.debug(
                 "job.trigger.skip "
-                + kv(patient_id=patient_id, time=time_str, reason="already confirmed")
+                + kv(patient_id=patient_id, time=time_str, reason="confirmed")
             )
             return
 
         self.state_mgr.set_status(inst, Status.AWAITING)
         inst.attempts_sent = 1
 
-        msg_id = await self.messenger.send_reminder_step(inst)
-        if msg_id is not None:
-            inst.last_message_ids.append(msg_id)
-            self._msg_to_key[msg_id] = inst.dose_key
-
+        await self.messenger.send_reminder_step(inst)
         await self._start_retry(inst)
-
-    async def _measurement_check_job(self, patient_id: int, measure_id: str) -> None:
-        await self._job_measure_check(patient_id=patient_id, measure_id=measure_id)
 
     async def _job_measure_check(self, *, patient_id: int, measure_id: str) -> None:
         patient = self.patient_index.get(patient_id)
@@ -336,9 +266,12 @@ class ReminderEngine:
         if not self.measures.has_today(measure_id, patient_id, today):
             await self._reply(
                 patient["group_id"],
-                "measure_missing_today",
-                measure_label=self.measures.get_label(measure_id),
+                "escalate_group"
+                if measure_id not in {"pressure", "weight"}
+                else "unknown_text",
             )
+            # Immediately refresh menu after any bot-visible event
+            await self.show_current_menu(patient["group_id"])
 
     # ---- retry glue -------------------------------------------------------------------
     async def _start_retry(self, inst: DoseInstance) -> None:
@@ -356,82 +289,75 @@ class ReminderEngine:
         inst.retry_task = None
 
     async def _send_repeat_wrapper(self, inst: DoseInstance) -> None:
-        msg_id = await self.messenger.send_reminder_step(inst)
-        if msg_id is not None:
-            inst.last_message_ids.append(msg_id)
-            self._msg_to_key[msg_id] = inst.dose_key
+        # v4: final pre-send status check — if not AWAITING, do not send the retry.
+        if self.state_mgr.status(inst) != Status.AWAITING:
+            return
+        await self.messenger.send_reminder_step(inst)
 
     async def _on_escalate_wrapper(self, inst: DoseInstance) -> None:
+        # Send escalation messages
         await self.messenger.send_escalation(inst)
         self._escalated.add(inst.dose_key)
         self._log_outcome_csv(inst, "escalated")
-        # DO NOT post a new step here; engine/menu remains as-is
+        # NEW: keep the invariant "menu is last" after escalation.
+        await self.show_current_menu(inst.group_id)
 
     # ---- confirmation handling ---------------------------------------------------------
     async def _handle_confirmation_text(self, patient: dict) -> None:
         now = self.clock.now()
         target = self.state_mgr.select_target_for_confirmation(now, patient)
         if not target:
-            await self._reply(patient["group_id"], "too_early")
+            # Not awaiting → neutral line + refresh menu
+            await self._reply(patient["group_id"], "unknown_text")
+            await self.show_current_menu(patient["group_id"])
             return
 
-        grace_s = int(getattr(self.cfg, "TAKING_GRACE_INTERVAL_S", 600))
-        if (
-            target.scheduled_dt_local - now <= timedelta(seconds=grace_s)
-            and self.state_mgr.status(target) != Status.AWAITING
-        ):
-            target.preconfirmed = True
-            await self._confirm_and_finalize(target, source="preconfirm")
-            await self._reply(patient["group_id"], "preconfirm_ack")
+        # Idempotent confirm
+        if self.state_mgr.status(target) == Status.CONFIRMED:
+            await self._reply(patient["group_id"], "ack_confirm")
+            await self.show_current_menu(patient["group_id"])
             return
 
-        await self._confirm_and_finalize(target, source="text")
-        await self._reply(patient["group_id"], "confirm_ack")
-
-    async def _confirm_and_finalize(self, inst: DoseInstance, *, source: str) -> None:
-        if self.state_mgr.status(inst) == Status.CONFIRMED:
-            return
-        self.state_mgr.set_status(inst, Status.CONFIRMED)
-        await self._stop_retry(inst)
+        self.state_mgr.set_status(target, Status.CONFIRMED)
+        await self._stop_retry(target)
         self.log.info(
             "dose.confirm "
-            + kv(patient_id=inst.patient_id, time=inst.dose_key.time_str, source=source)
+            + kv(
+                patient_id=target.patient_id,
+                time=target.dose_key.time_str,
+                source="tap/text",
+            )
         )
 
-        if inst.dose_key in self._escalated:
+        if target.dose_key in self._escalated:
             await self.messenger.send_nurse_notice(
-                inst.nurse_user_id,
+                target.nurse_user_id,
                 fmt(
                     "nurse_late_confirm_dm",
-                    patient_label=inst.patient_label,
-                    date=inst.dose_key.date_str,
-                    time=inst.dose_key.time_str,
-                    pill_text=inst.pill_text,
+                    patient_label=target.patient_label,
+                    date=target.dose_key.date_str,
+                    time=target.dose_key.time_str,
+                    pill_text=target.pill_text,
                 ),
             )
-            self._escalated.discard(inst.dose_key)
+            self._escalated.discard(target.dose_key)
 
-        self._log_outcome_csv(inst, "confirmed")
+        self._log_outcome_csv(target, "confirmed")
 
-    # ---- plain replies (no auto-menu push) --------------------------------------------
+        # Ack + refresh menu without confirm
+        await self._reply(patient["group_id"], "ack_confirm")
+        await self.show_current_menu(patient["group_id"])
+
+    # ---- plain replies ---------------------------------------------------------------
     async def _reply(
-        self,
-        group_id: int,
-        template_key: str,
-        **fmt_args: Any,
+        self, group_id: int, template_key: str, **fmt_args: Any
     ) -> Optional[int]:
-        """Send a plain group message using i18n template. No auto menu injection here."""
+        """Send a plain group message using i18n template (menu is managed by callers)."""
         return await self.messenger.send_group_template(
             group_id, template_key, **fmt_args
         )
 
-    async def _prompt(self, group_id: int, template_key: str, *, patient: dict) -> None:
-        await self._reply(group_id, template_key)
-
     # ---- misc -------------------------------------------------------------------------
-    def _today_str(self) -> str:
-        return self.clock.today_str()
-
     def _log_outcome_csv(self, inst: DoseInstance, status: str) -> None:
         line = (
             f"{inst.scheduled_dt_local.strftime('%Y-%m-%d %H:%M')}, "
@@ -447,6 +373,3 @@ class ReminderEngine:
     @property
     def state(self):
         return self.state_mgr.mapping
-
-
-__all__ = ["ReminderEngine", "IncomingMessage", "Status", "DoseKey", "DoseInstance"]

@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -18,15 +17,17 @@ from aiogram.types import (
 from pillsbot.core.reminder_engine import IncomingMessage
 from pillsbot.core.logging_utils import kv
 from pillsbot.core.i18n import MESSAGES
+from pillsbot.debug_ids import print_group_and_users_best_effort
 
 
 class TelegramAdapter:
     """
-    aiogram 3.x adapter with inline-only UI per pill_reminder_UI_guide.md:
-    - Pinned Home message is STATIC (no buttons)
-    - Exactly one actionable STEP at a time (retire previous before sending)
-    - Robust patient guard (accepts payload pid or mapped pid)
-    - No ReplyKeyboard ever shown
+    aiogram 3.x adapter implementing the v4 inline-only UX:
+
+    • Single dynamic inline menu at the bottom (flat, no submenus, no pinned message).
+    • Exactly one menu message exists in the chat: before posting a new one, delete the old one.
+    • Accept both tap and text confirmation (engine handles text; adapter routes taps).
+    • Patient-only actions; others are ignored silently (logged).
     """
 
     def __init__(
@@ -40,144 +41,106 @@ class TelegramAdapter:
 
         self.log = logging.getLogger("pillsbot.adapter")
 
-        # Per-chat UI state
-        self._home_msg_id: dict[int, int] = {}
-        self._last_step_msg_id: dict[int, int] = {}
-        self._reply_kb_cleared: set[int] = set()
+        # Per-chat menu lifecycle (v4: delete-then-post)
+        self._last_menu_msg_id: dict[int, int] = {}
 
-        # Handlers
-        self.dp.message.register(self.on_group_text, F.text)
+        # ---- Handlers (IMPORTANT: commands first, then generic text) ----
         self.dp.message.register(self.on_start, CommandStart())
-        self.dp.callback_query.register(
-            self.on_callback, F.data.startswith(("confirm:", "ui:"))
-        )
+        self.dp.message.register(self.on_ids, Command("ids"))
+        self.dp.message.register(self.on_group_text, F.text)
+        self.dp.callback_query.register(self.on_callback, F.data.startswith("ui:"))
 
     # ------------------------------------------------------------------------------
-    # Inline keyboards (helpers)
+    # Flat inline keyboard (single component; can_confirm toggles first row)
     # ------------------------------------------------------------------------------
-    def kb(self, rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text=label, callback_data=data)
-                    for (label, data) in row
-                ]
-                for row in rows
-            ]
-        )
+    def build_menu_keyboard(self, *, can_confirm: bool) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
 
-    def home_keyboard(
-        self, patient_id: int, *, can_confirm: bool
-    ) -> InlineKeyboardMarkup:
-        rows: list[list[tuple[str, str]]] = []
         if can_confirm:
             rows.append(
-                [("✅ " + MESSAGES["btn_confirm_taken"], f"ui:TAKE:{patient_id}")]
-            )
-        rows.append([("📈 " + MESSAGES["btn_measurements"], f"ui:MEAS:{patient_id}")])
-        rows.append([("🆘 " + MESSAGES["btn_help"], f"ui:HELP:{patient_id}")])
-        return self.kb(rows)
-
-    def get_home_keyboard(
-        self, patient_id: int, *, can_confirm: bool
-    ) -> InlineKeyboardMarkup:
-        """Public for messenger/engine to obtain the context-aware Home keyboard."""
-        return self.home_keyboard(patient_id, can_confirm=can_confirm)
-
-    def measurements_keyboard(self, patient_id: int) -> InlineKeyboardMarkup:
-        return self.kb(
-            [
                 [
-                    (MESSAGES["btn_pressure"], f"ui:MEAS_P:{patient_id}"),
-                    (MESSAGES["btn_weight"], f"ui:MEAS_W:{patient_id}"),
-                ],
-                [(MESSAGES["btn_back_home"], f"ui:HOME:{patient_id}")],
+                    InlineKeyboardButton(
+                        text="✅ " + MESSAGES["btn_confirm_taken"],
+                        callback_data="ui:TAKE",
+                    )
+                ]
+            )
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=MESSAGES["btn_pressure"], callback_data="ui:PRESSURE"
+                ),
+                InlineKeyboardButton(
+                    text=MESSAGES["btn_weight"], callback_data="ui:WEIGHT"
+                ),
             ]
         )
+        rows.append(
+            [InlineKeyboardButton(text=MESSAGES["btn_help"], callback_data="ui:HELP")]
+        )
+
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
     # ------------------------------------------------------------------------------
-    # Reply keyboard removal (one-time per chat)
+    # Menu posting (delete previous first)
     # ------------------------------------------------------------------------------
-    async def clear_reply_keyboard(self, chat_id: int) -> None:
-        if chat_id in self._reply_kb_cleared:
-            return
+    async def post_menu(self, chat_id: int, text: str, *, can_confirm: bool) -> int:
+        # 1) Try to delete the previous menu message.
+        old = self._last_menu_msg_id.get(chat_id)
+        if old:
+            try:
+                await self.bot.delete_message(chat_id, old)
+            except Exception as e:
+                # Log and proceed to send a fresh menu anyway.
+                self.log.debug("menu.delete.fail " + kv(chat_id=chat_id, err=str(e)))
+
+        # 2) Send the new menu message (text + inline keyboard).
+        kb = self.build_menu_keyboard(can_confirm=can_confirm)
+        msg = await self.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+
+        # 3) Track it as the last menu.
+        self._last_menu_msg_id[chat_id] = msg.message_id
+        return msg.message_id
+
+    # ------------------------------------------------------------------------------
+    # Reply keyboard removal — done on /start (separate message)
+    # ------------------------------------------------------------------------------
+    async def clear_reply_keyboard_once(self, chat_id: int) -> None:
         try:
             await self.bot.send_message(
                 chat_id, " ", reply_markup=ReplyKeyboardRemove(remove_keyboard=True)
             )
         except Exception:
+            # Best-effort, ignore any errors (no rights, etc.)
             pass
-        self._reply_kb_cleared.add(chat_id)
-
-    # ------------------------------------------------------------------------------
-    # Pinned Home (STATIC) & Step sending
-    # ------------------------------------------------------------------------------
-    async def ensure_pinned_home(self, chat_id: int, patient_id: Optional[int]) -> None:
-        if patient_id is None:
-            return
-
-        mid = self._home_msg_id.get(chat_id)
-        if mid:
-            try:
-                await self.bot.pin_chat_message(
-                    chat_id=chat_id, message_id=mid, disable_notification=True
-                )
-                return
-            except Exception:
-                pass
-
-        # STATIC pinned message with NO INLINE KEYBOARD
-        msg = await self.bot.send_message(
-            chat_id,
-            MESSAGES["home_title"],
-            reply_markup=ReplyKeyboardRemove(remove_keyboard=True),
-        )
-        self._home_msg_id[chat_id] = msg.message_id
-        try:
-            await self.bot.pin_chat_message(
-                chat_id=chat_id, message_id=msg.message_id, disable_notification=True
-            )
-        except Exception:
-            pass
-
-    async def retire_old_keyboard(self, chat_id: int) -> None:
-        mid = self._last_step_msg_id.get(chat_id)
-        if not mid:
-            return
-        try:
-            await self.bot.edit_message_reply_markup(chat_id, mid, reply_markup=None)
-        except Exception:
-            pass
-
-    async def send_step_message(
-        self, chat_id: int, text: str, reply_markup: InlineKeyboardMarkup | None
-    ) -> int:
-        await self.retire_old_keyboard(chat_id)
-        msg = await self.bot.send_message(chat_id, text, reply_markup=reply_markup)
-        self._last_step_msg_id[chat_id] = msg.message_id
-        return msg.message_id
 
     # ------------------------------------------------------------------------------
     # Handlers
     # ------------------------------------------------------------------------------
     async def on_start(self, message: Message) -> None:
+        """
+        v4 migration: on /start send a separate message with ReplyKeyboardRemove(),
+        then post the state-appropriate menu (engine decides can_confirm).
+        """
         chat_id = message.chat.id
-        pid_mapping = getattr(self.engine, "group_to_patient", None)
-        pid = pid_mapping.get(chat_id) if isinstance(pid_mapping, dict) else None
-        await self.ensure_pinned_home(chat_id, pid)
-        await self.clear_reply_keyboard(chat_id)
-        # On start, send Home STEP (no confirm) immediately
-        if isinstance(pid_mapping, dict) and pid is not None:
-            await self.send_step_message(
-                chat_id,
-                MESSAGES["home_title"],
-                self.home_keyboard(pid, can_confirm=False),
-            )
+        await self.clear_reply_keyboard_once(chat_id)
+        await self.engine.show_current_menu(chat_id)
 
     async def on_group_text(self, message: Message) -> None:
         chat_id = message.chat.id
         text = message.text or ""
         sender_user_id = message.from_user.id if message.from_user else 0
+
+        # Fallback guard: if a command slipped through, route it explicitly
+        if text.startswith("/"):
+            cmd = text.split()[0].split("@")[0].lower()
+            if cmd == "/start":
+                await self.on_start(message)
+                return
+            if cmd == "/ids":
+                await self.on_ids(message)
+                return
 
         self.log.info(
             "msg.in.group "
@@ -188,7 +151,12 @@ class TelegramAdapter:
             self.log.debug("msg.in.ignored " + kv(reason="not a patient group"))
             return
 
-        sent_at_utc = getattr(message, "date", None) or datetime.now(timezone.utc)
+        sent_at_utc = getattr(message, "date", None)
+        if sent_at_utc is None:
+            # aiogram delivers timezone-aware datetime; engine treats it as UTC timestamp.
+            from datetime import datetime, timezone as _tz
+
+            sent_at_utc = datetime.now(_tz.utc)
 
         incoming = IncomingMessage(
             group_id=chat_id,
@@ -197,131 +165,91 @@ class TelegramAdapter:
             sent_at_utc=sent_at_utc,
         )
 
-        pid_mapping = getattr(self.engine, "group_to_patient", None)
-        pid = pid_mapping.get(chat_id) if isinstance(pid_mapping, dict) else None
-        await self.ensure_pinned_home(chat_id, pid)
-        await self.clear_reply_keyboard(chat_id)
-
         await self.engine.on_patient_message(incoming)
 
     async def on_callback(self, callback: CallbackQuery) -> None:
+        """
+        Flat UI actions:
+        - ui:TAKE      → confirm (if awaiting)
+        - ui:PRESSURE  → send prompt, then refresh menu
+        - ui:WEIGHT    → send prompt, then refresh menu
+        - ui:HELP      → help text, then refresh menu
+
+        Only the mapped patient may act. Others are ignored silently (logged).
+        """
         chat_id = callback.message.chat.id if callback.message else 0
         from_user_id = callback.from_user.id if callback.from_user else 0
         data = callback.data or ""
-        msg_id = callback.message.message_id if callback.message else None
 
-        # Parse pid from payload when present (for robust guard)
-        payload_pid: Optional[int] = None
-        try:
-            if data.startswith("confirm:"):
-                _, pid_s, *_ = data.split(":")
-                payload_pid = int(pid_s)
-            elif data.startswith("ui:"):
-                _, _, pid_s = (data.split(":") + ["", "", ""])[:3]
-                if pid_s.isdigit():
-                    payload_pid = int(pid_s)
-        except Exception:
-            payload_pid = None
-
-        # Group guard — allow if mapping OR payload pid matches the actor
+        # Access control: patient-only
         expected_pid = None
         pid_mapping = getattr(self.engine, "group_to_patient", None)
         if isinstance(pid_mapping, dict):
             expected_pid = pid_mapping.get(chat_id)
-
-        is_actor_patient = (
-            (expected_pid is not None and from_user_id == expected_pid)
-            or (payload_pid is not None and from_user_id == payload_pid)
-            or (expected_pid is None and payload_pid is None)
-        )
-        if not is_actor_patient:
-            await self.answer_callback(
-                callback.id, text=MESSAGES["cb_only_patient"], show_alert=True
+        if expected_pid is not None and from_user_id != expected_pid:
+            self.log.debug(
+                "cb.ignored.nonpatient "
+                + kv(group_id=chat_id, actor=from_user_id, expected=expected_pid)
             )
+            # Ignore silently as per spec (optionally log). Do not toast.
             return
 
-        # Home/submenu actions (ui:*)
-        if data.startswith("ui:"):
-            await self.answer_callback(
-                callback.id, text=MESSAGES["toast_processing"], show_alert=False
-            )
-            _, action, pid_str = (data.split(":") + ["", "", ""])[:3]
-
-            if action == "TAKE":
-                await self.engine.quick_confirm(chat_id, from_user_id)
-                # Do NOT auto-show next reminder/menu; engine sends only confirm_ack
-                return
-
-            if action == "HELP":
-                await self.engine._reply(chat_id, "help_brief")
-                return
-
-            if action == "MEAS":
-                pid = int(pid_str) if pid_str.isdigit() else from_user_id
-                await self.send_step_message(
-                    chat_id,
-                    MESSAGES["measurements_menu_title"],
-                    self.measurements_keyboard(pid),
-                )
-                return
-
-            if action == "MEAS_P":
-                await self.engine._reply(chat_id, "prompt_pressure")
-                return
-
-            if action == "MEAS_W":
-                await self.engine._reply(chat_id, "prompt_weight")
-                return
-
-            if action == "HOME":
-                # Show context-aware bottom STEP:
-                # - Confirm ONLY if awaiting, else Home without confirm
-                await self.engine.show_current_menu(chat_id)
-                return
-
+        # Route actions
+        if data == "ui:TAKE":
+            await self.engine.quick_confirm(chat_id, from_user_id)
+            # Engine sends ack and refreshes menu.
             return
 
-        # Step actions (confirm:*). Outdated tap?
-        if (
-            msg_id is not None
-            and self._last_step_msg_id.get(chat_id)
-            and msg_id != self._last_step_msg_id[chat_id]
-        ):
-            await self.answer_callback(
-                callback.id, text=MESSAGES["toast_expired"], show_alert=False
-            )
+        if data == "ui:PRESSURE":
+            await self.engine._reply(chat_id, "prompt_pressure")
             await self.engine.show_current_menu(chat_id)
             return
 
-        await self.answer_callback(
-            callback.id, text=MESSAGES["toast_processing"], show_alert=False
-        )
+        if data == "ui:WEIGHT":
+            await self.engine._reply(chat_id, "prompt_weight")
+            await self.engine.show_current_menu(chat_id)
+            return
+
+        if data == "ui:HELP":
+            await self.engine._reply(chat_id, "help_text")
+            await self.engine.show_current_menu(chat_id)
+            return
+
+    async def on_ids(self, message: Message) -> None:
+        """
+        Debug command: /ids prints group id and best-effort participants to console only.
+        No chat output, no menu refresh or deletions.
+        """
         try:
-            if msg_id is not None:
-                await self.bot.edit_message_reply_markup(
-                    chat_id, msg_id, reply_markup=None
-                )
-        except Exception:
-            pass
+            # Gather known participants for this group (patient + nurse).
+            known_ids: set[int] = set()
+            chat_id = message.chat.id
 
-        result: dict[str, Any] = await self.engine.on_inline_confirm(
-            group_id=chat_id, from_user_id=from_user_id, data=data, message_id=msg_id
-        )
+            pid_mapping = getattr(self.engine, "group_to_patient", {})
+            pat_idx = getattr(self.engine, "patient_index", {})
 
-        cb_text: Optional[str] = result.get("cb_text")
-        show_alert: bool = bool(result.get("show_alert", False))
-        if cb_text:
-            await self.answer_callback(callback.id, text=cb_text, show_alert=show_alert)
+            patient_id = pid_mapping.get(chat_id)
+            if isinstance(patient_id, int):
+                known_ids.add(patient_id)
+                pdata = pat_idx.get(patient_id, {})
+                nurse_id = pdata.get("nurse_user_id")
+                if isinstance(nurse_id, int):
+                    known_ids.add(nurse_id)
+
+            await print_group_and_users_best_effort(
+                self.bot, message, known_user_ids=list(known_ids)
+            )
+        except Exception as e:
+            self.log.debug("ids.print.fail " + kv(err=str(e)))
+        # Intentionally do nothing in chat (no reply).
 
     # ------------------------------------------------------------------------------
-    # Outbound messaging
+    # Outbound messaging (used by messenger)
     # ------------------------------------------------------------------------------
     async def send_group_message(
         self, group_id: int, text: str, reply_markup: Any | None = None
     ) -> int:
         self.log.info("msg.out.group " + kv(group_id=group_id, text=text))
-        if reply_markup is None:
-            reply_markup = ReplyKeyboardRemove(remove_keyboard=True)
         msg = await self.bot.send_message(
             chat_id=group_id, text=text, reply_markup=reply_markup
         )
@@ -331,12 +259,11 @@ class TelegramAdapter:
         self.log.info("msg.out.dm " + kv(user_id=user_id, text=text))
         await self.bot.send_message(chat_id=user_id, text=text)
 
-    async def answer_callback(
-        self, callback_query_id: str, text: str | None = None, show_alert: bool = False
-    ) -> None:
-        await self.bot.answer_callback_query(
-            callback_query_id, text=text or None, show_alert=show_alert
-        )
+    # v4 menu hook used by ReminderMessenger
+    async def send_menu_message(
+        self, group_id: int, text: str, *, can_confirm: bool
+    ) -> int:
+        return await self.post_menu(group_id, text, can_confirm=can_confirm)
 
     async def run_polling(self) -> None:
         self.log.debug("polling.run")
