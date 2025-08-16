@@ -1,7 +1,9 @@
 # pillsbot/adapters/telegram_adapter.py
 from __future__ import annotations
 
+import asyncio
 import logging
+import contextlib
 from typing import Any, Iterable
 
 from aiogram import Bot, Dispatcher, F
@@ -27,7 +29,7 @@ class TelegramAdapter:
     • Single dynamic inline menu at the bottom (flat, no submenus, no pinned message).
     • Exactly one menu message exists in the chat: before posting a new one, delete the old one.
     • Accept both tap and text confirmation (engine handles text; adapter routes taps).
-    • Patient-only actions; others are ignored silently (logged).
+    • Patient-only actions; others are ignored (now with a polite toast + INFO log).
     """
 
     def __init__(
@@ -43,6 +45,8 @@ class TelegramAdapter:
 
         # Per-chat menu lifecycle (v4: delete-then-post)
         self._last_menu_msg_id: dict[int, int] = {}
+        # per-chat lock to serialize delete→post across concurrent sends
+        self._menu_locks: dict[int, asyncio.Lock] = {}
 
         # ---- Handlers (IMPORTANT: commands first, then generic text) ----
         self.dp.message.register(self.on_start, CommandStart())
@@ -83,25 +87,27 @@ class TelegramAdapter:
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     # ------------------------------------------------------------------------------
-    # Menu posting (delete previous first)
+    # Menu posting (delete previous first) — serialized per chat
     # ------------------------------------------------------------------------------
     async def post_menu(self, chat_id: int, text: str, *, can_confirm: bool) -> int:
-        # 1) Try to delete the previous menu message.
-        old = self._last_menu_msg_id.get(chat_id)
-        if old:
-            try:
-                await self.bot.delete_message(chat_id, old)
-            except Exception as e:
-                # Log and proceed to send a fresh menu anyway.
-                self.log.debug("menu.delete.fail " + kv(chat_id=chat_id, err=str(e)))
+        lock = self._menu_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            old = self._last_menu_msg_id.get(chat_id)
+            if old:
+                try:
+                    await self.bot.delete_message(chat_id, old)
+                except Exception as e:
+                    self.log.debug(
+                        "menu.delete.fail " + kv(chat_id=chat_id, err=str(e))
+                    )
 
-        # 2) Send the new menu message (text + inline keyboard).
-        kb = self.build_menu_keyboard(can_confirm=can_confirm)
-        msg = await self.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+            kb = self.build_menu_keyboard(can_confirm=can_confirm)
+            msg = await self.bot.send_message(
+                chat_id=chat_id, text=text, reply_markup=kb
+            )
 
-        # 3) Track it as the last menu.
-        self._last_menu_msg_id[chat_id] = msg.message_id
-        return msg.message_id
+            self._last_menu_msg_id[chat_id] = msg.message_id
+            return msg.message_id
 
     # ------------------------------------------------------------------------------
     # Reply keyboard removal — done on /start (separate message)
@@ -121,10 +127,6 @@ class TelegramAdapter:
     # Handlers
     # ------------------------------------------------------------------------------
     async def on_start(self, message: Message) -> None:
-        """
-        v4 migration: on /start send a separate message with ReplyKeyboardRemove(),
-        then post the state-appropriate menu (engine decides can_confirm).
-        """
         chat_id = message.chat.id
         await self.clear_reply_keyboard_once(chat_id)
         await self.engine.show_current_menu(chat_id)
@@ -156,6 +158,7 @@ class TelegramAdapter:
         sent_at_utc = getattr(message, "date", None)
         if sent_at_utc is None:
             from datetime import datetime, timezone as _tz
+
             sent_at_utc = datetime.now(_tz.utc)
 
         incoming = IncomingMessage(
@@ -175,7 +178,7 @@ class TelegramAdapter:
         - ui:WEIGHT    → show hint + menu in ONE message; expect next input as weight
         - ui:HELP      → help text, then refresh menu
 
-        Only the mapped patient may act. Others are ignored silently (logged).
+        Only the mapped patient may act. Others get a polite toast and we log at INFO.
         """
         chat_id = callback.message.chat.id if callback.message else 0
         from_user_id = callback.from_user.id if callback.from_user else 0
@@ -187,11 +190,21 @@ class TelegramAdapter:
         if isinstance(pid_mapping, dict):
             expected_pid = pid_mapping.get(chat_id)
         if expected_pid is not None and from_user_id != expected_pid:
-            self.log.debug(
+            # Toast the tapper so they understand why "nothing happens"
+            with contextlib.suppress(Exception):
+                await callback.answer(
+                    "Ця кнопка доступна лише пацієнту.", show_alert=False
+                )
+            # Log at INFO so it's visible in default console output
+            self.log.info(
                 "cb.ignored.nonpatient "
-                + kv(group_id=chat_id, actor=from_user_id, expected=expected_pid)
+                + kv(
+                    group_id=chat_id,
+                    actor=from_user_id,
+                    expected=expected_pid,
+                    action=data,
+                )
             )
-            # Ignore silently as per spec. Do not toast.
             return
 
         # Acknowledge the callback to clear the Telegram spinner
@@ -223,7 +236,6 @@ class TelegramAdapter:
         No chat output, no menu refresh or deletions.
         """
         try:
-            # Gather known participants for this group (patient + nurse).
             known_ids: set[int] = set()
             chat_id = message.chat.id
 

@@ -12,7 +12,7 @@
 #   ./concat_sources.sh result.txt
 
 # === Hardcoded excluded folders (space-separated array) ===
-exclude_folders=("__pycache__" "tests" "logs" "venv" ".git")
+exclude_folders=("tests" "__pycache__" "logs" "venv" ".git" "venv_med" "zz_old_med" "zip-bin")
 
 # === Hardcoded included file extensions (space-separated array, without dots) ===
 include_extensions=("py" "yaml")

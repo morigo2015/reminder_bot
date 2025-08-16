@@ -38,4 +38,4 @@ async def test_text_confirmation_confirms_when_awaiting():
     await eng.on_patient_message(msg)
 
     assert eng.state_mgr.status(inst) == Status.CONFIRMED
-    assert any("Готово! Зафіксовано" in t for _, _, t, *rest in eng.adapter.sent)
+    assert any("Готово! Прийом зафіксовано" in t for _, _, t, *rest in eng.adapter.sent)

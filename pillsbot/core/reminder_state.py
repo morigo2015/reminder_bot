@@ -149,5 +149,9 @@ class ReminderState:
     # -- utilities ------------------------------------------------------
     def _combine(self, yyyy_mm_dd: str, hh_mm: str) -> datetime:
         y, m, d = (int(x) for x in yyyy_mm_dd.split("-"))
-        hh, mm = (int(x) for x in hh_mm.split(":"))
+        # Handle special case where time is "*" (any time)
+        if hh_mm == "*":
+            hh, mm = 12, 0  # Default to noon for "any time" doses
+        else:
+            hh, mm = (int(x) for x in hh_mm.split(":"))
         return datetime(y, m, d, hh, mm, tzinfo=self.tz)

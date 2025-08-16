@@ -61,7 +61,7 @@ async def test_confirmation_takes_precedence_over_hint_expectation():
     await eng.on_patient_message(_mk_msg(gid, uid, "так"))
 
     assert eng.state_mgr.status(inst) == Status.CONFIRMED
-    assert any("Зафіксовано" in t for _, _, t, *rest in eng.adapter.sent)
+    assert any("Готово! Прийом зафіксовано" in t for _, _, t, *rest in eng.adapter.sent)
 
 
 @pytest.mark.asyncio
@@ -76,4 +76,4 @@ async def test_help_takes_precedence_over_hint_expectation():
     await eng.show_hint_menu(gid, kind="weight")
     await eng.on_patient_message(_mk_msg(gid, uid, "help"))
 
-    assert any("Як надіслати показник" in t for _, _, t, *rest in eng.adapter.sent)
+    assert any("Доступні вимірювання: тиск, вага" in t for _, _, t, *rest in eng.adapter.sent)

@@ -12,16 +12,15 @@ from zoneinfo import ZoneInfo
 # --------------------------------------------------------------------------------------
 # Core bot settings
 # --------------------------------------------------------------------------------------
-BOT_TOKEN: str | None = (
-    "550433191:AAFkG6atLs_uo0nwphtuiwbwIJeUhwfzCyI"  # fallback if env BOT_TOKEN is not set
-)
+# IMPORTANT: no hardcoded token in repo; provide via env or explicit override
+BOT_TOKEN: str | None = None
 TIMEZONE = "Europe/Kyiv"
 TZ = ZoneInfo(TIMEZONE)
 
 # Retry/escalation configuration
-RETRY_INTERVAL_S = 30
+RETRY_INTERVAL_S = 60
 MAX_RETRY_ATTEMPTS = 3
-TAKING_GRACE_INTERVAL_S = 600  # reserved for future; engine simplified in v4
+# TAKING_GRACE_INTERVAL_S = 600  # reserved for future; engine simplified in v4
 
 # --------------------------------------------------------------------------------------
 # Patterns (v4: text confirmation list — case-insensitive/trimmed)
@@ -71,13 +70,13 @@ PATIENTS: list[dict[str, Any]] = [
         "group_id": -1002690368389,
         "nurse_user_id": 7391874317,
         "doses": [
-            {"time": "02:19", "text": "Вітамін Д"},
-            {"time": "20:00", "text": "Вітамін Д"},
+            {"time": "*", "text": "Вітамін Д"},
+            {"time": "22:26", "text": "Парацетамол"},
         ],
         # Optional daily measurement checks (per measure)
         "measurement_checks": [
-            {"measure_id": "pressure", "time": "21:00"},
-            {"measure_id": "weight", "time": "21:00"},
+            {"measure_id": "pressure", "time": "14:16"},
+            {"measure_id": "weight", "time": "23:34"},
         ],
     },
 ]
@@ -87,6 +86,6 @@ def get_bot_token() -> str:
     token = BOT_TOKEN or os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError(
-            "Bot token is not set. Set BOT_TOKEN in config.py or env var BOT_TOKEN."
+            "Bot token is not set. Set env var BOT_TOKEN or override BOT_TOKEN in config.py."
         )
     return token

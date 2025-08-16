@@ -4,15 +4,20 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional, Dict, Set
+from typing import Any, Optional, Dict, Set, Tuple, List
 from zoneinfo import ZoneInfo
 
 from pillsbot.core.matcher import Matcher
 from pillsbot.core.i18n import fmt, MESSAGES
 from pillsbot.core.logging_utils import kv
-from pillsbot.core.measurements import MeasurementRegistry, parse_pressure_free, parse_weight_free
+from pillsbot.core.measurements import (
+    MeasurementRegistry,
+    parse_pressure_free,
+    parse_weight_free,
+)
 from pillsbot.core.reminder_state import (
     Clock,
     Status,
@@ -77,14 +82,14 @@ class ReminderEngine:
         self.log.debug("engine.adapter.attached " + kv(kind=type(adapter).__name__))
 
     async def start(self, scheduler: Any | None) -> None:
-        # Build indices
+        # Build indices & pre-create state for today
         for p in getattr(self.cfg, "PATIENTS", []):
             pid = p["patient_id"]
             self.patient_index[pid] = p
             self.group_to_patient[p["group_id"]] = pid
             self.state_mgr.ensure_today_instances(p)
 
-        # Wire retry
+        # Wire retry manager
         self.retry_mgr = RetryManager(
             interval_seconds=int(getattr(self.cfg, "RETRY_INTERVAL_S", 30)),
             max_attempts=int(getattr(self.cfg, "MAX_RETRY_ATTEMPTS", 3)),
@@ -95,7 +100,7 @@ class ReminderEngine:
             logger=self.log,
         )
 
-        # Optional scheduler passthrough kept for compatibility
+        # Optional legacy scheduler passthrough (kept for compatibility)
         if scheduler is not None:
             try:
                 for p in getattr(self.cfg, "PATIENTS", []):
@@ -116,6 +121,7 @@ class ReminderEngine:
                             },
                         )
             except Exception:
+                # best-effort compatibility
                 pass
 
     # ---- incoming from adapter --------------------------------------------------------
@@ -150,7 +156,7 @@ class ReminderEngine:
             await self._handle_confirmation_text(patient)
             return
 
-        # --- B) Help commands (should not be blocked by hint expectation) ---
+        # --- B) Help commands ---
         if text.lower() in {"help", "?", "довідка"}:
             await self.show_help(group_id)
             return
@@ -224,11 +230,17 @@ class ReminderEngine:
             self._expect_next[group_id] = kind
 
         # Can we show confirm row?
-        target = self.state_mgr.select_target_for_confirmation(self.clock.now(), patient)
+        target = self.state_mgr.select_target_for_confirmation(
+            self.clock.now(), patient
+        )
         can_confirm = bool(target and self.state_mgr.status(target) == Status.AWAITING)
 
         # Which hint text?
-        text = MESSAGES["prompt_pressure"] if kind == "pressure" else MESSAGES["prompt_weight"]
+        text = (
+            MESSAGES["prompt_pressure"]
+            if kind == "pressure"
+            else MESSAGES["prompt_weight"]
+        )
 
         await self.messenger.send_menu(group_id, text=text, can_confirm=can_confirm)
 
@@ -265,7 +277,9 @@ class ReminderEngine:
                 self.log.error(
                     "job.trigger.miss "
                     + kv(
-                        patient_id=patient_id, time=time_str, reason="state not created"
+                        patient_id=patient_id,
+                        time=time_str,
+                        reason="state not created",
                     )
                 )
                 return
@@ -283,15 +297,61 @@ class ReminderEngine:
         await self.messenger.send_reminder_step(inst)
         await self._start_retry(inst)
 
+    # --- IMPORTANT: robust measurement check entry points ---
+    async def _start_measurement_check_job(
+        self, *, patient_id: int, measure_id: str
+    ) -> None:
+        """
+        Compatibility alias for app.schedule_jobs(...) that might still call this name.
+        Delegates to the canonical _job_measure_check.
+        """
+        await self._job_measure_check(patient_id=patient_id, measure_id=measure_id)
+
     async def _job_measure_check(self, *, patient_id: int, measure_id: str) -> None:
+        """
+        If the patient hasn't submitted 'measure_id' today, nudge with a visible hint line
+        and show the hint menu (sets one-shot expectation).
+        """
         patient = self.patient_index.get(patient_id)
         if not patient:
+            self.log.debug(
+                "job.measure.miss "
+                + kv(reason="unknown patient", patient_id=patient_id)
+            )
             return
+
         today = self.clock.now().date()
-        if not self.measures.has_today(measure_id, patient_id, today):
-            # Neutral line; menu refresh keeps UI consistent
-            await self._reply(patient["group_id"], "unknown_text")
-            await self.show_current_menu(patient["group_id"])
+        if self.measures.has_today(measure_id, patient_id, today):
+            # NEW: include last time and values for today in the INFO log
+            last = self._read_today_last_measure(measure_id, patient_id, today)
+            if last:
+                dt_local, values = last
+                self.log.info(
+                    "measure.check.skip "
+                    + kv(
+                        patient_id=patient_id,
+                        measure_id=measure_id,
+                        reason="has_today",
+                        last_time=dt_local.strftime("%H:%M"),
+                        values=";".join(values),
+                    )
+                )
+            else:
+                # Fallback if CSV could not be parsed (still explain skip)
+                self.log.info(
+                    "measure.check.skip "
+                    + kv(
+                        patient_id=patient_id, measure_id=measure_id, reason="has_today"
+                    )
+                )
+            return
+
+        group_id = patient["group_id"]
+        # Post a contentful hint via the menu (arms one-shot expectation)
+        self.log.info(
+            "measure.check.prompt " + kv(patient_id=patient_id, measure_id=measure_id)
+        )
+        await self.show_hint_menu(group_id, kind=measure_id)
 
     # ---- retry glue -------------------------------------------------------------------
     async def _start_retry(self, inst: DoseInstance) -> None:
@@ -315,11 +375,12 @@ class ReminderEngine:
         await self.messenger.send_reminder_step(inst)
 
     async def _on_escalate_wrapper(self, inst: DoseInstance) -> None:
-        # Send escalation messages
-        await self.messenger.send_escalation(inst) if hasattr(self.messenger, "send_escalation") else None
+        # Send escalation messages & menu
+        await self.messenger.send_escalation(inst) if hasattr(
+            self.messenger, "send_escalation"
+        ) else None
         self._escalated.add(inst.dose_key)
         self._log_outcome_csv(inst, "escalated")
-        # Keep the invariant "menu is last" after escalation.
         await self.show_current_menu(inst.group_id)
 
     # ---- confirmation handling ---------------------------------------------------------
@@ -379,13 +440,21 @@ class ReminderEngine:
             pulse_v = parsed.get("pulse")
             vals = (sys_v, dia_v) if pulse_v is None else (sys_v, dia_v, pulse_v)
             self.measures.append_csv(
-                "pressure", now_local, patient["patient_id"], patient["patient_label"], vals
+                "pressure",
+                now_local,
+                patient["patient_id"],
+                patient["patient_label"],
+                vals,
             )
             if pulse_v is None:
                 await self._reply(gid, "ack_pressure", systolic=sys_v, diastolic=dia_v)
             else:
                 await self._reply(
-                    gid, "ack_pressure_pulse", systolic=sys_v, diastolic=dia_v, pulse=pulse_v
+                    gid,
+                    "ack_pressure_pulse",
+                    systolic=sys_v,
+                    diastolic=dia_v,
+                    pulse=pulse_v,
                 )
         else:
             err = parsed.get("error")
@@ -403,7 +472,11 @@ class ReminderEngine:
             now_local = self.clock.now()
             kg = parsed["kg"]
             self.measures.append_csv(
-                "weight", now_local, patient["patient_id"], patient["patient_label"], (kg,)
+                "weight",
+                now_local,
+                patient["patient_id"],
+                patient["patient_label"],
+                (kg,),
             )
             await self._reply(gid, "ack_weight", kg=kg)
         else:
@@ -424,6 +497,73 @@ class ReminderEngine:
             group_id, template_key, **fmt_args
         )
 
+    # ---- CSV helper for richer logs (self-contained; no changes to measurements.py) ---
+    def _read_today_last_measure(
+        self, measure_id: str, patient_id: int, today_date
+    ) -> Optional[Tuple[datetime, List[str]]]:
+        """
+        Return (local_dt, values[]) for the LAST row in the measure CSV that matches
+        (today, patient_id). Values are the string fields after 'patient_label'.
+        Robust to minor CSV variations; ignores malformed lines.
+        """
+        # Resolve CSV path from config
+        try:
+            mdef = getattr(self.cfg, "MEASURES", {})[measure_id]
+            path = mdef.get("csv_file")
+        except Exception:
+            return None
+
+        if not path or not os.path.exists(path):
+            return None
+
+        last_dt: Optional[datetime] = None
+        last_vals: List[str] = []
+
+        # Accept common datetime formats
+        dt_formats = ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S")
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) < 4:
+                        continue
+                    dt_str, pid_str = parts[0], parts[1]
+                    # Must match patient id
+                    try:
+                        if int(pid_str) != int(patient_id):
+                            continue
+                    except Exception:
+                        continue
+
+                    # Parse dt
+                    dt_local = None
+                    for fmt_ in dt_formats:
+                        try:
+                            dt_local = datetime.strptime(dt_str, fmt_)
+                            break
+                        except Exception:
+                            continue
+                    if dt_local is None:
+                        continue
+                    if dt_local.date() != today_date:
+                        continue
+
+                    # Values start from index 3 (after patient_label)
+                    vals = parts[3:]
+                    if (last_dt is None) or (dt_local > last_dt):
+                        last_dt = dt_local
+                        last_vals = vals
+        except Exception:
+            return None
+
+        if last_dt is None:
+            return None
+        return last_dt, last_vals
+
     # ---- misc -------------------------------------------------------------------------
     def _log_outcome_csv(self, inst: DoseInstance, status: str) -> None:
         line = (
@@ -431,8 +571,6 @@ class ReminderEngine:
             f"{inst.patient_id}, {inst.patient_label}, {inst.pill_text}, {status}, {inst.attempts_sent}\n"
         )
         path = getattr(self.cfg, "LOG_FILE", "pillsbot/logs/pills.csv")
-        import os
-
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             f.write(line)
