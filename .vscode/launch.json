@@ -5,6 +5,21 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "carer_bot: app.main (module)",
+            "type": "debugpy",
+            "request": "launch",
+            // Run as a module:
+            "module": "app.main",
+            // Project root where the "app" package lives:
+            "cwd": "/home/igor/med/carer_bot",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            // Optional but harmless: makes imports work even if you start from the workspace root
+            "env": {
+                "PYTHONPATH": "/home/igor/med/carer_bot"
+            }
+        },
+        {
             "name": "Python Debugger: Current File",
             "type": "debugpy",
             "request": "launch",
