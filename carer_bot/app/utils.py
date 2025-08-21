@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from . import config
 
+
 def dbg(msg: str) -> None:
     """
     Lightweight debug printer for PoC.

@@ -1,3 +1,542 @@
+### FILE: ./app/config.py
+# app/config.py
+from __future__ import annotations
+from zoneinfo import ZoneInfo
+
+# ---- Core settings (PoC) ----
+TZ = ZoneInfo("Europe/Kyiv")
+DATETIME_FMT = "%Y-%m-%d %H:%M"  # used in messages and CSV
+
+# For PoC we keep these here (no env). Replace later with env vars.
+BOT_TOKEN = "550433191:AAFkG6atLs_uo0nwphtuiwbwIJeUhwfzCyI"
+
+# Single caregiver escalation channel (for ALL patients)
+CARE_GIVER_CHAT_ID = 7391874317  # group/supergroup id
+
+# Logging
+LOG_DIR = "./logs"  # will be created on first write
+
+# Generic dedupe window for prompts (minutes)
+DEDUPE_MIN = 20
+
+# Photo confirmation window relative to scheduled time (minutes)
+# Window [-60 ; +120] == [-1h ; +2h]
+PHOTO_CONFIRM_WINDOW = (-60, 120)
+
+# Confirmation lexicon (case-insensitive)
+CONFIRM_OK = {"прийняла", "прийняв", "так", "да", "є"}
+
+# ---- Feature flags ----
+FEATURE_ONBOARD_FEEDBACK = (
+    True  # one-time "not onboarded" message for unknown groups/users
+)
+DEBUG_MODE = True
+DEBUG_NAG_SECONDS = [
+    10,
+    30,
+    90,
+]  # not used for BP reminder; used for pill nags if DEBUG_MODE
+
+# ---- Defaults for thresholds / timings ----
+DEFAULTS = {
+    "bp_thresholds": {
+        "sys_min": 80,
+        "sys_max": 260,
+        "dia_min": 60,
+        "dia_max": 140,
+        "pulse_min": 40,
+        "pulse_max": 200,  # alert if outside inclusive bounds
+    },
+    # Mixed delimiters allowed between numbers: spaces, ',', '/', '-'
+    "bp_delimiters_regex": r"[\s,\-\/]+",
+    # Pills timing (minutes)
+    "pill_nag_after_minutes": 15,
+    "pill_escalate_after_minutes": 45,
+    # BP timing: one reminder per day (no reminder-nag).
+    # Clarification nag is allowed if user's reply was invalid/incomplete.
+    "bp_clarify_nag_after_minutes": 15,
+    "bp_escalate_after_minutes": 45,  # escalate if no valid value after reminder
+}
+
+# ---- Seed data (PoC) ----
+# NOTE: Group-based communication:
+#   - patient_user_id : Telegram user ID of the patient (who is allowed to talk to bot)
+#   - group_chat_id   : Private group chat where bot posts pill/BP messages (visible to relatives)
+#
+# There is NO per-patient caregiver chat now (single CARE_GIVER_CHAT_ID used for escalations).
+PATIENTS = {
+    1: {
+        "name": "Марія",
+        "patient_user_id": 382163513,  # patient's personal Telegram user id
+        "group_chat_id": -1002690368389,  # private group for this patient (bot + family)
+        # ---- Labels & daypart (used for dose labels like "Пн/р") ----
+        # weekday[0..6] = Mon..Sun
+        "labels": {
+            "weekday": ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"],
+            "daypart": {"morning": "р", "evening": "в"},
+            "threshold_hhmm": "13:00",
+        },
+        # ---- Pill schedule (index position = med_id) ----
+        "pill_times_hhmm": ["20:11", "20:30"],
+        # ---- BP collection ----
+        "bp_types": {
+            "швидко": r"(швид\w*|моментально)",
+            "довго": r"(довго|повільно)",
+        },
+        # Optional per-patient thresholds (inclusive bounds). Omit to use DEFAULTS.
+        "bp_thresholds": {
+            "sys_min": 80,
+            "sys_max": 260,
+            "dia_min": 60,
+            "dia_max": 140,
+            "pulse_min": 40,
+            "pulse_max": 200,
+        },
+        # Optional per-patient timing overrides (minutes)
+        # "pill_nag_after_minutes": 20,
+        # "pill_escalate_after_minutes": 60,
+        # "bp_clarify_nag_after_minutes": 20,
+        # "bp_escalate_after_minutes": 60,
+    },
+}
+
+# ---- Measurement reminders (time-of-day). Simple PoC list for BP. ----
+# One or more daily BP reminder slots per patient. The "one-per-day" rule is enforced at runtime.
+MEASURES = [
+    {
+        "patient_id": 1,
+        "kind": "bp",
+        "schedule": {"type": "cron", "hour": 20, "minute": 30},
+    },
+]
+
+
+# ---- Helper: deterministic job IDs (APScheduler) ----
+def job_id_for_med(patient_id: int, med_id: int) -> str:
+    """Deterministic IDs like 'med:1:0' let us update/cancel the exact job later."""
+    return f"med:{patient_id}:{med_id}"
+
+
+def job_id_for_measure(patient_id: int, kind: str) -> str:
+    """Deterministic IDs like 'measure:1:bp' for measurement jobs."""
+    return f"measure:{patient_id}:{kind}"
+
+
+def job_id_for_clarify(patient_id: int, kind: str, due_ts: int) -> str:
+    """One-off clarify nag job id."""
+    return f"clarify:{patient_id}:{kind}:{due_ts}"
+
+
+def job_id_for_escalate(patient_id: int, kind: str, due_ts: int) -> str:
+    """One-off escalation check job id."""
+    return f"escalate:{patient_id}:{kind}:{due_ts}"
+
+
+### FILE: ./app/csvlog.py
+# app/csvlog.py
+from __future__ import annotations
+import os
+import csv
+import json
+from typing import Optional, Any, Dict
+from datetime import datetime
+from . import config
+
+HEADER = [
+    "date_time_kyiv",
+    "patient_id",
+    "scenario",
+    "event",
+    "med_id",
+    "measure_kind",
+    "due_time_kyiv",
+    "pill_label",
+    "sys",
+    "dia",
+    "pulse",
+    "bp_type",
+    "temp_c",
+    "text",
+    "photo_file_id",
+    "action",
+    "nag_count",
+    "escalated",
+    "tg_message_id",
+    "extra_json",
+]
+
+
+def _ensure_dir():
+    os.makedirs(config.LOG_DIR, exist_ok=True)
+
+
+def _now_local() -> datetime:
+    from datetime import datetime
+
+    return datetime.now(config.TZ)
+
+
+def _fmt(dt: Optional[datetime]) -> str:
+    return dt.astimezone(config.TZ).strftime(config.DATETIME_FMT) if dt else ""
+
+
+def csv_append(
+    *,
+    patient_id: int,
+    scenario: str,
+    event: str,
+    med_id: Optional[int] = None,
+    measure_kind: Optional[str] = None,
+    due_time_kyiv: Optional[datetime] = None,
+    pill_label: Optional[str] = None,
+    sys: Optional[int] = None,
+    dia: Optional[int] = None,
+    pulse: Optional[int] = None,
+    bp_type: Optional[str] = None,
+    temp_c: Optional[float] = None,
+    text: Optional[str] = None,
+    photo_file_id: Optional[str] = None,
+    action: Optional[str] = None,
+    nag_count: Optional[int] = None,
+    escalated: bool = False,
+    tg_message_id: Optional[int] = None,
+    extra_json: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Append a single row with the stable header defined in Specs v2.1.
+    """
+    _ensure_dir()
+    fname = os.path.join(
+        config.LOG_DIR, f"events_{_now_local().date().isoformat()}.csv"
+    )
+    new_file = not os.path.exists(fname)
+    try:
+        with open(fname, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f, delimiter=";")
+            if new_file:
+                w.writerow(HEADER)
+            w.writerow(
+                [
+                    _fmt(_now_local()),
+                    patient_id,
+                    scenario,
+                    event,
+                    med_id if med_id is not None else "",
+                    measure_kind or "",
+                    _fmt(due_time_kyiv),
+                    pill_label or "",
+                    sys if sys is not None else "",
+                    dia if dia is not None else "",
+                    pulse if pulse is not None else "",
+                    bp_type or "",
+                    f"{temp_c:.1f}" if temp_c is not None else "",
+                    (text or "").replace("\n", " ").strip(),
+                    photo_file_id or "",
+                    action or "",
+                    nag_count if nag_count is not None else "",
+                    "1" if escalated else "0",
+                    tg_message_id or "",
+                    json.dumps(extra_json or {}, ensure_ascii=False),
+                ]
+            )
+    except Exception as e:
+        # Logging must never kill the bot in PoC
+        from .utils import dbg
+
+        dbg(f"CSV append failed: {e}")
+
+
+def emit_config_digest_system() -> None:
+    csv_append(
+        patient_id=0,
+        scenario="system",
+        event="config_digest",
+        text="Carer v2.1 start",
+        extra_json={"tz": "Europe/Kyiv", "datetime_fmt": config.DATETIME_FMT},
+    )
+
+
+def emit_config_digest_patient(patient_id: int, p: dict) -> None:
+    weekday = p["labels"]["weekday"]
+    threshold = p["labels"]["threshold_hhmm"]
+    pill_times = p.get("pill_times_hhmm", [])
+    bp_types = list(p.get("bp_types", {}).keys())
+    thr = p.get("bp_thresholds", config.DEFAULTS["bp_thresholds"])
+    text = (
+        f"patient={p.get('name', '')}; pills={pill_times}; threshold={threshold}; "
+        f"weekday={weekday}; bp_types={bp_types}; "
+        f"bp_thr={{sys:[{thr['sys_min']},{thr['sys_max']}], "
+        f"dia:[{thr['dia_min']},{thr['dia_max']}], pulse:[{thr['pulse_min']},{thr['pulse_max']} ]}}"
+    )
+    csv_append(
+        patient_id=patient_id, scenario="system", event="config_digest", text=text
+    )
+
+
+### FILE: ./app/__init__.py
+# Makes 'app' a package.
+
+
+### FILE: ./app/main.py
+# app/main.py
+import asyncio
+import os
+import sys
+from typing import Optional, List
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command
+from aiogram.types import Message
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from . import config
+from .policies import (
+    handle_timer_fired,
+    handle_user_message,
+    emit_config_digest_on_startup,
+)
+from .utils import dbg
+from . import prompts
+
+router = Router()
+
+# Global scheduler reference for /status
+SCHEDULER: Optional[AsyncIOScheduler] = None
+
+
+def _patient_id_for_group(chat_id: int) -> Optional[int]:
+    for pid, p in config.PATIENTS.items():
+        if p.get("group_chat_id") == chat_id:
+            return pid
+    return None
+
+
+def _patient_user_id(pid: int) -> Optional[int]:
+    return config.PATIENTS.get(pid, {}).get("patient_user_id")
+
+
+async def _warn_not_patient(msg: Message, pid: int) -> None:
+    name = config.PATIENTS.get(pid, {}).get("name", "пацієнт")
+    await msg.answer(prompts.only_patient_can_write(name))
+
+
+@router.message(Command("status"))
+async def on_status(msg: Message):
+    tz_str = getattr(config.TZ, "key", str(config.TZ))
+    sched_status = "unknown"
+    jobs_count = 0
+    if SCHEDULER:
+        try:
+            if hasattr(SCHEDULER, "running"):
+                sched_status = "running" if SCHEDULER.running else "stopped"
+            elif hasattr(SCHEDULER, "state"):
+                state = getattr(SCHEDULER, "state")
+                sched_status = {0: "stopped", 1: "running", 2: "paused"}.get(
+                    state, "unknown"
+                )
+            jobs_count = len(SCHEDULER.get_jobs())
+        except Exception as e:
+            sched_status = f"error: {e}"
+
+    tail = _tail_csv_events(3)
+    lines = [
+        f"TZ: {tz_str}",
+        f"Scheduler: {sched_status}",
+        f"Jobs scheduled: {jobs_count}",
+        "Last log entries:" if tail else "Last log entries: —",
+        *tail,
+    ]
+    await msg.answer("\n".join(lines))
+
+
+def _tail_csv_events(n: int) -> List[str]:
+    """Return last n event rows (semicolon-separated) from the most recent events_*.csv file."""
+    try:
+        files = [
+            f
+            for f in os.listdir(config.LOG_DIR)
+            if f.startswith("events_") and f.endswith(".csv")
+        ]
+        if not files:
+            return []
+        files.sort()
+        latest = os.path.join(config.LOG_DIR, files[-1])
+        with open(latest, "r", encoding="utf-8") as f:
+            rows = [line.strip() for line in f if line.strip()]
+        if len(rows) <= 1:
+            return []
+        data = rows[1:]  # skip header
+        return data[-n:]
+    except Exception as e:
+        dbg(f"/status tail read failed: {e}")
+        return []
+
+
+@router.message(F.photo)
+async def on_photo(msg: Message):
+    pid = _patient_id_for_group(msg.chat.id)
+    if pid is None:
+        # Unknown group: ignore silently (PoC)
+        return
+    # Only patient may send actionable messages
+    if (
+        msg.from_user
+        and not msg.from_user.is_bot
+        and msg.from_user.id != _patient_user_id(pid)
+    ):
+        await _warn_not_patient(msg, pid)
+        return
+    file_id = msg.photo[-1].file_id if msg.photo else None
+    await handle_user_message(
+        bot=msg.bot, scheduler=SCHEDULER, patient_id=pid, photo_file_id=file_id
+    )
+
+
+@router.message(F.voice)
+async def on_voice(msg: Message):
+    pid = _patient_id_for_group(msg.chat.id)
+    if pid is None:
+        return
+    if (
+        msg.from_user
+        and not msg.from_user.is_bot
+        and msg.from_user.id != _patient_user_id(pid)
+    ):
+        await _warn_not_patient(msg, pid)
+        return
+    await msg.answer("Будь ласка, напишіть коротко текстом.")
+
+
+@router.message(F.text)
+async def on_text(msg: Message):
+    pid = _patient_id_for_group(msg.chat.id)
+    if pid is None:
+        # Unknown group: ignore silently (PoC)
+        return
+    if (
+        msg.from_user
+        and not msg.from_user.is_bot
+        and msg.from_user.id != _patient_user_id(pid)
+    ):
+        await _warn_not_patient(msg, pid)
+        return
+    await handle_user_message(
+        bot=msg.bot, scheduler=SCHEDULER, patient_id=pid, text=msg.text or ""
+    )
+
+
+def _fail_fast_config():
+    problems = []
+    if not config.BOT_TOKEN:
+        problems.append("BOT_TOKEN is empty in app/config.py")
+    if not isinstance(config.CARE_GIVER_CHAT_ID, int) or config.CARE_GIVER_CHAT_ID == 0:
+        problems.append(
+            "CARE_GIVER_CHAT_ID is not set to a valid Telegram chat id (negative int for groups)"
+        )
+    if not config.PATIENTS:
+        problems.append("PATIENTS is empty; add at least one patient")
+    for pid, p in config.PATIENTS.items():
+        if not p.get("group_chat_id"):
+            problems.append(f"patient {pid}: group_chat_id missing")
+        if not p.get("patient_user_id"):
+            problems.append(f"patient {pid}: patient_user_id missing")
+    if problems:
+        print("Configuration errors:\n - " + "\n - ".join(problems), file=sys.stderr)
+        sys.exit(2)
+
+
+def _seed_jobs(scheduler: AsyncIOScheduler, bot: Bot):
+    # Pills: derive from per-patient pill_times_hhmm; med_id = index position
+    for pid, p in config.PATIENTS.items():
+        for idx, hhmm in enumerate(p.get("pill_times_hhmm", [])):
+            hh, mm = map(int, hhmm.split(":"))
+            jid = config.job_id_for_med(pid, idx)
+            trig = CronTrigger(hour=hh, minute=mm, timezone=config.TZ)
+            scheduler.add_job(
+                handle_timer_fired,
+                trigger=trig,
+                id=jid,
+                replace_existing=True,
+                kwargs=dict(
+                    bot=bot,
+                    scheduler=scheduler,
+                    kind="med_due",
+                    patient_id=pid,
+                    med_id=idx,
+                    scheduled_due_at=None,  # default to now in handler
+                ),
+            )
+            dbg(
+                f"Seeded job {jid} (pill) at {hh:02d}:{mm:02d} TZ={getattr(config.TZ, 'key', str(config.TZ))}"
+            )
+
+    # BP measurements: keep PoC-style slots from config.MEASURES
+    for meas in config.MEASURES:
+        if meas.get("kind") != "bp":
+            continue
+        jid = config.job_id_for_measure(meas["patient_id"], meas["kind"])
+        sched = meas["schedule"]
+        if sched.get("type") != "cron":
+            raise ValueError("Only 'cron' schedules are supported in PoC")
+        trig = CronTrigger(
+            hour=sched["hour"], minute=sched["minute"], timezone=config.TZ
+        )
+        scheduler.add_job(
+            handle_timer_fired,
+            trigger=trig,
+            id=jid,
+            replace_existing=True,
+            kwargs=dict(
+                bot=bot,
+                scheduler=scheduler,
+                kind="measure_due",
+                patient_id=meas["patient_id"],
+                measure_kind=meas["kind"],
+            ),
+        )
+        dbg(
+            f"Seeded job {jid} (measure:{meas['kind']}) at {sched['hour']:02d}:{sched['minute']:02d} TZ={getattr(config.TZ, 'key', str(config.TZ))}"
+        )
+
+
+async def main():
+    _fail_fast_config()
+
+    bot = Bot(token=config.BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    scheduler = AsyncIOScheduler(timezone=config.TZ)
+    _seed_jobs(scheduler, bot)
+    scheduler.start()
+
+    global SCHEDULER
+    SCHEDULER = scheduler
+
+    # Emit config digest rows on startup
+    emit_config_digest_on_startup()
+
+    dbg("Bot take-off:")
+    dbg(f"  TZ = {getattr(config.TZ, 'key', str(config.TZ))}")
+    dbg(f"  DEBUG_MODE = {config.DEBUG_MODE}")
+    dbg(f"  Patients = {len(config.PATIENTS)}")
+    dbg(
+        f"  Pill jobs scheduled = {sum(len(p.get('pill_times_hhmm', [])) for p in config.PATIENTS.values())}"
+    )
+    dbg(
+        f"  BP measure slots scheduled = {len([m for m in config.MEASURES if m.get('kind') == 'bp'])}"
+    )
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+### FILE: ./app/policies.py
 # app/policies.py
 from __future__ import annotations
 
@@ -772,3 +1311,254 @@ def emit_config_digest_on_startup() -> None:
     emit_config_digest_system()
     for pid, p in config.PATIENTS.items():
         emit_config_digest_patient(pid, p)
+
+
+### FILE: ./app/prompts.py
+# app/prompts.py
+# Centralized UA strings (PoC). Matches Specs v2.1.
+
+from __future__ import annotations
+from datetime import datetime
+from . import config
+
+
+# ---------- Group moderation ----------
+def only_patient_can_write(patient_name: str) -> str:
+    return f"Тільки {patient_name} може надсилати повідомлення в цю группу"
+
+
+# ---------- Pills ----------
+def pill_prompt(patient_name: str, label: str) -> str:
+    return f'Час прийняти ліки "{label}".'
+
+
+def pill_nag(label: str) -> str:
+    return f'Нагадую: треба прийняти ліки "{label}".'
+
+
+def pill_escalation(patient_name: str, due_dt: datetime, label: str) -> str:
+    due_str = due_dt.astimezone(config.TZ).strftime(config.DATETIME_FMT)
+    return f'Пацієнт {patient_name} пропустив прийом ліків, запланований на {due_str}. Мітка: "{label}".'
+
+
+def med_taken_photo_ack() -> str:
+    return "Дякую за фото. Запишу як прийнято."
+
+
+def med_taken_followup() -> str:
+    return "Чудово. Дякую."
+
+
+def ask_clarify_yes_no() -> str:
+    return "Не розчула. Ви прийняли ліки? (так/ні)"
+
+
+def voice_kindly_decline() -> str:
+    return "Будь ласка, напишіть коротко текстом."
+
+
+# ---------- Blood Pressure ----------
+def measure_bp_prompt(patient_name: str) -> str:
+    return (
+        f"{patient_name}, виміряйте тиск і пульс.\n"
+        f"Напишіть: <тип> <систолічний> <діастолічний> <пульс>.\n"
+        f"Напр.: швидко 125 62 51."
+    )
+
+
+def bp_clarify_missing_type() -> str:
+    return (
+        "Я не бачу тип вимірювання. Будь ласка, додайте його: "
+        "<тип> <систолічний> <діастолічний> <пульс>. "
+        "Напр.: швидко 125 62 51."
+    )
+
+
+def bp_clarify_two_numbers() -> str:
+    return (
+        "Потрібно три числа (тиск систолічний, діастолічний і пульс) та тип. "
+        "Напр.: довго 127 61 52."
+    )
+
+
+def bp_clarify_unknown_type(canonical_types: list[str]) -> str:
+    opts = ", ".join(canonical_types)
+    return f"Не розпізнав(ла) тип. Доступні: {opts}. Напр.: швидко 125 62 51."
+
+
+def bp_clarify_bad_order() -> str:
+    return "Тип має бути на початку або в кінці. Приклад: швидко 125 62 51."
+
+
+def bp_clarify_nag() -> str:
+    return "Нагадую: надішліть, будь ласка, <тип> <систолічний> <діастолічний> <пульс>."
+
+
+def bp_out_of_range_alert(
+    patient_name: str, sys: int, dia: int, pulse: int, bp_type: str
+) -> str:
+    return (
+        f'Алерт: {patient_name} повідомив(ла) АТ {sys}/{dia}, пульс {pulse}, тип "{bp_type}". '
+        f"За межами належних меж."
+    )
+
+
+# Generic
+def ok_ack() -> str:
+    return "Гаразд."
+
+
+def sorry_ack() -> str:
+    return "Розумію."
+
+
+### FILE: ./app/regex_bank.py
+# app/regex_bank.py
+from __future__ import annotations
+import re
+from . import config
+
+# Compile confirmation pattern dynamically from lexicon
+_confirm_tokens = sorted(config.CONFIRM_OK, key=len, reverse=True)
+_CONFIRM_RE = re.compile(
+    r"(?i)\b(" + "|".join(map(re.escape, _confirm_tokens)) + r")\b"
+)
+
+# Negation phrases (minimal PoC set)
+_NEGATE_RE = re.compile(
+    r"(?i)\b(не\s*прийняв|не\s*прийняла|забув|забула|пропустив|пропустила|не\s*встиг|не\s*можу)\b"
+)
+
+# Legacy simple patterns (kept for fallback classification only)
+_BP_RE = re.compile(r"\b(\d{2,3})\s*[\/\-]\s*(\d{2,3})\b")
+_TEMP_RE = re.compile(r"(?i)\b(3[5-9](?:[.,]\d)?|4[0-2](?:[.,]\d)?)\s*°?\s*[cс]?\b")
+
+LABEL_PILL_TAKEN = "pill_taken_affirm"
+LABEL_PILL_NEGATE = "pill_taken_negation"
+LABEL_MEAS_BP = "measurement_bp"
+LABEL_MEAS_TEMP = "measurement_temp"
+LABEL_SYMPTOM = "symptom_report"
+LABEL_UNKNOWN = "unknown"
+
+
+def classify_text(text: str) -> str:
+    """
+    Returns one of LABEL_* constants.
+    Regex-only PoC classifier. Keep conservative.
+    """
+    if not text:
+        return LABEL_UNKNOWN
+    t = text.strip()
+
+    if _NEGATE_RE.search(t):
+        return LABEL_PILL_NEGATE
+
+    if _CONFIRM_RE.search(t):
+        return LABEL_PILL_TAKEN
+
+    if _BP_RE.search(t):
+        return LABEL_MEAS_BP
+
+    if _TEMP_RE.search(t):
+        return LABEL_MEAS_TEMP
+
+    # Fallback: treat as symptom report (free text), not strictly unknown
+    return LABEL_SYMPTOM
+
+
+def is_confirmation(text: str) -> bool:
+    return bool(_CONFIRM_RE.search(text or ""))
+
+
+def is_negation(text: str) -> bool:
+    return bool(_NEGATE_RE.search(text or ""))
+
+
+### FILE: ./app/scenarios.py
+# app/scenarios.py
+"""
+Hardcoded PoC scenarios (no YAML yet).
+Each scenario is a tiny unit: trigger -> prompt -> expected labels -> fallbacks.
+We keep only what's needed for PoC; final project will lift this shape into YAML+Jinja2.
+"""
+
+from __future__ import annotations
+from typing import Callable, Dict, List, Literal, TypedDict
+from . import prompts
+from .regex_bank import (
+    LABEL_PILL_TAKEN,
+    LABEL_PILL_NEGATE,
+    LABEL_MEAS_BP,
+    LABEL_MEAS_TEMP,
+    LABEL_SYMPTOM,
+)
+
+TriggerKind = Literal["med_due", "measure_due"]
+
+class Scenario(TypedDict, total=False):
+    id: str
+    trigger: Dict[str, str]         # {"type":"med_due"} or {"type":"measure_due","kind":"bp"}
+    prompt_fn: Callable[..., str]   # functions from prompts.py
+    expected_labels: List[str]      # allowed classification labels
+    fallback_prompt_fn: Callable[..., str]
+
+SCENARIOS: Dict[str, Scenario] = {
+    # 1) Medication reminder
+    "meds.reminder.take_pill": {
+        "id": "meds.reminder.take_pill",
+        "trigger": {"type": "med_due"},
+        "prompt_fn": prompts.med_due,
+        "expected_labels": [
+            LABEL_PILL_TAKEN,    # "прийняв/прийняла/так/да/є"
+            LABEL_PILL_NEGATE,   # negation (we still wait for nags/escalation rules)
+        ],
+        "fallback_prompt_fn": prompts.med_reprompt,
+    },
+
+    # 2) Blood pressure measurement
+    "measure.collect.bp": {
+        "id": "measure.collect.bp",
+        "trigger": {"type": "measure_due", "kind": "bp"},
+        "prompt_fn": prompts.measure_bp_prompt,
+        "expected_labels": [LABEL_MEAS_BP],
+        "fallback_prompt_fn": prompts.measure_recorded_ack,  # not really used; re-prompt handled in policy
+    },
+
+    # 3) Temperature measurement
+    "measure.collect.temp": {
+        "id": "measure.collect.temp",
+        "trigger": {"type": "measure_due", "kind": "temp"},
+        "prompt_fn": prompts.measure_temp_prompt,
+        "expected_labels": [LABEL_MEAS_TEMP],
+        "fallback_prompt_fn": prompts.measure_recorded_ack,
+    },
+
+    # 4) Simple symptom intake (catch-all)
+    "symptom.intake.simple": {
+        "id": "symptom.intake.simple",
+        "trigger": {"type": "user_text"},
+        "prompt_fn": lambda patient_name: prompts.ok_ack(),
+        "expected_labels": [LABEL_SYMPTOM],
+        "fallback_prompt_fn": prompts.ask_clarify_yes_no,
+    },
+}
+
+
+### FILE: ./app/utils.py
+# app/utils.py
+from __future__ import annotations
+from datetime import datetime
+from . import config
+
+
+def dbg(msg: str) -> None:
+    """
+    Lightweight debug printer for PoC.
+    Prints only when config.DEBUG_MODE is True.
+    """
+    if not config.DEBUG_MODE:
+        return
+    ts = datetime.now(config.TZ).strftime("%H:%M:%S")
+    print(f"[DEBUG {ts}] {msg}", flush=True)
+
+
