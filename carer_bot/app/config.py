@@ -35,18 +35,16 @@ DEFAULTS: Dict[str, int] = {
 # ---- Patients (PoC) ----
 PATIENTS: Dict[int, Dict] = {
     1: {
-        "name": "Ірина",
+        "name": "Надія Микитівна",
         "group_chat_id": -1002690368389,
-        "pill_times_hhmm": ["22:10", "20:00"],
+        "pill_times_hhmm": ["22:39", "20:00"],
         # Optional: restrict who can post as the patient (Telegram user id)
         # "patient_user_id": 123456789,
         "labels": {
             "weekday": ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"],
             "daypart": {
                 "morning": "ранок",
-                "day": "день",
                 "evening": "вечір",
-                "night": "ніч",
             },
             "threshold_hhmm": "16:00",
         },

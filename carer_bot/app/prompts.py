@@ -19,6 +19,18 @@ def med_escalate_to_caregiver(patient_name: str, due_at: datetime) -> str:
     return f"Ескалація: {patient_name} не підтвердив(ла) прийом ліків (на {format_kyiv(due_at)})."
 
 
+def med_confirmed_with_label(label: str) -> str:
+    return f"Прийом ліків {label} підтверджено ✅"
+
+
+def patient_missed_pill_notice(label: str) -> str:
+    return f"Пропущено прийом ліків {label}!! Інформую медичну сестру."
+
+
+def caregiver_confirmed_after_escalation(patient_name: str, label: str) -> str:
+    return f"Оновлення: {patient_name} підтвердив(ла) прийом ліків {label} після ескалації."
+
+
 def ok_ack() -> str:
     return "Дякую, зафіксовано ✅"
 
@@ -42,6 +54,10 @@ def clarify_nag() -> str:
 
 def bp_recorded_ack(syst: int, diast: int, pulse: int) -> str:
     return f"Записав(ла) тиск: {syst}/{diast}, пульс {pulse}."
+
+
+def bp_recorded_ack_with_label(label: str, syst: int, diast: int, pulse: int) -> str:
+    return f"Тиск {label} : {syst} {diast} {pulse} записано."
 
 
 def bp_escalate_to_caregiver(patient_name: str) -> str:

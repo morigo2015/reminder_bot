@@ -15,7 +15,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 from . import config, prompts
-from .csvlog import log_med, log_measure
+from .csvlog import log_med, log_measure, log_pills_detail, log_pressure_detail
 from .events import (
     EV_ACK,
     EV_ACK_NEG,
@@ -26,7 +26,6 @@ from .events import (
     EV_ESCALATED,
     EV_NAG,
     EV_BP_RECORDED,
-    EV_DUPLICATE_IGNORE,
     BP_KIND,
 )
 from .regex_bank import LABEL_PILL_NEGATE, classify_text, is_confirmation
@@ -43,6 +42,8 @@ class DoseState:
     confirmed_at: Optional[datetime] = None
     nag_sent_at: Optional[datetime] = None
     escalated: bool = False
+    nags: int = 0
+    label: str = "?"
 
 
 @dataclass
@@ -190,10 +191,10 @@ async def _on_med_due(pid: int, mid: int) -> None:
     ymd = today_key()
     st = _get_dose_state(pid, mid, ymd)
     st.due_at = now_local()
-    part = prompts.label_daypart(p["labels"]["threshold_hhmm"], st.due_at)
+    st.label = prompts.label_daypart(p["labels"]["threshold_hhmm"], st.due_at)
     try:
         msg = await bot.send_message(
-            p["group_chat_id"], prompts.med_due(p["name"], part)
+            p["group_chat_id"], prompts.med_due(p["name"], st.label)
         )
         log_med(
             event=EV_DUE,
@@ -203,7 +204,6 @@ async def _on_med_due(pid: int, mid: int) -> None:
             tg_message_id=msg.message_id,
         )
     except TelegramBadRequest as e:
-        # Don’t crash future runs; just log once per fire.
         logger.error(
             "Failed to send med_due to group %s (pid=%s mid=%s): %s",
             p["group_chat_id"],
@@ -242,6 +242,7 @@ async def _on_med_nag(pid: int, mid: int, ymd: str) -> None:
     try:
         msg = await bot.send_message(p["group_chat_id"], prompts.med_nag(p["name"]))
         st.nag_sent_at = now_local()
+        st.nags += 1
         log_med(
             event=EV_NAG,
             patient_id=pid,
@@ -266,8 +267,21 @@ async def _on_med_escalate(pid: int, mid: int, ymd: str) -> None:
     st = _get_dose_state(pid, mid, ymd)
     if st.confirmed_at or st.escalated:
         return
+    # Notify patient in group first
     try:
-        # Direct message to caregiver user
+        await bot.send_message(
+            p["group_chat_id"], prompts.patient_missed_pill_notice(st.label or "")
+        )
+    except TelegramBadRequest as e:
+        logger.error(
+            "Failed to send missed pill notice to group %s (pid=%s mid=%s): %s",
+            p["group_chat_id"],
+            pid,
+            mid,
+            e,
+        )
+    # DM caregiver
+    try:
         await bot.send_message(
             config.CAREGIVER_USER_ID,
             prompts.med_escalate_to_caregiver(p["name"], st.due_at),
@@ -279,6 +293,10 @@ async def _on_med_escalate(pid: int, mid: int, ymd: str) -> None:
             med_id=mid,
             due_at=st.due_at,
             action="pill_missed",
+        )
+        # Detail log for pills with result
+        log_pills_detail(
+            patient_id=pid, label=st.label or "", nags=st.nags, result="ESCALATED"
         )
     except TelegramBadRequest as e:
         logger.error(
@@ -350,21 +368,13 @@ async def handle_patient_text(
                 latest = (mid, st)
         if latest:
             mid, st = latest
-            if st.confirmed_at:
-                msg = await bot.send_message(chat_id, prompts.ok_ack())
-                log_med(
-                    event=EV_ACK,
-                    patient_id=pid,
-                    med_id=mid,
-                    due_at=st.due_at,
-                    action=EV_DUPLICATE_IGNORE,
-                    text=text,
-                    tg_message_id=msg.message_id,
-                )
-                return
+            # Standard confirmation
             st.confirmed_at = now_local()
             _cancel_jobs_for_pill(pid, mid, ymd)
-            msg = await bot.send_message(chat_id, prompts.ok_ack())
+            # Improved confirmation message with label
+            msg = await bot.send_message(
+                chat_id, prompts.med_confirmed_with_label(st.label or "")
+            )
             log_med(
                 event=EV_CONFIRMED,
                 patient_id=pid,
@@ -373,6 +383,22 @@ async def handle_patient_text(
                 text=text,
                 tg_message_id=msg.message_id,
             )
+            # Detail pills log
+            result_status = (
+                "CONFIRMED_AFTER_ESCALATION" if st.escalated else "CONFIRMED"
+            )
+            log_pills_detail(
+                patient_id=pid, label=st.label or "", nags=st.nags, result=result_status
+            )
+            # If was escalated earlier, politely notify caregiver that it’s resolved
+            if st.escalated:
+                with suppress(TelegramBadRequest):
+                    await bot.send_message(
+                        config.CAREGIVER_USER_ID,
+                        prompts.caregiver_confirmed_after_escalation(
+                            p["name"], st.label or ""
+                        ),
+                    )
             return
         # no pending today → generic ack
         msg = await bot.send_message(chat_id, prompts.ok_ack())
@@ -405,7 +431,12 @@ async def handle_patient_text(
                 action = "auto_swapped"
             ms.last_measured_on = now_local().date()
             ms.clarify_started_at = None
-            msg = await bot.send_message(chat_id, prompts.bp_recorded_ack(s, d, pval))
+            # Improved BP ack with label (morning/evening by threshold)
+            bp_label = prompts.label_daypart(p["labels"]["threshold_hhmm"], now_local())
+            msg = await bot.send_message(
+                chat_id, prompts.bp_recorded_ack_with_label(bp_label, s, d, pval)
+            )
+            # Standard events log + detail pressure log
             log_measure(
                 event=EV_BP_RECORDED,
                 patient_id=pid,
@@ -414,6 +445,7 @@ async def handle_patient_text(
                 text=f"{s}/{d} {pval}",
                 tg_message_id=msg.message_id,
             )
+            log_pressure_detail(patient_id=pid, sys=s, dia=d, pulse=pval)
             return
         # enter/continue clarify
         first_time = ms.clarify_started_at is None
@@ -491,7 +523,6 @@ async def _on_bp_escalate(pid: int, kind: str, ymd: str) -> None:
     if ms.clarify_started_at is None:
         return
     try:
-        # Direct message to caregiver user
         await bot.send_message(
             config.CAREGIVER_USER_ID, prompts.bp_escalate_to_caregiver(p["name"])
         )
