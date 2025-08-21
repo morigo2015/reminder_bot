@@ -25,6 +25,10 @@ def parse_hhmm(hhmm: str) -> Tuple[int, int]:
     return int(hh), int(mm)
 
 
+def today_key() -> str:
+    return now_local().strftime("%Y%m%d")
+
+
 def any_substr(s: str, keys: Iterable[str]) -> bool:
     low = s.lower()
     return any(k in low for k in keys)

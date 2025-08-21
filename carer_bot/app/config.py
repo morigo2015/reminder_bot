@@ -6,46 +6,40 @@ from zoneinfo import ZoneInfo
 
 # ---- Core settings (PoC) ----
 TZ = ZoneInfo("Europe/Kyiv")
-DATETIME_FMT = "%Y-%m-%d %H:%M"  # used in messages and CSV
+DATETIME_FMT = "%Y-%m-%d %H:%M"
 
-# For PoC we keep these here (no env). Replace later with env vars.
-# NOTE: use a bot token for your environment when running.
+# For PoC we keep these here.
 BOT_TOKEN = "550433191:AAFkG6atLs_uo0nwphtuiwbwIJeUhwfzCyI"
 
-# Single caregiver escalation channel (for ALL patients)
-CAREGIVER_CHAT_ID = 7391874317  # group/supergroup id
+# Caregiver escalation is now a DIRECT MESSAGE to this user id
+# (the caregiver must have started the bot at least once)
+CAREGIVER_USER_ID = 7391874317  # Telegram user id
 
 # Logging
-LOG_DIR = "./logs"  # will be created on first write
+LOG_DIR = "./logs"
 CSV_FILE = f"{LOG_DIR}/events.csv"
 
 # Debug
-DEBUG_MODE: bool = False
-# When DEBUG_MODE=True, nags (pill + clarify) will honor seconds, not minutes (fast loops for tests)
-# Tuple form allows us to reuse 0-index consistently (explicitness > magic).
+DEBUG_MODE: bool = True
+# When DEBUG_MODE=True, nags (pill + clarify) honor seconds (fast loops for tests)
 DEBUG_NAG_SECONDS: Tuple[int, int] = (8, 15)  # (pill_nag, clarify_nag)
 
 # ---- Defaults (overridable per patient) ----
 DEFAULTS: Dict[str, int] = {
     "pill_nag_after_minutes": 15,
-    "pill_escalate_after_minutes": 60,
+    "pill_escalate_after_minutes": 1,  # 60,
     "bp_clarify_nag_after_minutes": 20,
     "bp_escalate_after_minutes": 60,
 }
 
 # ---- Patients (PoC) ----
-# All per-patient specifics live here in the MVP. No DB for PoC.
 PATIENTS: Dict[int, Dict] = {
     1: {
         "name": "Ірина",
-        "group_chat_id": -1002223334445,  # private group where bot/patient/caregiver are members
-        "pill_times_hhmm": ["20:58", "20:00"],
-        # Optional per-patient overrides (uncomment to customize)
-        # "pill_nag_after_minutes": 10,
-        # "pill_escalate_after_minutes": 45,
-        # "bp_clarify_nag_after_minutes": 15,
-        # "bp_escalate_after_minutes": 45,
-        # Labels and daypart threshold (used in messages and CSV)
+        "group_chat_id": -1002690368389,
+        "pill_times_hhmm": ["22:10", "20:00"],
+        # Optional: restrict who can post as the patient (Telegram user id)
+        # "patient_user_id": 123456789,
         "labels": {
             "weekday": ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"],
             "daypart": {
@@ -54,31 +48,37 @@ PATIENTS: Dict[int, Dict] = {
                 "evening": "вечір",
                 "night": "ніч",
             },
-            "threshold_hhmm": "16:00",  # for daypart labeling in prompts/logs
+            "threshold_hhmm": "16:00",
         },
     },
 }
 
 
-# ---- Helper: consistent job IDs (APScheduler) ----
-def job_id_for_med(patient_id: int, med_id: int) -> str:
-    """Deterministic IDs like 'med:1:0' per scheduled dose ordinal."""
-    return f"med:{patient_id}:{med_id}"
+# ---- Helper: config access ----
+def cfg(pid: int, key: str, default_key: str) -> int:
+    """Uniform per-patient minutes lookup with project defaults."""
+    return int(PATIENTS[pid].get(key, DEFAULTS[default_key]))
 
 
-def job_id_for_measure(patient_id: int, kind: str) -> str:
-    """Deterministic IDs like 'measure:1:bp' for measurement jobs."""
-    return f"measure:{patient_id}:{kind}"
+# ---- Job ID helpers (include date key) ----
+def job_id_med(pid: int, mid: int, ymd: str) -> str:
+    return f"med:{pid}:{mid}:{ymd}"
 
 
-def job_id_for_clarify(patient_id: int, kind: str, due_ts: int) -> str:
-    """One-off clarify nag job id."""
-    return f"clarify:{patient_id}:{kind}:{due_ts}"
+def job_id_med_nag(pid: int, mid: int, ymd: str) -> str:
+    return f"med_nag:{pid}:{mid}:{ymd}"
 
 
-def job_id_for_escalate(patient_id: int, kind: str, due_ts: int) -> str:
-    """One-off escalation check job id."""
-    return f"escalate:{patient_id}:{kind}:{due_ts}"
+def job_id_med_escalate(pid: int, mid: int, ymd: str) -> str:
+    return f"med_escalate:{pid}:{mid}:{ymd}"
+
+
+def job_id_bp_clarify(pid: int, ymd: str) -> str:
+    return f"bp_clarify:{pid}:{ymd}"
+
+
+def job_id_bp_escalate(pid: int, ymd: str) -> str:
+    return f"bp_escalate:{pid}:{ymd}"
 
 
 # ---- Validation helpers (fail fast) ----
@@ -94,36 +94,42 @@ def _unique(seq: List[str]) -> bool:
 
 
 def fail_fast_config() -> None:
-    # caregiver channel present
-    assert isinstance(CAREGIVER_CHAT_ID, int), "CAREGIVER_CHAT_ID must be an integer"
-    # defaults sane
+    errors: List[str] = []
+    if not isinstance(CAREGIVER_USER_ID, int):
+        errors.append("CAREGIVER_USER_ID must be an integer Telegram user id")
     for k in (
         "pill_nag_after_minutes",
         "pill_escalate_after_minutes",
         "bp_clarify_nag_after_minutes",
         "bp_escalate_after_minutes",
     ):
-        assert k in DEFAULTS and int(DEFAULTS[k]) > 0, (
-            f"DEFAULTS['{k}'] must be positive int"
-        )
-    # patients validate
-    assert isinstance(PATIENTS, dict) and PATIENTS, "PATIENTS must be a non-empty dict"
-    for pid, cfg in PATIENTS.items():
-        assert "group_chat_id" in cfg, f"patient {pid}: missing group_chat_id"
-        assert isinstance(cfg["group_chat_id"], int), (
-            f"patient {pid}: group_chat_id must be int"
-        )
-        times = cfg.get("pill_times_hhmm", [])
-        for t in times:
-            assert _is_hhmm(t), f"patient {pid}: bad HH:MM in pill_times_hhmm: {t}"
-        assert _unique(times), f"patient {pid}: duplicate values in pill_times_hhmm"
-        labels = cfg.get("labels", {})
-        weekday = labels.get("weekday", [])
-        assert len(weekday) == 7, f"patient {pid}: labels.weekday must have 7 items"
-        thr = labels.get("threshold_hhmm", "16:00")
-        assert _is_hhmm(thr), f"patient {pid}: labels.threshold_hhmm must be HH:MM"
-    # debug seconds if enabled
+        if k not in DEFAULTS or int(DEFAULTS[k]) <= 0:
+            errors.append(f"DEFAULTS['{k}'] must be positive int")
+    if not isinstance(PATIENTS, dict) or not PATIENTS:
+        errors.append("PATIENTS must be a non-empty dict")
+    else:
+        for pid, p in PATIENTS.items():
+            if "group_chat_id" not in p or not isinstance(p["group_chat_id"], int):
+                errors.append(f"patient {pid}: missing or invalid group_chat_id")
+            times = p.get("pill_times_hhmm", [])
+            for t in times:
+                if not _is_hhmm(t):
+                    errors.append(f"patient {pid}: bad HH:MM in pill_times_hhmm: {t}")
+            if not _unique(times):
+                errors.append(f"patient {pid}: duplicate values in pill_times_hhmm")
+            labels = p.get("labels", {})
+            weekday = labels.get("weekday", [])
+            if len(weekday) != 7:
+                errors.append(f"patient {pid}: labels.weekday must have 7 items")
+            thr = labels.get("threshold_hhmm", "16:00")
+            if not _is_hhmm(thr):
+                errors.append(f"patient {pid}: labels.threshold_hhmm must be HH:MM")
     if DEBUG_MODE:
-        assert DEBUG_NAG_SECONDS[0] > 0 and DEBUG_NAG_SECONDS[1] > 0, (
-            "DEBUG_NAG_SECONDS must be positive"
-        )
+        if (
+            len(DEBUG_NAG_SECONDS) != 2
+            or DEBUG_NAG_SECONDS[0] <= 0
+            or DEBUG_NAG_SECONDS[1] <= 0
+        ):
+            errors.append("DEBUG_NAG_SECONDS must be a tuple of two positive ints")
+    if errors:
+        raise AssertionError("Config errors:\n- " + "\n- ".join(errors))

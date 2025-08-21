@@ -64,3 +64,50 @@ def csv_append(
     ]
     with open(config.CSV_FILE, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(row)
+
+
+# ---- Thin helpers to reduce repetition ----
+def log_med(
+    *,
+    event: str,
+    patient_id: int,
+    med_id: Optional[int] = None,
+    due_at: Optional[datetime] = None,
+    action: Optional[str] = None,
+    text: Optional[str] = None,
+    tg_message_id: Optional[int] = None,
+) -> None:
+    group_chat_id = config.PATIENTS[patient_id]["group_chat_id"]
+    csv_append(
+        scenario="pill",
+        event=event,
+        patient_id=patient_id,
+        group_chat_id=group_chat_id,
+        med_id=med_id,
+        due_at=due_at,
+        action=action,
+        text=text,
+        tg_message_id=tg_message_id,
+    )
+
+
+def log_measure(
+    *,
+    event: str,
+    patient_id: int,
+    kind: str,
+    action: Optional[str] = None,
+    text: Optional[str] = None,
+    tg_message_id: Optional[int] = None,
+) -> None:
+    group_chat_id = config.PATIENTS[patient_id]["group_chat_id"]
+    csv_append(
+        scenario="measure",
+        event=event,
+        patient_id=patient_id,
+        group_chat_id=group_chat_id,
+        kind=kind,
+        action=action,
+        text=text,
+        tg_message_id=tg_message_id,
+    )

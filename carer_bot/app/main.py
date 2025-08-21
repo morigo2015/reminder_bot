@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import suppress
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Dict, Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType
@@ -17,25 +19,39 @@ from .events import SC_OTHER, EV_ACK
 from .policies import handle_patient_text, schedule_daily_jobs
 from .prompts import only_patient_can_write
 from .utils import format_kyiv, now_local
+from .ctx import AppCtx, set_ctx, get_ctx
 
-# Global bot for internal job handlers (lazy import workaround)
-BOT: Optional[Bot] = None
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Rate-limit moderation warnings: group_id -> last_sent_at
+_LAST_WARN_AT: Dict[int, datetime] = {}
+
+
+def _should_warn_group(group_id: int) -> bool:
+    last = _LAST_WARN_AT.get(group_id)
+    if not last:
+        return True
+    return now_local() - last >= timedelta(minutes=10)
+
+
+def _mark_warned(group_id: int) -> None:
+    _LAST_WARN_AT[group_id] = now_local()
 
 
 async def _setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=config.TZ)
-    await schedule_daily_jobs(scheduler)
+    await schedule_daily_jobs(scheduler, bot)
     scheduler.start()
-    # attach for job handlers
-    bot["scheduler"] = scheduler
     return scheduler
 
 
 async def start() -> None:
     config.fail_fast_config()
-    global BOT
-    BOT = Bot(token=config.BOT_TOKEN, parse_mode=None)
+    bot = Bot(token=config.BOT_TOKEN)  # no parse_mode tweaks
     dp = Dispatcher()
+    scheduler = await _setup_scheduler(bot)
+    set_ctx(AppCtx(bot=bot, scheduler=scheduler))
 
     # ---- Commands ----
     @dp.message(Command("status"))
@@ -43,31 +59,34 @@ async def start() -> None:
         now = format_kyiv(now_local())
         await msg.reply(f"OK {now} (Kyiv). Jobs active ✅")
 
+    @dp.message(Command("echo"))
+    async def cmd_echo(msg: Message):
+        # Handy for grabbing the real chat_id to paste into config.PATIENTS / CAREGIVER_CHAT_ID
+        await msg.reply(f"chat_id: {msg.chat.id}")
+
     # ---- Group moderation & routing ----
     @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
     async def on_group_message(msg: Message):
-        # Route only known patient messages; warn others
         pid = _find_patient_by_group(msg.chat.id)
-        if pid is None:
-            return  # unknown group, ignore
-        if msg.from_user is None:
+        if pid is None or msg.from_user is None or msg.from_user.is_bot:
             return
-        if msg.from_user.is_bot:
-            return
-        # Only patient should speak in the group (bot <-> patient). Others get a gentle warning.
-        if not _is_patient_user(pid, msg.from_user.id):
-            await msg.reply(only_patient_can_write())
+        # Optional strict check if patient_user_id is configured
+        expected_uid = config.PATIENTS[pid].get("patient_user_id")
+        if expected_uid is not None and msg.from_user.id != expected_uid:
+            if _should_warn_group(msg.chat.id):
+                await msg.reply(only_patient_can_write())
+                _mark_warned(msg.chat.id)
             return
         await handle_patient_text(
-            BOT,
-            BOT["scheduler"],
+            bot,
+            get_ctx().scheduler,
             patient_id=pid,
             text=msg.text or "",
             chat_id=msg.chat.id,
             tg_message_id=msg.message_id,
         )
 
-    # Fallback: any private messages (if used during PoC) → ack and ignore
+    # Fallback: any private messages → ack and ignore
     @dp.message(F.chat.type == ChatType.PRIVATE)
     async def on_private(msg: Message):
         csv_append(
@@ -79,27 +98,19 @@ async def start() -> None:
         )
         await msg.reply("Цей бот працює лише в приватній групі пацієнта.")
 
-    # ready
-    scheduler = await _setup_scheduler(BOT)
     try:
-        await dp.start_polling(BOT, handle_signals=False)
+        await dp.start_polling(bot, handle_signals=False)
     finally:
         with suppress(Exception):
             scheduler.shutdown(wait=False)
-        await BOT.session.close()
+        await bot.session.close()
 
 
 def _find_patient_by_group(group_chat_id: int) -> Optional[int]:
-    for pid, cfg in config.PATIENTS.items():
-        if cfg.get("group_chat_id") == group_chat_id:
+    for pid, p in config.PATIENTS.items():
+        if p.get("group_chat_id") == group_chat_id:
             return pid
     return None
-
-
-def _is_patient_user(patient_id: int, user_id: int) -> bool:
-    # MVP: any human in the group can type as "patient".
-    # If you want strict identity checks, store Telegram user_id per patient in config and validate here.
-    return True
 
 
 if __name__ == "__main__":
