@@ -1,59 +1,27 @@
 # app/regex_bank.py
 from __future__ import annotations
 import re
-from . import config
+from typing import Final
 
-# Compile confirmation pattern dynamically from lexicon
-_confirm_tokens = sorted(config.CONFIRM_OK, key=len, reverse=True)
-_CONFIRM_RE = re.compile(
-    r"(?i)\b(" + "|".join(map(re.escape, _confirm_tokens)) + r")\b"
+# Minimal, on-purpose.
+LABEL_PILL_NEGATE: Final[str] = "pill_negate"
+LABEL_OTHER: Final[str] = "other"
+
+_NEG_PAT = re.compile(r"\b(ні|не|нет|не\s+пив|не\s+прийм)\b", re.IGNORECASE)
+_OK_PAT = re.compile(
+    r"\b(так|ок|окей|прийняв|випив|принял|приняла|приняла)\b", re.IGNORECASE
 )
-
-# Negation phrases (minimal PoC set)
-_NEGATE_RE = re.compile(
-    r"(?i)\b(не\s*прийняв|не\s*прийняла|забув|забула|пропустив|пропустила|не\s*встиг|не\s*можу)\b"
-)
-
-# Legacy simple patterns (kept for fallback classification only)
-_BP_RE = re.compile(r"\b(\d{2,3})\s*[\/\-]\s*(\d{2,3})\b")
-_TEMP_RE = re.compile(r"(?i)\b(3[5-9](?:[.,]\d)?|4[0-2](?:[.,]\d)?)\s*°?\s*[cс]?\b")
-
-LABEL_PILL_TAKEN = "pill_taken_affirm"
-LABEL_PILL_NEGATE = "pill_taken_negation"
-LABEL_MEAS_BP = "measurement_bp"
-LABEL_MEAS_TEMP = "measurement_temp"
-LABEL_SYMPTOM = "symptom_report"
-LABEL_UNKNOWN = "unknown"
-
-
-def classify_text(text: str) -> str:
-    """
-    Returns one of LABEL_* constants.
-    Regex-only PoC classifier. Keep conservative.
-    """
-    if not text:
-        return LABEL_UNKNOWN
-    t = text.strip()
-
-    if _NEGATE_RE.search(t):
-        return LABEL_PILL_NEGATE
-
-    if _CONFIRM_RE.search(t):
-        return LABEL_PILL_TAKEN
-
-    if _BP_RE.search(t):
-        return LABEL_MEAS_BP
-
-    if _TEMP_RE.search(t):
-        return LABEL_MEAS_TEMP
-
-    # Fallback: treat as symptom report (free text), not strictly unknown
-    return LABEL_SYMPTOM
-
-
-def is_confirmation(text: str) -> bool:
-    return bool(_CONFIRM_RE.search(text or ""))
 
 
 def is_negation(text: str) -> bool:
-    return bool(_NEGATE_RE.search(text or ""))
+    return bool(_NEG_PAT.search(text))
+
+
+def is_confirmation(text: str) -> bool:
+    return bool(_OK_PAT.search(text))
+
+
+def classify_text(text: str) -> str:
+    # Keep it intentionally tiny: only one special label for pill negation.
+    # All else treated as "other" (symptom/free text).
+    return LABEL_PILL_NEGATE if is_negation(text) else LABEL_OTHER

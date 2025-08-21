@@ -1,96 +1,61 @@
 # app/prompts.py
-# Centralized UA strings (PoC). Matches Specs v2.1.
-
 from __future__ import annotations
+
 from datetime import datetime
+
 from . import config
+from .utils import format_kyiv
 
 
-# ---------- Group moderation ----------
-def only_patient_can_write(patient_name: str) -> str:
-    return f"Тільки {patient_name} може надсилати повідомлення в цю группу"
+# ---- Pill prompts ----
+def med_due(name: str, label_daypart: str) -> str:
+    return f"{name}, час прийняти ліки ({label_daypart}). Підтвердіть, будь ласка."
 
 
-# ---------- Pills ----------
-def pill_prompt(patient_name: str, label: str) -> str:
-    return f'Час прийняти ліки "{label}".'
+def med_nag(name: str) -> str:
+    return f"{name}, нагадування: підтвердіть, будь ласка, що ви прийняли ліки."
 
 
-def pill_nag(label: str) -> str:
-    return f'Нагадую: треба прийняти ліки "{label}".'
+def med_escalate_to_caregiver(patient_name: str, due_at: datetime) -> str:
+    return f"Ескалація: {patient_name} не підтвердив(ла) прийом ліків (на {format_kyiv(due_at)})."
 
 
-def pill_escalation(patient_name: str, due_dt: datetime, label: str) -> str:
-    due_str = due_dt.astimezone(config.TZ).strftime(config.DATETIME_FMT)
-    return f'Пацієнт {patient_name} пропустив прийом ліків, запланований на {due_str}. Мітка: "{label}".'
-
-
-def med_taken_photo_ack() -> str:
-    return "Дякую за фото. Запишу як прийнято."
-
-
-def med_taken_followup() -> str:
-    return "Чудово. Дякую."
-
-
-def ask_clarify_yes_no() -> str:
-    return "Не розчула. Ви прийняли ліки? (так/ні)"
-
-
-def voice_kindly_decline() -> str:
-    return "Будь ласка, напишіть коротко текстом."
-
-
-# ---------- Blood Pressure ----------
-def measure_bp_prompt(patient_name: str) -> str:
-    return (
-        f"{patient_name}, виміряйте тиск і пульс.\n"
-        f"Напишіть: <тип> <систолічний> <діастолічний> <пульс>.\n"
-        f"Напр.: швидко 125 62 51."
-    )
-
-
-def bp_clarify_missing_type() -> str:
-    return (
-        "Я не бачу тип вимірювання. Будь ласка, додайте його: "
-        "<тип> <систолічний> <діастолічний> <пульс>. "
-        "Напр.: швидко 125 62 51."
-    )
-
-
-def bp_clarify_two_numbers() -> str:
-    return (
-        "Потрібно три числа (тиск систолічний, діастолічний і пульс) та тип. "
-        "Напр.: довго 127 61 52."
-    )
-
-
-def bp_clarify_unknown_type(canonical_types: list[str]) -> str:
-    opts = ", ".join(canonical_types)
-    return f"Не розпізнав(ла) тип. Доступні: {opts}. Напр.: швидко 125 62 51."
-
-
-def bp_clarify_bad_order() -> str:
-    return "Тип має бути на початку або в кінці. Приклад: швидко 125 62 51."
-
-
-def bp_clarify_nag() -> str:
-    return "Нагадую: надішліть, будь ласка, <тип> <систолічний> <діастолічний> <пульс>."
-
-
-def bp_out_of_range_alert(
-    patient_name: str, sys: int, dia: int, pulse: int, bp_type: str
-) -> str:
-    return (
-        f'Алерт: {patient_name} повідомив(ла) АТ {sys}/{dia}, пульс {pulse}, тип "{bp_type}". '
-        f"За межами належних меж."
-    )
-
-
-# Generic
 def ok_ack() -> str:
-    return "Гаразд."
+    return "Дякую, зафіксовано ✅"
 
 
 def sorry_ack() -> str:
-    return "Розумію."
+    return "Добре, зафіксував(ла) ❎"
+
+
+# ---- BP prompts ----
+def measure_bp_due(name: str) -> str:
+    return f"{name}, час виміряти тиск сьогодні. Відправте «систолічний, діастолічний, пульс»."
+
+
+def clarify_bp() -> str:
+    return "Не бачу трьох чисел для тиску. Відправте, будь ласка: «систолічний, діастолічний, пульс»."
+
+
+def clarify_nag() -> str:
+    return "Нагадування: надішліть три числа тиску, будь ласка."
+
+
+def bp_recorded_ack(syst: int, diast: int, pulse: int) -> str:
+    return f"Записав(ла) тиск: {syst}/{diast}, пульс {pulse}."
+
+
+def bp_escalate_to_caregiver(patient_name: str) -> str:
+    return f"Ескалація: {patient_name} не надіслав(ла) коректні дані тиску."
+
+
+# ---- Group moderation ----
+def only_patient_can_write() -> str:
+    # fixed wording: "цю групу"
+    return "Будь ласка, не пишіть у цю групу. Тут спілкуються лише пацієнт і бот."
+
+
+# ---- Misc helpers ----
+def label_daypart(threshold_hhmm: str, when: datetime) -> str:
+    hhmm = when.astimezone(config.TZ).strftime("%H:%M")
+    return "ранок" if hhmm < threshold_hhmm else "вечір"
