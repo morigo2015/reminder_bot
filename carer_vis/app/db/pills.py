@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 from datetime import date
 from app.db.pool import pool
 
+
 async def upsert_reminder(patient_id: str, d: date, dose: str, label: str) -> None:
     sql = (
         "INSERT INTO pills_day (patient_id, date_kyiv, dose, label, reminder_ts) "
@@ -25,7 +26,9 @@ async def has_reminder_row(patient_id: str, d: date, dose: str) -> bool:
             return bool(row and row[0])
 
 
-async def set_confirm_if_empty(patient_id: str, d: date, dose: str, via: str) -> Tuple[bool, Optional[str], bool]:
+async def set_confirm_if_empty(
+    patient_id: str, d: date, dose: str, via: str
+) -> Tuple[bool, Optional[str], bool]:
     """Return (changed, label, was_escalated)
     changed=True if confirm_ts was written now.
     """
@@ -45,11 +48,24 @@ async def set_confirm_if_empty(patient_id: str, d: date, dose: str, via: str) ->
                 await cur.execute(sql_upd, (via, patient_id, d, dose))
                 changed = cur.rowcount > 0
                 return changed, label, escalated_ts is not None
-            else:
-                return False, label, escalated_ts is not None
 
 
-async def latest_unconfirmed(patient_id: str, today: date) -> Optional[Tuple[date, str]]:
+async def get_state(patient_id: str, d: date, dose: str):
+    """
+    Return (reminder_ts, confirm_ts) or None if row doesn't exist.
+    Used by ticker to decide repeat eligibility (must still be unconfirmed,
+    and enough time since initial reminder).
+    """
+    sql = "SELECT reminder_ts, confirm_ts FROM pills_day WHERE patient_id=%s AND date_kyiv=%s AND dose=%s"
+    async with pool().acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(sql, (patient_id, d, dose))
+            return await cur.fetchone()
+
+
+async def latest_unconfirmed(
+    patient_id: str, today: date
+) -> Optional[Tuple[date, str]]:
     """Find latest unconfirmed: prefer today, else previous day(s). Returns (date, dose)."""
     async with pool().acquire() as conn:
         async with conn.cursor() as cur:

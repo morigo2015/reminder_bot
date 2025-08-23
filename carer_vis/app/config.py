@@ -5,15 +5,15 @@ from datetime import time
 TZ = ZoneInfo("Europe/Kyiv")
 
 # --- Telegram (temporary: keep here per spec) ---
-BOT_TOKEN = "<TELEGRAM_BOT_TOKEN>"
-NURSE_CHAT_ID = 111111111  # private chat id
+BOT_TOKEN = "550433191:AAFkG6atLs_uo0nwphtuiwbwIJeUhwfzCyI"
+NURSE_CHAT_ID = 7391874317  # private chat id
 
 # --- MySQL connection ---
 DB = {
     "host": "127.0.0.1",
     "port": 3306,
-    "user": "carer",
-    "password": "change_me",
+    "user": "igor",
+    "password": "1",
     "db": "carer",
 }
 
@@ -28,15 +28,15 @@ SWEEP_SECONDS = 300
 PATIENTS = [
     {
         "id": "alice",
-        "chat_id": 123456789,
+        "chat_id": 382163513,
         "name": "Аліса",
         "pills": {
             "times": {
                 "morning": time(8, 0, tzinfo=TZ),
-                "evening": time(20, 0, tzinfo=TZ),
+                "evening": time(23, 36, tzinfo=TZ),
             },
-            "repeat_min": 10,              # per-patient override
-            "confirm_window_min": 25,      # per-patient override
+            "repeat_min": 10,  # per-patient override
+            "confirm_window_min": 25,  # per-patient override
         },
         "bp": {
             "time": time(9, 0, tzinfo=TZ),
