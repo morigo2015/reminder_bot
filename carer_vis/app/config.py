@@ -20,6 +20,7 @@ DB = {
 # --- Defaults (can be overridden per patient) ---
 DEFAULT_REPEAT_REMINDER_MIN = 10
 DEFAULT_CONFIRM_WINDOW_MIN = 25
+DEFAULT_INITIAL_SEND_GRACE_MIN = 5  # global grace, keep it simple
 TICK_SECONDS = 60
 SWEEP_SECONDS = 300
 
@@ -32,15 +33,15 @@ PATIENTS = [
         "name": "Аліса",
         "pills": {
             "times": {
-                "morning": time(8, 0, tzinfo=TZ),
+                "morning": time(2, 9, tzinfo=TZ),
                 "evening": time(23, 36, tzinfo=TZ),
             },
-            "repeat_min": 10,  # per-patient override
-            "confirm_window_min": 25,  # per-patient override
+            "repeat_min": 2,  # per-patient override
+            "confirm_window_min": 8,  # per-patient override
         },
         "bp": {
-            "time": time(9, 0, tzinfo=TZ),
-            "safe_ranges": {"sys": (90, 150), "dia": (60, 95), "pulse": (45, 110)},
+            "time": time(0, 25, tzinfo=TZ),
+            "safe_ranges": {"sys": (80, 170), "dia": (50, 110), "pulse": (40, 180)},
         },
     },
 ]

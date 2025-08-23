@@ -1,12 +1,22 @@
+# app/db/bp.py
 from __future__ import annotations
-from typing import Optional
-from app.db.pool import pool
+from sqlalchemy import insert, func
+from app.db.session import engine
+from app.db.models import bp_readings
 
-async def insert_reading(patient_id: str, side: str, sys_v: int, dia_v: int, pulse_v: int, out_of_range: bool) -> None:
-    sql = (
-        "INSERT INTO bp_readings (patient_id, ts_utc, side, sys, dia, pulse, flags) "
-        "VALUES (%s, UTC_TIMESTAMP(), %s, %s, %s, %s, IF(%s, 'out_of_range', NULL))"
+
+async def insert_reading(
+    patient_id: str, side: str, sys_v: int, dia_v: int, pulse_v: int, out_of_range: bool
+) -> None:
+    flags = "out_of_range" if out_of_range else None
+    stmt = insert(bp_readings).values(
+        patient_id=patient_id,
+        ts_utc=func.utc_timestamp(),
+        side=side,
+        sys=sys_v,
+        dia=dia_v,
+        pulse=pulse_v,
+        flags=flags,
     )
-    async with pool().acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(sql, (patient_id, side, sys_v, dia_v, pulse_v, out_of_range))
+    async with engine().begin() as conn:
+        await conn.execute(stmt)

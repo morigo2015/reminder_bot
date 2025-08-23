@@ -6,16 +6,13 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from app import config
-from app.db.pool import init_pool
 from app.bot.handlers import router
 from app.logic import ticker, sweeper
 from app.db.patients import upsert_patient
 
 
 async def main():
-    await init_pool()
-
-    # Seed patients so FKs are satisfied
+    # Seed patients so FKs are satisfied (SQLAlchemy engine is lazy-initialized)
     for p in config.PATIENTS:
         await upsert_patient(p["id"], p["chat_id"], p["name"])
 
@@ -25,9 +22,8 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Use the loop helpers already in your repo
-    t1 = asyncio.create_task(ticker_loop(bot))  # <— defined below
-    t2 = asyncio.create_task(sweeper_loop(bot))  # <— defined below
+    t1 = asyncio.create_task(ticker_loop(bot))
+    t2 = asyncio.create_task(sweeper_loop(bot))
 
     try:
         await dp.start_polling(bot)
@@ -42,7 +38,7 @@ async def main():
 async def ticker_loop(bot: Bot):
     while True:
         try:
-            await ticker.tick(bot)  # tick exists
+            await ticker.tick(bot)
         except Exception as e:
             print({"level": "error", "action": "ticker", "exception": str(e)})
         await asyncio.sleep(config.TICK_SECONDS)
@@ -51,7 +47,7 @@ async def ticker_loop(bot: Bot):
 async def sweeper_loop(bot: Bot):
     while True:
         try:
-            await sweeper.sweep(bot)  # sweep exists
+            await sweeper.sweep(bot)
         except Exception as e:
             print({"level": "error", "action": "sweeper", "exception": str(e)})
         await asyncio.sleep(config.SWEEP_SECONDS)
