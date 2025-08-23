@@ -15,8 +15,15 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 from . import config, prompts
-from .csvlog import log_med, log_measure, log_pills_detail, log_pressure_detail
+from .csvlog import (
+    csv_append,
+    log_med,
+    log_measure,
+    log_pills_detail,
+    log_pressure_detail,
+)
 from .events import (
+    SC_OTHER,
     EV_ACK,
     EV_ACK_NEG,
     EV_CLARIFY_NAG,
@@ -57,8 +64,15 @@ MED_STATE: Dict[int, Dict[int, Dict[str, DoseState]]] = {}
 # patient_id -> kind -> yyyymmdd -> MeasureState
 MEASURE_STATE: Dict[int, Dict[str, Dict[str, MeasureState]]] = {}
 
+# Existing BP intent heuristics (kept for clarify flow)
 BP_WORDS = ("тиск", "систол", "діастол", "пульс", "ат")
 _BP_3NUM = re.compile(r"(?P<s>\d{2,3}).*?(?P<d>\d{2,3}).*?(?P<p>\d{2,3})")
+# New strict patterns for typed BP and bare 3 numbers
+_TYPE_AND_3NUM_RE = re.compile(
+    r"^\s*([^\W\d_]+)\s+(\d{2,3})\s+(\d{2,3})\s+(\d{2,3})(?:\D|$)",
+    re.UNICODE,
+)
+_ONLY_3NUM_RE = re.compile(r"^\s*(\d{2,3})\s+(\d{2,3})\s+(\d{2,3})\s*$")
 
 
 # ---- Helpers ----
@@ -120,18 +134,6 @@ def _cancel_jobs_for_pill(pid: int, mid: int, ymd: str) -> None:
         ctx.scheduler.remove_job(config.job_id_med_escalate(pid, mid, ymd))
 
 
-async def _chat_exists(bot: Bot, chat_id: int) -> bool:
-    try:
-        await bot.get_chat(chat_id)
-        return True
-    except TelegramBadRequest as e:
-        logger.error("Chat verification failed for chat_id=%s: %s", chat_id, e)
-        return False
-    except Exception as e:
-        logger.exception("Unexpected error verifying chat_id=%s: %s", chat_id, e)
-        return False
-
-
 # ---- Scheduling entrypoints ----
 async def schedule_daily_jobs(scheduler: AsyncIOScheduler, bot: Bot) -> None:
     """
@@ -139,20 +141,26 @@ async def schedule_daily_jobs(scheduler: AsyncIOScheduler, bot: Bot) -> None:
     Patients with invalid group_chat_id are skipped (logged).
     """
     # Verify caregiver user once (direct messages)
-    if not await _chat_exists(bot, config.CAREGIVER_USER_ID):
+    try:
+        await bot.get_chat(config.CAREGIVER_USER_ID)
+    except TelegramBadRequest as e:
         logger.error(
             "CAREGIVER_USER_ID=%s is invalid or the caregiver hasn't started the bot. "
-            "Direct-message escalations will fail until the caregiver starts the bot.",
+            "Direct-message escalations will fail until the caregiver starts the bot. Error: %s",
             config.CAREGIVER_USER_ID,
+            e,
         )
 
     for pid, p in config.PATIENTS.items():
         group_id = p.get("group_chat_id")
-        if not await _chat_exists(bot, group_id):
+        try:
+            await bot.get_chat(group_id)
+        except TelegramBadRequest as e:
             logger.error(
-                "Skipping scheduling for patient %s (invalid group_chat_id=%s).",
+                "Skipping scheduling for patient %s (invalid group_chat_id=%s): %s",
                 pid,
                 group_id,
+                e,
             )
             continue
 
@@ -342,21 +350,22 @@ async def handle_patient_text(
 ) -> None:
     pid = patient_id
     p = config.PATIENTS[pid]
+    t = (text or "").strip()
 
     # 1) Pill confirm/negate
-    label = classify_text(text)
+    label = classify_text(t)
     if label == LABEL_PILL_NEGATE:
         msg = await bot.send_message(chat_id, prompts.sorry_ack())
         log_med(
             event=EV_ACK_NEG,
             patient_id=pid,
             action="ack_negation",
-            text=text,
+            text=t,
             tg_message_id=msg.message_id,
         )
         return
 
-    if is_confirmation(text):
+    if is_confirmation(t):
         # confirm latest unconfirmed *today*
         ymd = today_key()
         latest: Optional[Tuple[int, DoseState]] = None
@@ -380,7 +389,7 @@ async def handle_patient_text(
                 patient_id=pid,
                 med_id=mid,
                 due_at=st.due_at,
-                text=text,
+                text=t,
                 tg_message_id=msg.message_id,
             )
             # Detail pills log
@@ -391,8 +400,8 @@ async def handle_patient_text(
                 patient_id=pid, label=st.label or "", nags=st.nags, result=result_status
             )
             # If was escalated earlier, politely notify caregiver that it’s resolved
-            if st.escalated:
-                with suppress(TelegramBadRequest):
+            with suppress(TelegramBadRequest):
+                if st.escalated:
                     await bot.send_message(
                         config.CAREGIVER_USER_ID,
                         prompts.caregiver_confirmed_after_escalation(
@@ -406,48 +415,110 @@ async def handle_patient_text(
             event=EV_ACK,
             patient_id=pid,
             action="no_pending",
-            text=text,
+            text=t,
             tg_message_id=msg.message_id,
         )
         return
 
-    # 2) BP flow (3 numbers or clarify)
-    ymd = today_key()
-    ms = _get_measure_state(pid, BP_KIND, ymd)
-    text_l = (text or "").lower()
-    bp_intent = any(w in text_l for w in BP_WORDS) or ms.clarify_started_at is not None
-    nums = _BP_3NUM.search(text) if bp_intent else None
-
-    if bp_intent:
-        if nums:
-            s, d, pval = (
-                int(nums.group("s")),
-                int(nums.group("d")),
-                int(nums.group("p")),
-            )
+    # 2) BP strict typed path FIRST (must start with <letters> then three numbers)
+    m = _TYPE_AND_3NUM_RE.match(t)
+    if m:
+        type_token, s_sys, s_dia, s_pulse = m.groups()
+        canon = config.canonicalize_bp_type(type_token)
+        if canon:
+            s, d, pval = int(s_sys), int(s_dia), int(s_pulse)
             action = None
             if s < d:
                 s, d = d, s
                 action = "auto_swapped"
+            ymd = today_key()
+            ms = _get_measure_state(pid, BP_KIND, ymd)
             ms.last_measured_on = now_local().date()
             ms.clarify_started_at = None
-            # Improved BP ack with label (morning/evening by threshold)
-            bp_label = prompts.label_daypart(p["labels"]["threshold_hhmm"], now_local())
+            # Ack with TYPE (not daypart)
             msg = await bot.send_message(
-                chat_id, prompts.bp_recorded_ack_with_label(bp_label, s, d, pval)
+                chat_id, prompts.bp_recorded_ack_with_type(canon, s, d, pval)
             )
-            # Standard events log + detail pressure log
             log_measure(
                 event=EV_BP_RECORDED,
                 patient_id=pid,
                 kind=BP_KIND,
                 action=action,
-                text=f"{s}/{d} {pval}",
+                text=f"{canon} {s}/{d} {pval}",
                 tg_message_id=msg.message_id,
             )
-            log_pressure_detail(patient_id=pid, sys=s, dia=d, pulse=pval)
+            log_pressure_detail(patient_id=pid, sys=s, dia=d, pulse=pval, type_=canon)
+            # cleanup clarify/escalate jobs if any
+            with suppress(Exception):
+                get_ctx().scheduler.remove_job(config.job_id_bp_clarify(pid, ymd))
+            with suppress(Exception):
+                get_ctx().scheduler.remove_job(config.job_id_bp_escalate(pid, ymd))
             return
-        # enter/continue clarify
+        # leading token present but unknown → ask to retry with correct type
+        msg = await bot.send_message(chat_id, prompts.bp_need_type_retry())
+        log_measure(
+            event=EV_CLARIFY_REQUIRED,
+            patient_id=pid,
+            kind=BP_KIND,
+            action="unknown_bp_type",
+            tg_message_id=msg.message_id,
+        )
+        return
+
+    # If message is exactly three numbers → reject and ask for typed format
+    if _ONLY_3NUM_RE.match(t):
+        msg = await bot.send_message(chat_id, prompts.bp_need_type_retry())
+        log_measure(
+            event=EV_CLARIFY_REQUIRED,
+            patient_id=pid,
+            kind=BP_KIND,
+            action="bp_missing_type",
+            tg_message_id=msg.message_id,
+        )
+        return
+
+    # 3) Legacy BP flow gate (keywords/clarify), but DO NOT accept numbers-only here
+    ymd = today_key()
+    ms = _get_measure_state(pid, BP_KIND, ymd)
+    text_l = t.lower()
+    bp_intent = any(w in text_l for w in BP_WORDS) or ms.clarify_started_at is not None
+    nums = _BP_3NUM.search(t) if bp_intent else None
+
+    if bp_intent:
+        if nums:
+            # We have numbers under BP intent but no leading type → require typed format
+            msg = await bot.send_message(chat_id, prompts.bp_need_type_retry())
+            first_time = ms.clarify_started_at is None
+            ms.clarify_started_at = ms.clarify_started_at or now_local()
+            log_measure(
+                event=EV_CLARIFY_REQUIRED,
+                patient_id=pid,
+                kind=BP_KIND,
+                action="bp_missing_type_under_intent",
+                tg_message_id=msg.message_id,
+            )
+            if first_time:
+                # schedule clarify nag(s)
+                run_at = now_local() + _clarify_nag_delta(pid)
+                scheduler.add_job(
+                    _on_clarify_nag,
+                    DateTrigger(run_date=run_at),
+                    id=config.job_id_bp_clarify(pid, ymd),
+                    args=[pid, BP_KIND, ymd],
+                    replace_existing=True,
+                )
+                # schedule escalation
+                esc_at = ms.clarify_started_at + _bp_escalate_after(pid)
+                scheduler.add_job(
+                    _on_bp_escalate,
+                    DateTrigger(run_date=esc_at),
+                    id=config.job_id_bp_escalate(pid, ymd),
+                    args=[pid, BP_KIND, ymd],
+                    replace_existing=True,
+                )
+            return
+
+        # enter/continue clarify (no numbers)
         first_time = ms.clarify_started_at is None
         ms.clarify_started_at = now_local()
         msg = await bot.send_message(chat_id, prompts.clarify_bp())
@@ -479,25 +550,32 @@ async def handle_patient_text(
             )
         return
 
-    # 3) Everything else → simple ack
+    # 4) Everything else → simple ack, but log under SC_OTHER (not 'measure')
     msg = await bot.send_message(chat_id, prompts.ok_ack())
-    log_measure(
+    csv_append(
+        scenario=SC_OTHER,
         event=EV_ACK,
         patient_id=pid,
-        kind=BP_KIND,
-        text=text,
+        group_chat_id=p["group_chat_id"],
+        text=t,
         tg_message_id=msg.message_id,
     )
 
 
-# ---- Clarify & escalate helpers ----
+# ---- BP clarify follow-ups (ADDED to fix Ruff F821) ----
 async def _on_clarify_nag(pid: int, kind: str, ymd: str) -> None:
+    """
+    Send a clarify nag in the group if clarify is still active and no valid BP was received.
+    """
     ctx = get_ctx()
     bot = ctx.bot
     p = config.PATIENTS[pid]
     ms = _get_measure_state(pid, kind, ymd)
-    if ms.clarify_started_at is None:
+
+    # If measurement was recorded today or clarify not active anymore, skip.
+    if ms.last_measured_on == now_local().date() or ms.clarify_started_at is None:
         return
+
     try:
         msg = await bot.send_message(p["group_chat_id"], prompts.clarify_nag())
         log_measure(
@@ -516,27 +594,42 @@ async def _on_clarify_nag(pid: int, kind: str, ymd: str) -> None:
 
 
 async def _on_bp_escalate(pid: int, kind: str, ymd: str) -> None:
+    """
+    Escalate BP clarify failure to caregiver via direct message.
+    Also cancels pending clarify/escalation jobs for the day.
+    """
     ctx = get_ctx()
     bot = ctx.bot
     p = config.PATIENTS[pid]
     ms = _get_measure_state(pid, kind, ymd)
-    if ms.clarify_started_at is None:
+
+    # If measurement recorded or clarify not active, do nothing.
+    if ms.last_measured_on == now_local().date() or ms.clarify_started_at is None:
         return
+
     try:
         await bot.send_message(
-            config.CAREGIVER_USER_ID, prompts.bp_escalate_to_caregiver(p["name"])
+            config.CAREGIVER_USER_ID,
+            prompts.bp_escalate_to_caregiver(p["name"]),
         )
         log_measure(
             event=EV_ESCALATED,
             patient_id=pid,
             kind=kind,
-            action="bp_missing_or_invalid",
+            action="bp_clarify_failed",
         )
+        # stop clarify for today
+        ms.clarify_started_at = None
     except TelegramBadRequest as e:
         logger.error(
-            "Failed to DM caregiver user_id=%s for BP escalation (pid=%s). "
-            "Likely the caregiver hasn't started the bot. Error: %s",
+            "Failed to DM caregiver user_id=%s for BP escalation (pid=%s). Error: %s",
             config.CAREGIVER_USER_ID,
             pid,
             e,
         )
+
+    # Cleanup any pending jobs for clarity/escalation
+    with suppress(Exception):
+        ctx.scheduler.remove_job(config.job_id_bp_clarify(pid, ymd))
+    with suppress(Exception):
+        ctx.scheduler.remove_job(config.job_id_bp_escalate(pid, ymd))

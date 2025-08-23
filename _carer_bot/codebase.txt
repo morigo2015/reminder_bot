@@ -1,0 +1,1182 @@
+### FILE: ./app/config.py
+# app/config.py
+from __future__ import annotations
+
+from typing import Dict, List, Tuple
+from zoneinfo import ZoneInfo
+
+# ---- Core settings (PoC) ----
+TZ = ZoneInfo("Europe/Kyiv")
+DATETIME_FMT = "%Y-%m-%d %H:%M"
+
+# For PoC we keep these here.
+BOT_TOKEN = "550433191:AAFkG6atLs_uo0nwphtuiwbwIJeUhwfzCyI"
+
+# Caregiver escalation is now a DIRECT MESSAGE to this user id
+# (the caregiver must have started the bot at least once)
+CAREGIVER_USER_ID = 7391874317  # Telegram user id
+
+# Logging
+LOG_DIR = "./logs"
+CSV_FILE = f"{LOG_DIR}/events.csv"
+
+# Debug
+DEBUG_MODE: bool = True
+# When DEBUG_MODE=True, nags (pill + clarify) honor seconds (fast loops for tests)
+DEBUG_NAG_SECONDS: Tuple[int, int] = (8, 15)  # (pill_nag, clarify_nag)
+
+# ---- Defaults (overridable per patient) ----
+DEFAULTS: Dict[str, int] = {
+    "pill_nag_after_minutes": 15,
+    "pill_escalate_after_minutes": 1,  # 60,
+    "bp_clarify_nag_after_minutes": 20,
+    "bp_escalate_after_minutes": 60,
+}
+
+# ---- Patients (PoC) ----
+PATIENTS: Dict[int, Dict] = {
+    1: {
+        "name": "Надія Микитівна",
+        "group_chat_id": -1002690368389,
+        "pill_times_hhmm": ["22:39", "20:00"],
+        # Optional: restrict who can post as the patient (Telegram user id)
+        # "patient_user_id": 123456789,
+        "labels": {
+            "weekday": ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"],
+            "daypart": {
+                "morning": "ранок",
+                "evening": "вечір",
+            },
+            "threshold_hhmm": "16:00",
+        },
+    },
+}
+
+
+# ---- Helper: config access ----
+def cfg(pid: int, key: str, default_key: str) -> int:
+    """Uniform per-patient minutes lookup with project defaults."""
+    return int(PATIENTS[pid].get(key, DEFAULTS[default_key]))
+
+
+# ---- Job ID helpers (include date key) ----
+def job_id_med(pid: int, mid: int, ymd: str) -> str:
+    return f"med:{pid}:{mid}:{ymd}"
+
+
+def job_id_med_nag(pid: int, mid: int, ymd: str) -> str:
+    return f"med_nag:{pid}:{mid}:{ymd}"
+
+
+def job_id_med_escalate(pid: int, mid: int, ymd: str) -> str:
+    return f"med_escalate:{pid}:{mid}:{ymd}"
+
+
+def job_id_bp_clarify(pid: int, ymd: str) -> str:
+    return f"bp_clarify:{pid}:{ymd}"
+
+
+def job_id_bp_escalate(pid: int, ymd: str) -> str:
+    return f"bp_escalate:{pid}:{ymd}"
+
+
+# ---- Validation helpers (fail fast) ----
+def _is_hhmm(s: str) -> bool:
+    if len(s) != 5 or s[2] != ":":
+        return False
+    hh, mm = s.split(":")
+    return hh.isdigit() and mm.isdigit() and 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59
+
+
+def _unique(seq: List[str]) -> bool:
+    return len(seq) == len(set(seq))
+
+
+def fail_fast_config() -> None:
+    errors: List[str] = []
+    if not isinstance(CAREGIVER_USER_ID, int):
+        errors.append("CAREGIVER_USER_ID must be an integer Telegram user id")
+    for k in (
+        "pill_nag_after_minutes",
+        "pill_escalate_after_minutes",
+        "bp_clarify_nag_after_minutes",
+        "bp_escalate_after_minutes",
+    ):
+        if k not in DEFAULTS or int(DEFAULTS[k]) <= 0:
+            errors.append(f"DEFAULTS['{k}'] must be positive int")
+    if not isinstance(PATIENTS, dict) or not PATIENTS:
+        errors.append("PATIENTS must be a non-empty dict")
+    else:
+        for pid, p in PATIENTS.items():
+            if "group_chat_id" not in p or not isinstance(p["group_chat_id"], int):
+                errors.append(f"patient {pid}: missing or invalid group_chat_id")
+            times = p.get("pill_times_hhmm", [])
+            for t in times:
+                if not _is_hhmm(t):
+                    errors.append(f"patient {pid}: bad HH:MM in pill_times_hhmm: {t}")
+            if not _unique(times):
+                errors.append(f"patient {pid}: duplicate values in pill_times_hhmm")
+            labels = p.get("labels", {})
+            weekday = labels.get("weekday", [])
+            if len(weekday) != 7:
+                errors.append(f"patient {pid}: labels.weekday must have 7 items")
+            thr = labels.get("threshold_hhmm", "16:00")
+            if not _is_hhmm(thr):
+                errors.append(f"patient {pid}: labels.threshold_hhmm must be HH:MM")
+    if DEBUG_MODE:
+        if (
+            len(DEBUG_NAG_SECONDS) != 2
+            or DEBUG_NAG_SECONDS[0] <= 0
+            or DEBUG_NAG_SECONDS[1] <= 0
+        ):
+            errors.append("DEBUG_NAG_SECONDS must be a tuple of two positive ints")
+    if errors:
+        raise AssertionError("Config errors:\n- " + "\n- ".join(errors))
+
+
+### FILE: ./app/csvlog.py
+# app/csvlog.py
+from __future__ import annotations
+
+import csv
+from datetime import datetime
+from typing import Optional
+
+from . import config
+from .utils import ensure_dir, format_kyiv
+
+_HEADER = [
+    "ts_local",
+    "tz",
+    "scenario",
+    "event",
+    "patient_id",
+    "group_chat_id",
+    "med_id",
+    "kind",
+    "due_at",
+    "action",
+    "text",
+    "tg_message_id",
+]
+
+# Detail logs (per request)
+_PILLS_DETAIL_FILE = f"{config.LOG_DIR}/pills_detail.csv"
+_PILLS_DETAIL_HEADER = ["date", "time", "patient_id", "label", "nags", "result"]
+
+_PRESSURE_DETAIL_FILE = f"{config.LOG_DIR}/pressure_detail.csv"
+_PRESSURE_DETAIL_HEADER = ["type", "date", "time", "patient_id", "sys", "dia", "pulse"]
+
+
+def _ensure_file():
+    ensure_dir(config.LOG_DIR)
+    try:
+        with open(config.CSV_FILE, "x", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(_HEADER)
+    except FileExistsError:
+        pass
+
+
+def _ensure_detail_files():
+    ensure_dir(config.LOG_DIR)
+    try:
+        with open(_PILLS_DETAIL_FILE, "x", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(_PILLS_DETAIL_HEADER)
+    except FileExistsError:
+        pass
+    try:
+        with open(_PRESSURE_DETAIL_FILE, "x", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(_PRESSURE_DETAIL_HEADER)
+    except FileExistsError:
+        pass
+
+
+def csv_append(
+    *,
+    scenario: str,
+    event: str,
+    patient_id: int,
+    group_chat_id: int,
+    med_id: Optional[int] = None,
+    kind: Optional[str] = None,
+    due_at: Optional[datetime] = None,
+    action: Optional[str] = None,
+    text: Optional[str] = None,
+    tg_message_id: Optional[int] = None,
+) -> None:
+    _ensure_file()
+    row = [
+        format_kyiv(datetime.now(config.TZ)),
+        "Europe/Kyiv",
+        scenario,
+        event,
+        patient_id,
+        group_chat_id,
+        "" if med_id is None else med_id,
+        "" if kind is None else kind,
+        "" if due_at is None else format_kyiv(due_at),
+        "" if action is None else action,
+        "" if text is None else text,
+        "" if tg_message_id is None else tg_message_id,
+    ]
+    with open(config.CSV_FILE, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(row)
+
+
+# ---- Thin helpers to reduce repetition ----
+def log_med(
+    *,
+    event: str,
+    patient_id: int,
+    med_id: Optional[int] = None,
+    due_at: Optional[datetime] = None,
+    action: Optional[str] = None,
+    text: Optional[str] = None,
+    tg_message_id: Optional[int] = None,
+) -> None:
+    group_chat_id = config.PATIENTS[patient_id]["group_chat_id"]
+    csv_append(
+        scenario="pill",
+        event=event,
+        patient_id=patient_id,
+        group_chat_id=group_chat_id,
+        med_id=med_id,
+        due_at=due_at,
+        action=action,
+        text=text,
+        tg_message_id=tg_message_id,
+    )
+
+
+def log_measure(
+    *,
+    event: str,
+    patient_id: int,
+    kind: str,
+    action: Optional[str] = None,
+    text: Optional[str] = None,
+    tg_message_id: Optional[int] = None,
+) -> None:
+    group_chat_id = config.PATIENTS[patient_id]["group_chat_id"]
+    csv_append(
+        scenario="measure",
+        event=event,
+        patient_id=patient_id,
+        group_chat_id=group_chat_id,
+        kind=kind,
+        action=action,
+        text=text,
+        tg_message_id=tg_message_id,
+    )
+
+
+# ---- Detail logs (new) ----
+def log_pills_detail(*, patient_id: int, label: str, nags: int, result: str) -> None:
+    _ensure_detail_files()
+    now = datetime.now(config.TZ)
+    with open(_PILLS_DETAIL_FILE, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(
+            [
+                now.strftime("%Y-%m-%d"),
+                now.strftime("%H:%M"),
+                patient_id,
+                label,
+                nags,
+                result,
+            ]
+        )
+
+
+def log_pressure_detail(
+    *, patient_id: int, sys: int, dia: int, pulse: int, type_: str = "bp"
+) -> None:
+    _ensure_detail_files()
+    now = datetime.now(config.TZ)
+    with open(_PRESSURE_DETAIL_FILE, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(
+            [
+                type_,
+                now.strftime("%Y-%m-%d"),
+                now.strftime("%H:%M"),
+                patient_id,
+                sys,
+                dia,
+                pulse,
+            ]
+        )
+
+
+### FILE: ./app/ctx.py
+# app/ctx.py
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
+from aiogram import Bot
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+
+@dataclass
+class AppCtx:
+    bot: Bot
+    scheduler: AsyncIOScheduler
+
+
+_CTX: Optional[AppCtx] = None
+
+
+def set_ctx(ctx: AppCtx) -> None:
+    global _CTX
+    _CTX = ctx
+
+
+def get_ctx() -> AppCtx:
+    if _CTX is None:
+        raise RuntimeError("App context is not initialized")
+    return _CTX
+
+
+### FILE: ./app/events.py
+# app/events.py
+from __future__ import annotations
+from typing import Literal
+
+# CSV "scenario" values
+SC_MED: Literal["pill"] = "pill"
+SC_MEASURE: Literal["measure"] = "measure"
+SC_OTHER: Literal["other"] = "other"
+
+# CSV "event" values
+EV_DUE: Literal["due_sent"] = "due_sent"
+EV_NAG: Literal["nag_sent"] = "nag_sent"
+EV_CONFIRMED: Literal["confirmed"] = "confirmed"
+EV_ESCALATED: Literal["escalated"] = "escalated"
+EV_CLARIFY_REQUIRED: Literal["clarify_required"] = "clarify_required"
+EV_CLARIFY_NAG: Literal["clarify_nag_sent"] = "clarify_nag_sent"
+EV_BP_RECORDED: Literal["bp_recorded"] = "bp_recorded"
+EV_ACK: Literal["ack"] = "ack"
+EV_ACK_NEG: Literal["ack_negation"] = "ack_negation"
+EV_DUPLICATE_IGNORE: Literal["duplicate_ignore"] = "duplicate_ignore"
+
+# Kinds
+BP_KIND: Literal["bp"] = "bp"
+
+
+### FILE: ./app/__init__.py
+# app/__init__.py
+__all__ = []
+
+
+### FILE: ./app/main.py
+# app/main.py
+from __future__ import annotations
+
+import asyncio
+import logging
+from contextlib import suppress
+from datetime import datetime, timedelta
+from typing import Dict, Optional
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ChatType
+from aiogram.filters import Command
+from aiogram.types import Message
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from . import config
+from .csvlog import csv_append
+from .events import SC_OTHER, EV_ACK
+from .policies import handle_patient_text, schedule_daily_jobs
+from .prompts import only_patient_can_write
+from .utils import format_kyiv, now_local
+from .ctx import AppCtx, set_ctx, get_ctx
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Rate-limit moderation warnings: group_id -> last_sent_at
+_LAST_WARN_AT: Dict[int, datetime] = {}
+
+
+def _should_warn_group(group_id: int) -> bool:
+    last = _LAST_WARN_AT.get(group_id)
+    if not last:
+        return True
+    return now_local() - last >= timedelta(minutes=10)
+
+
+def _mark_warned(group_id: int) -> None:
+    _LAST_WARN_AT[group_id] = now_local()
+
+
+async def _setup_scheduler(bot: Bot) -> AsyncIOScheduler:
+    scheduler = AsyncIOScheduler(timezone=config.TZ)
+    await schedule_daily_jobs(scheduler, bot)
+    scheduler.start()
+    return scheduler
+
+
+async def start() -> None:
+    config.fail_fast_config()
+    bot = Bot(token=config.BOT_TOKEN)  # no parse_mode tweaks
+    dp = Dispatcher()
+    scheduler = await _setup_scheduler(bot)
+    set_ctx(AppCtx(bot=bot, scheduler=scheduler))
+
+    # ---- Commands ----
+    @dp.message(Command("status"))
+    async def cmd_status(msg: Message):
+        now = format_kyiv(now_local())
+        await msg.reply(f"OK {now} (Kyiv). Jobs active ✅")
+
+    @dp.message(Command("echo"))
+    async def cmd_echo(msg: Message):
+        # Handy for grabbing the real chat_id to paste into config.PATIENTS / CAREGIVER_CHAT_ID
+        await msg.reply(f"chat_id: {msg.chat.id}")
+
+    # ---- Group moderation & routing ----
+    @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+    async def on_group_message(msg: Message):
+        pid = _find_patient_by_group(msg.chat.id)
+        if pid is None or msg.from_user is None or msg.from_user.is_bot:
+            return
+        # Optional strict check if patient_user_id is configured
+        expected_uid = config.PATIENTS[pid].get("patient_user_id")
+        if expected_uid is not None and msg.from_user.id != expected_uid:
+            if _should_warn_group(msg.chat.id):
+                await msg.reply(only_patient_can_write())
+                _mark_warned(msg.chat.id)
+            return
+        await handle_patient_text(
+            bot,
+            get_ctx().scheduler,
+            patient_id=pid,
+            text=msg.text or "",
+            chat_id=msg.chat.id,
+            tg_message_id=msg.message_id,
+        )
+
+    # Fallback: any private messages → ack and ignore
+    @dp.message(F.chat.type == ChatType.PRIVATE)
+    async def on_private(msg: Message):
+        csv_append(
+            scenario=SC_OTHER,
+            event=EV_ACK,
+            patient_id=-1,
+            group_chat_id=msg.chat.id,
+            text=msg.text or "",
+        )
+        await msg.reply("Цей бот працює лише в приватній групі пацієнта.")
+
+    try:
+        await dp.start_polling(bot, handle_signals=False)
+    finally:
+        with suppress(Exception):
+            scheduler.shutdown(wait=False)
+        await bot.session.close()
+
+
+def _find_patient_by_group(group_chat_id: int) -> Optional[int]:
+    for pid, p in config.PATIENTS.items():
+        if p.get("group_chat_id") == group_chat_id:
+            return pid
+    return None
+
+
+if __name__ == "__main__":
+    asyncio.run(start())
+
+
+### FILE: ./app/policies.py
+# app/policies.py
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from typing import Dict, Optional, Tuple
+from contextlib import suppress
+
+from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+
+from . import config, prompts
+from .csvlog import log_med, log_measure, log_pills_detail, log_pressure_detail
+from .events import (
+    EV_ACK,
+    EV_ACK_NEG,
+    EV_CLARIFY_NAG,
+    EV_CLARIFY_REQUIRED,
+    EV_CONFIRMED,
+    EV_DUE,
+    EV_ESCALATED,
+    EV_NAG,
+    EV_BP_RECORDED,
+    BP_KIND,
+)
+from .regex_bank import LABEL_PILL_NEGATE, classify_text, is_confirmation
+from .utils import now_local, parse_hhmm, today_key
+from .ctx import get_ctx
+
+logger = logging.getLogger(__name__)
+
+
+# ---- In-memory per-day state (MVP) ----
+@dataclass
+class DoseState:
+    due_at: datetime
+    confirmed_at: Optional[datetime] = None
+    nag_sent_at: Optional[datetime] = None
+    escalated: bool = False
+    nags: int = 0
+    label: str = "?"
+
+
+@dataclass
+class MeasureState:
+    last_measured_on: Optional[date] = None
+    clarify_started_at: Optional[datetime] = None
+
+
+# patient_id -> med_id -> yyyymmdd -> DoseState
+MED_STATE: Dict[int, Dict[int, Dict[str, DoseState]]] = {}
+# patient_id -> kind -> yyyymmdd -> MeasureState
+MEASURE_STATE: Dict[int, Dict[str, Dict[str, MeasureState]]] = {}
+
+BP_WORDS = ("тиск", "систол", "діастол", "пульс", "ат")
+_BP_3NUM = re.compile(r"(?P<s>\d{2,3}).*?(?P<d>\d{2,3}).*?(?P<p>\d{2,3})")
+
+
+# ---- Helpers ----
+def _get_dose_state(pid: int, mid: int, ymd: str) -> DoseState:
+    return (
+        MED_STATE.setdefault(pid, {})
+        .setdefault(mid, {})
+        .setdefault(ymd, DoseState(due_at=now_local()))
+    )
+
+
+def _get_measure_state(pid: int, kind: str, ymd: str) -> MeasureState:
+    return (
+        MEASURE_STATE.setdefault(pid, {})
+        .setdefault(kind, {})
+        .setdefault(ymd, MeasureState())
+    )
+
+
+def _pill_nag_delta(pid: int) -> timedelta:
+    if config.DEBUG_MODE and config.DEBUG_NAG_SECONDS:
+        return timedelta(seconds=config.DEBUG_NAG_SECONDS[0])
+    return timedelta(
+        minutes=config.cfg(pid, "pill_nag_after_minutes", "pill_nag_after_minutes")
+    )
+
+
+def _clarify_nag_delta(pid: int) -> timedelta:
+    if config.DEBUG_MODE and config.DEBUG_NAG_SECONDS:
+        return timedelta(seconds=config.DEBUG_NAG_SECONDS[1])
+    return timedelta(
+        minutes=config.cfg(
+            pid, "bp_clarify_nag_after_minutes", "bp_clarify_nag_after_minutes"
+        )
+    )
+
+
+def _pill_escalate_after(pid: int) -> timedelta:
+    return timedelta(
+        minutes=config.cfg(
+            pid, "pill_escalate_after_minutes", "pill_escalate_after_minutes"
+        )
+    )
+
+
+def _bp_escalate_after(pid: int) -> timedelta:
+    return timedelta(
+        minutes=config.cfg(
+            pid, "bp_escalate_after_minutes", "bp_escalate_after_minutes"
+        )
+    )
+
+
+def _cancel_jobs_for_pill(pid: int, mid: int, ymd: str) -> None:
+    ctx = get_ctx()
+    with suppress(Exception):
+        ctx.scheduler.remove_job(config.job_id_med_nag(pid, mid, ymd))
+    with suppress(Exception):
+        ctx.scheduler.remove_job(config.job_id_med_escalate(pid, mid, ymd))
+
+
+async def _chat_exists(bot: Bot, chat_id: int) -> bool:
+    try:
+        await bot.get_chat(chat_id)
+        return True
+    except TelegramBadRequest as e:
+        logger.error("Chat verification failed for chat_id=%s: %s", chat_id, e)
+        return False
+    except Exception as e:
+        logger.exception("Unexpected error verifying chat_id=%s: %s", chat_id, e)
+        return False
+
+
+# ---- Scheduling entrypoints ----
+async def schedule_daily_jobs(scheduler: AsyncIOScheduler, bot: Bot) -> None:
+    """
+    Verify chats and schedule daily pill reminders (CronTrigger) and a single daily BP reminder.
+    Patients with invalid group_chat_id are skipped (logged).
+    """
+    # Verify caregiver user once (direct messages)
+    if not await _chat_exists(bot, config.CAREGIVER_USER_ID):
+        logger.error(
+            "CAREGIVER_USER_ID=%s is invalid or the caregiver hasn't started the bot. "
+            "Direct-message escalations will fail until the caregiver starts the bot.",
+            config.CAREGIVER_USER_ID,
+        )
+
+    for pid, p in config.PATIENTS.items():
+        group_id = p.get("group_chat_id")
+        if not await _chat_exists(bot, group_id):
+            logger.error(
+                "Skipping scheduling for patient %s (invalid group_chat_id=%s).",
+                pid,
+                group_id,
+            )
+            continue
+
+        # Pills: schedule cron jobs per HH:MM
+        for mid, hhmm in enumerate(p.get("pill_times_hhmm", [])):
+            hh, mm = parse_hhmm(hhmm)
+            scheduler.add_job(
+                _on_med_due,
+                CronTrigger(hour=hh, minute=mm, timezone=config.TZ),
+                id=f"cron_med:{pid}:{mid}",
+                args=[pid, mid],
+                replace_existing=True,
+                misfire_grace_time=60,
+            )
+            logger.info(
+                "Scheduled pill cron pid=%s mid=%s at %02d:%02d", pid, mid, hh, mm
+            )
+
+        # BP: once per day (simple default 09:00)
+        scheduler.add_job(
+            _on_measure_due,
+            CronTrigger(hour=9, minute=0, timezone=config.TZ),
+            id=f"cron_bp:{pid}",
+            args=[pid, BP_KIND],
+            replace_existing=True,
+            misfire_grace_time=60,
+        )
+        logger.info("Scheduled BP cron pid=%s at 09:00", pid)
+
+
+# ---- Job handlers (fired by scheduler) ----
+async def _on_med_due(pid: int, mid: int) -> None:
+    ctx = get_ctx()
+    bot = ctx.bot
+    p = config.PATIENTS[pid]
+    ymd = today_key()
+    st = _get_dose_state(pid, mid, ymd)
+    st.due_at = now_local()
+    st.label = prompts.label_daypart(p["labels"]["threshold_hhmm"], st.due_at)
+    try:
+        msg = await bot.send_message(
+            p["group_chat_id"], prompts.med_due(p["name"], st.label)
+        )
+        log_med(
+            event=EV_DUE,
+            patient_id=pid,
+            med_id=mid,
+            due_at=st.due_at,
+            tg_message_id=msg.message_id,
+        )
+    except TelegramBadRequest as e:
+        logger.error(
+            "Failed to send med_due to group %s (pid=%s mid=%s): %s",
+            p["group_chat_id"],
+            pid,
+            mid,
+            e,
+        )
+        return
+
+    # schedule nag + escalate for *today* only
+    nag_at = now_local() + _pill_nag_delta(pid)
+    ctx.scheduler.add_job(
+        _on_med_nag,
+        DateTrigger(run_date=nag_at),
+        id=config.job_id_med_nag(pid, mid, ymd),
+        args=[pid, mid, ymd],
+        replace_existing=True,
+    )
+    esc_at = st.due_at + _pill_escalate_after(pid)
+    ctx.scheduler.add_job(
+        _on_med_escalate,
+        DateTrigger(run_date=esc_at),
+        id=config.job_id_med_escalate(pid, mid, ymd),
+        args=[pid, mid, ymd],
+        replace_existing=True,
+    )
+
+
+async def _on_med_nag(pid: int, mid: int, ymd: str) -> None:
+    ctx = get_ctx()
+    bot = ctx.bot
+    p = config.PATIENTS[pid]
+    st = _get_dose_state(pid, mid, ymd)
+    if st.confirmed_at:
+        return
+    try:
+        msg = await bot.send_message(p["group_chat_id"], prompts.med_nag(p["name"]))
+        st.nag_sent_at = now_local()
+        st.nags += 1
+        log_med(
+            event=EV_NAG,
+            patient_id=pid,
+            med_id=mid,
+            due_at=st.due_at,
+            tg_message_id=msg.message_id,
+        )
+    except TelegramBadRequest as e:
+        logger.error(
+            "Failed to send med_nag to group %s (pid=%s mid=%s): %s",
+            p["group_chat_id"],
+            pid,
+            mid,
+            e,
+        )
+
+
+async def _on_med_escalate(pid: int, mid: int, ymd: str) -> None:
+    ctx = get_ctx()
+    bot = ctx.bot
+    p = config.PATIENTS[pid]
+    st = _get_dose_state(pid, mid, ymd)
+    if st.confirmed_at or st.escalated:
+        return
+    # Notify patient in group first
+    try:
+        await bot.send_message(
+            p["group_chat_id"], prompts.patient_missed_pill_notice(st.label or "")
+        )
+    except TelegramBadRequest as e:
+        logger.error(
+            "Failed to send missed pill notice to group %s (pid=%s mid=%s): %s",
+            p["group_chat_id"],
+            pid,
+            mid,
+            e,
+        )
+    # DM caregiver
+    try:
+        await bot.send_message(
+            config.CAREGIVER_USER_ID,
+            prompts.med_escalate_to_caregiver(p["name"], st.due_at),
+        )
+        st.escalated = True
+        log_med(
+            event=EV_ESCALATED,
+            patient_id=pid,
+            med_id=mid,
+            due_at=st.due_at,
+            action="pill_missed",
+        )
+        # Detail log for pills with result
+        log_pills_detail(
+            patient_id=pid, label=st.label or "", nags=st.nags, result="ESCALATED"
+        )
+    except TelegramBadRequest as e:
+        logger.error(
+            "Failed to DM caregiver user_id=%s for escalation (pid=%s mid=%s). "
+            "Likely the caregiver hasn't started the bot. Error: %s",
+            config.CAREGIVER_USER_ID,
+            pid,
+            mid,
+            e,
+        )
+
+
+async def _on_measure_due(pid: int, kind: str) -> None:
+    ctx = get_ctx()
+    bot = ctx.bot
+    p = config.PATIENTS[pid]
+    try:
+        msg = await bot.send_message(
+            p["group_chat_id"], prompts.measure_bp_due(p["name"])
+        )
+        log_measure(
+            event=EV_DUE, patient_id=pid, kind=kind, tg_message_id=msg.message_id
+        )
+    except TelegramBadRequest as e:
+        logger.error(
+            "Failed to send measure_due to group %s (pid=%s): %s",
+            p["group_chat_id"],
+            pid,
+            e,
+        )
+    # Clarify nags/escalation are scheduled only if we enter clarify flow.
+
+
+# ---- User message handling ----
+async def handle_patient_text(
+    bot: Bot,
+    scheduler: AsyncIOScheduler,
+    *,
+    patient_id: int,
+    text: str,
+    chat_id: int,
+    tg_message_id: int,
+) -> None:
+    pid = patient_id
+    p = config.PATIENTS[pid]
+
+    # 1) Pill confirm/negate
+    label = classify_text(text)
+    if label == LABEL_PILL_NEGATE:
+        msg = await bot.send_message(chat_id, prompts.sorry_ack())
+        log_med(
+            event=EV_ACK_NEG,
+            patient_id=pid,
+            action="ack_negation",
+            text=text,
+            tg_message_id=msg.message_id,
+        )
+        return
+
+    if is_confirmation(text):
+        # confirm latest unconfirmed *today*
+        ymd = today_key()
+        latest: Optional[Tuple[int, DoseState]] = None
+        for mid, by_day in MED_STATE.get(pid, {}).items():
+            st = by_day.get(ymd)
+            if not st or st.confirmed_at:
+                continue
+            if latest is None or st.due_at > latest[1].due_at:
+                latest = (mid, st)
+        if latest:
+            mid, st = latest
+            # Standard confirmation
+            st.confirmed_at = now_local()
+            _cancel_jobs_for_pill(pid, mid, ymd)
+            # Improved confirmation message with label
+            msg = await bot.send_message(
+                chat_id, prompts.med_confirmed_with_label(st.label or "")
+            )
+            log_med(
+                event=EV_CONFIRMED,
+                patient_id=pid,
+                med_id=mid,
+                due_at=st.due_at,
+                text=text,
+                tg_message_id=msg.message_id,
+            )
+            # Detail pills log
+            result_status = (
+                "CONFIRMED_AFTER_ESCALATION" if st.escalated else "CONFIRMED"
+            )
+            log_pills_detail(
+                patient_id=pid, label=st.label or "", nags=st.nags, result=result_status
+            )
+            # If was escalated earlier, politely notify caregiver that it’s resolved
+            if st.escalated:
+                with suppress(TelegramBadRequest):
+                    await bot.send_message(
+                        config.CAREGIVER_USER_ID,
+                        prompts.caregiver_confirmed_after_escalation(
+                            p["name"], st.label or ""
+                        ),
+                    )
+            return
+        # no pending today → generic ack
+        msg = await bot.send_message(chat_id, prompts.ok_ack())
+        log_med(
+            event=EV_ACK,
+            patient_id=pid,
+            action="no_pending",
+            text=text,
+            tg_message_id=msg.message_id,
+        )
+        return
+
+    # 2) BP flow (3 numbers or clarify)
+    ymd = today_key()
+    ms = _get_measure_state(pid, BP_KIND, ymd)
+    text_l = (text or "").lower()
+    bp_intent = any(w in text_l for w in BP_WORDS) or ms.clarify_started_at is not None
+    nums = _BP_3NUM.search(text) if bp_intent else None
+
+    if bp_intent:
+        if nums:
+            s, d, pval = (
+                int(nums.group("s")),
+                int(nums.group("d")),
+                int(nums.group("p")),
+            )
+            action = None
+            if s < d:
+                s, d = d, s
+                action = "auto_swapped"
+            ms.last_measured_on = now_local().date()
+            ms.clarify_started_at = None
+            # Improved BP ack with label (morning/evening by threshold)
+            bp_label = prompts.label_daypart(p["labels"]["threshold_hhmm"], now_local())
+            msg = await bot.send_message(
+                chat_id, prompts.bp_recorded_ack_with_label(bp_label, s, d, pval)
+            )
+            # Standard events log + detail pressure log
+            log_measure(
+                event=EV_BP_RECORDED,
+                patient_id=pid,
+                kind=BP_KIND,
+                action=action,
+                text=f"{s}/{d} {pval}",
+                tg_message_id=msg.message_id,
+            )
+            log_pressure_detail(patient_id=pid, sys=s, dia=d, pulse=pval)
+            return
+        # enter/continue clarify
+        first_time = ms.clarify_started_at is None
+        ms.clarify_started_at = now_local()
+        msg = await bot.send_message(chat_id, prompts.clarify_bp())
+        log_measure(
+            event=EV_CLARIFY_REQUIRED,
+            patient_id=pid,
+            kind=BP_KIND,
+            action="missing_numbers",
+            tg_message_id=msg.message_id,
+        )
+        if first_time:
+            # schedule clarify nag(s)
+            run_at = now_local() + _clarify_nag_delta(pid)
+            scheduler.add_job(
+                _on_clarify_nag,
+                DateTrigger(run_date=run_at),
+                id=config.job_id_bp_clarify(pid, ymd),
+                args=[pid, BP_KIND, ymd],
+                replace_existing=True,
+            )
+            # schedule escalation
+            esc_at = ms.clarify_started_at + _bp_escalate_after(pid)
+            scheduler.add_job(
+                _on_bp_escalate,
+                DateTrigger(run_date=esc_at),
+                id=config.job_id_bp_escalate(pid, ymd),
+                args=[pid, BP_KIND, ymd],
+                replace_existing=True,
+            )
+        return
+
+    # 3) Everything else → simple ack
+    msg = await bot.send_message(chat_id, prompts.ok_ack())
+    log_measure(
+        event=EV_ACK,
+        patient_id=pid,
+        kind=BP_KIND,
+        text=text,
+        tg_message_id=msg.message_id,
+    )
+
+
+# ---- Clarify & escalate helpers ----
+async def _on_clarify_nag(pid: int, kind: str, ymd: str) -> None:
+    ctx = get_ctx()
+    bot = ctx.bot
+    p = config.PATIENTS[pid]
+    ms = _get_measure_state(pid, kind, ymd)
+    if ms.clarify_started_at is None:
+        return
+    try:
+        msg = await bot.send_message(p["group_chat_id"], prompts.clarify_nag())
+        log_measure(
+            event=EV_CLARIFY_NAG,
+            patient_id=pid,
+            kind=kind,
+            tg_message_id=msg.message_id,
+        )
+    except TelegramBadRequest as e:
+        logger.error(
+            "Failed to send clarify_nag to group %s (pid=%s): %s",
+            p["group_chat_id"],
+            pid,
+            e,
+        )
+
+
+async def _on_bp_escalate(pid: int, kind: str, ymd: str) -> None:
+    ctx = get_ctx()
+    bot = ctx.bot
+    p = config.PATIENTS[pid]
+    ms = _get_measure_state(pid, kind, ymd)
+    if ms.clarify_started_at is None:
+        return
+    try:
+        await bot.send_message(
+            config.CAREGIVER_USER_ID, prompts.bp_escalate_to_caregiver(p["name"])
+        )
+        log_measure(
+            event=EV_ESCALATED,
+            patient_id=pid,
+            kind=kind,
+            action="bp_missing_or_invalid",
+        )
+    except TelegramBadRequest as e:
+        logger.error(
+            "Failed to DM caregiver user_id=%s for BP escalation (pid=%s). "
+            "Likely the caregiver hasn't started the bot. Error: %s",
+            config.CAREGIVER_USER_ID,
+            pid,
+            e,
+        )
+
+
+### FILE: ./app/prompts.py
+# app/prompts.py
+from __future__ import annotations
+
+from datetime import datetime
+from . import config
+from .utils import format_kyiv
+
+
+# ---- Pill prompts ----
+def med_due(name: str, label_daypart: str) -> str:
+    return f"{name}, час прийняти ліки ({label_daypart}). Підтвердіть, будь ласка."
+
+
+def med_nag(name: str) -> str:
+    return f"{name}, нагадування: підтвердіть, будь ласка, що ви прийняли ліки."
+
+
+def med_escalate_to_caregiver(patient_name: str, due_at: datetime) -> str:
+    return f"Ескалація: {patient_name} не підтвердив(ла) прийом ліків (на {format_kyiv(due_at)})."
+
+
+def med_confirmed_with_label(label: str) -> str:
+    return f"Прийом ліків {label} підтверджено ✅"
+
+
+def patient_missed_pill_notice(label: str) -> str:
+    return f"Пропущено прийом ліків {label}!! Інформую медичну сестру."
+
+
+def caregiver_confirmed_after_escalation(patient_name: str, label: str) -> str:
+    return f"Оновлення: {patient_name} підтвердив(ла) прийом ліків {label} після ескалації."
+
+
+def ok_ack() -> str:
+    return "Дякую, зафіксовано ✅"
+
+
+def sorry_ack() -> str:
+    return "Добре, зафіксував(ла) ❎"
+
+
+# ---- BP prompts ----
+def measure_bp_due(name: str) -> str:
+    return f"{name}, час виміряти тиск сьогодні. Відправте «систолічний, діастолічний, пульс»."
+
+
+def clarify_bp() -> str:
+    return "Не бачу трьох чисел для тиску. Відправте, будь ласка: «систолічний, діастолічний, пульс»."
+
+
+def clarify_nag() -> str:
+    return "Нагадування: надішліть три числа тиску, будь ласка."
+
+
+def bp_recorded_ack(syst: int, diast: int, pulse: int) -> str:
+    return f"Записав(ла) тиск: {syst}/{diast}, пульс {pulse}."
+
+
+def bp_recorded_ack_with_label(label: str, syst: int, diast: int, pulse: int) -> str:
+    return f"Тиск {label} : {syst} {diast} {pulse} записано."
+
+
+def bp_escalate_to_caregiver(patient_name: str) -> str:
+    return f"Ескалація: {patient_name} не надіслав(ла) коректні дані тиску."
+
+
+# ---- Group moderation ----
+def only_patient_can_write() -> str:
+    # fixed wording: "цю групу"
+    return "Будь ласка, не пишіть у цю групу. Тут спілкуються лише пацієнт і бот."
+
+
+# ---- Misc helpers ----
+def label_daypart(threshold_hhmm: str, when: datetime) -> str:
+    hhmm = when.astimezone(config.TZ).strftime("%H:%M")
+    return "ранок" if hhmm < threshold_hhmm else "вечір"
+
+
+### FILE: ./app/regex_bank.py
+# app/regex_bank.py
+from __future__ import annotations
+import re
+from typing import Final
+
+LABEL_PILL_NEGATE: Final[str] = "pill_negate"
+LABEL_OTHER: Final[str] = "other"
+
+# Boundaries to avoid partial words; small multilingual list.
+_NEG_PAT = re.compile(
+    r"\b(ні|не|нет|не\s+пив|не\s*прийм\w*)\b", re.IGNORECASE | re.UNICODE
+)
+_OK_PAT = re.compile(
+    r"\b(так|ок|ok|окей|готово|done|yes|прийняв\w*|випив\w*|принял\w*)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def is_negation(text: str) -> bool:
+    return bool(_NEG_PAT.search(text or ""))
+
+
+def is_confirmation(text: str) -> bool:
+    return bool(_OK_PAT.search(text or ""))
+
+
+def classify_text(text: str) -> str:
+    # Minimal: "pill_negate" or generic "other"
+    return LABEL_PILL_NEGATE if is_negation(text) else LABEL_OTHER
+
+
+### FILE: ./app/utils.py
+# app/utils.py
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable, Tuple
+
+from . import config
+
+
+def now_local() -> datetime:
+    return datetime.now(config.TZ)
+
+
+def format_kyiv(dt: datetime) -> str:
+    return dt.astimezone(config.TZ).strftime(config.DATETIME_FMT)
+
+
+def ensure_dir(p: str) -> None:
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+
+def parse_hhmm(hhmm: str) -> Tuple[int, int]:
+    hh, mm = hhmm.split(":")
+    return int(hh), int(mm)
+
+
+def today_key() -> str:
+    return now_local().strftime("%Y%m%d")
+
+
+def any_substr(s: str, keys: Iterable[str]) -> bool:
+    low = s.lower()
+    return any(k in low for k in keys)
+
+

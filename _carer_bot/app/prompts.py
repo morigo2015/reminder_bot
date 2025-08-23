@@ -31,6 +31,7 @@ def caregiver_confirmed_after_escalation(patient_name: str, label: str) -> str:
     return f"Оновлення: {patient_name} підтвердив(ла) прийом ліків {label} після ескалації."
 
 
+# ---- Simple acks ----
 def ok_ack() -> str:
     return "Дякую, зафіксовано ✅"
 
@@ -41,15 +42,15 @@ def sorry_ack() -> str:
 
 # ---- BP prompts ----
 def measure_bp_due(name: str) -> str:
-    return f"{name}, час виміряти тиск сьогодні. Відправте «систолічний, діастолічний, пульс»."
+    return f"{name}, час виміряти тиск сьогодні. Відправте «тип сис діа пульс», напр.: «швидко 120 80 60»."
 
 
 def clarify_bp() -> str:
-    return "Не бачу трьох чисел для тиску. Відправте, будь ласка: «систолічний, діастолічний, пульс»."
+    return "Не бачу коректного повідомлення про тиск. Формат: «тип сис діа пульс»."
 
 
 def clarify_nag() -> str:
-    return "Нагадування: надішліть три числа тиску, будь ласка."
+    return "Нагадування: надішліть тиск у форматі «тип сис діа пульс», напр.: «швидко 120 80 60»."
 
 
 def bp_recorded_ack(syst: int, diast: int, pulse: int) -> str:
@@ -60,7 +61,19 @@ def bp_recorded_ack_with_label(label: str, syst: int, diast: int, pulse: int) ->
     return f"Тиск {label} : {syst} {diast} {pulse} записано."
 
 
+def bp_recorded_ack_with_type(bp_type: str, syst: int, diast: int, pulse: int) -> str:
+    return f"Тиск {bp_type} : {syst} {diast} {pulse} записано."
+
+
+def bp_need_type_retry() -> str:
+    return (
+        "Будь ласка, надішліть тиск з типом: «тип сис діа пульс».\n"
+        "Приклади: «швидко 120 80 60», «повільно 118 76 58»."
+    )
+
+
 def bp_escalate_to_caregiver(patient_name: str) -> str:
+    # Added back to fix escalation crash in BP clarify flow
     return f"Ескалація: {patient_name} не надіслав(ла) коректні дані тиску."
 
 

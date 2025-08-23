@@ -1,7 +1,8 @@
 # app/config.py
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+import re
+from typing import Dict, List, Tuple, Optional
 from zoneinfo import ZoneInfo
 
 # ---- Core settings (PoC) ----
@@ -11,8 +12,7 @@ DATETIME_FMT = "%Y-%m-%d %H:%M"
 # For PoC we keep these here.
 BOT_TOKEN = "550433191:AAFkG6atLs_uo0nwphtuiwbwIJeUhwfzCyI"
 
-# Caregiver escalation is now a DIRECT MESSAGE to this user id
-# (the caregiver must have started the bot at least once)
+# Caregiver escalation is a DIRECT MESSAGE to this user id
 CAREGIVER_USER_ID = 7391874317  # Telegram user id
 
 # Logging
@@ -33,13 +33,13 @@ DEFAULTS: Dict[str, int] = {
 }
 
 # ---- Patients (PoC) ----
+# NOTE: patient_user_id is REQUIRED (strict moderation by default).
 PATIENTS: Dict[int, Dict] = {
     1: {
         "name": "Надія Микитівна",
         "group_chat_id": -1002690368389,
-        "pill_times_hhmm": ["22:39", "20:00"],
-        # Optional: restrict who can post as the patient (Telegram user id)
-        # "patient_user_id": 123456789,
+        "patient_user_id": 382163513,
+        "pill_times_hhmm": ["00:23", "20:00"],
         "labels": {
             "weekday": ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"],
             "daypart": {
@@ -50,6 +50,69 @@ PATIENTS: Dict[int, Dict] = {
         },
     },
 }
+
+# ---- Blood pressure "types" (canonical -> variants) ----
+# These are global for all patients. Variants must be letters-only (unicode).
+BP_TYPES: Dict[str, List[str]] = {
+    "швидко": ["швидко", "різко", "одразу", "швидкий", "quick"],
+    "повільно": ["повільно", "поступово", "slow"],
+}
+
+# Precompute variant -> canonical map (lowercased)
+_BP_VARIANT_TO_CANON: Dict[str, str] = {}
+for canon, variants in BP_TYPES.items():
+    for v in variants:
+        _BP_VARIANT_TO_CANON[v.lower()] = canon
+
+# Letters-only token (no digits/underscore); unicode-aware.
+_LETTERS_ONLY = re.compile(r"^[^\W\d_]+$", re.UNICODE)
+
+
+def canonicalize_bp_type(token: str) -> Optional[str]:
+    """Return canonical bp type for an acceptable leading token; otherwise None."""
+    t = (token or "").strip().lower()
+    if not t or not _LETTERS_ONLY.match(t):
+        return None
+    return _BP_VARIANT_TO_CANON.get(t)
+
+
+# ---- OK confirmation patterns (broadened for backward compatibility) ----
+# NOTE:
+#  - Short, exact acks remain anchored.
+#  - Verb stems are *searched* anywhere in the text with word boundaries.
+#  - Negation is handled separately in regex_bank.is_negation(), which runs first.
+_OK_CONFIRM_PATTERNS_RAW: List[str] = [
+    # Short exact acks
+    r"^\s*(так|ок|окей|підтверджую)\s*[.!]?\s*$",
+    r"^\s*(ok|okay|done|yes|y)\s*[.!]?\s*$",
+    r"^\s*✅\s*$",
+    r"^\s*👍\s*$",
+    # Ukrainian verb stems
+    r"\bприйняв(?!\w)\b",
+    r"\bприйняла(?!\w)\b",
+    r"\bприйнято(?!\w)\b",
+    r"\bвипив(?!\w)\b",
+    r"\bвипила(?!\w)\b",
+    r"\bготово\b",
+    r"\bзробив(?!\w)\b",
+    r"\bзробила(?!\w)\b",
+    # Russian verb stems
+    r"\bпринял(?!\w)\b",
+    r"\bприняла(?!\w)\b",
+    r"\bвыпил(?!\w)\b",
+    r"\bвыпила(?!\w)\b",
+    r"\bсделал(?!\w)\b",
+    r"\bсделала(?!\w)\b",
+    r"\bготово\b",
+    # English
+    r"\btook\b",
+    r"\btaken\b",
+    r"\bdone\b",
+    r"\bi\s+(took|have\s+taken|did)\b",
+]
+OK_CONFIRM_PATTERNS = [
+    re.compile(p, re.IGNORECASE | re.UNICODE) for p in _OK_CONFIRM_PATTERNS_RAW
+]
 
 
 # ---- Helper: config access ----
@@ -109,6 +172,10 @@ def fail_fast_config() -> None:
         for pid, p in PATIENTS.items():
             if "group_chat_id" not in p or not isinstance(p["group_chat_id"], int):
                 errors.append(f"patient {pid}: missing or invalid group_chat_id")
+            if "patient_user_id" not in p or not isinstance(p["patient_user_id"], int):
+                errors.append(
+                    f"patient {pid}: patient_user_id is required and must be int"
+                )
             times = p.get("pill_times_hhmm", [])
             for t in times:
                 if not _is_hhmm(t):
@@ -129,5 +196,24 @@ def fail_fast_config() -> None:
             or DEBUG_NAG_SECONDS[1] <= 0
         ):
             errors.append("DEBUG_NAG_SECONDS must be a tuple of two positive ints")
+
+    # BP types sanity
+    if not BP_TYPES:
+        errors.append("BP_TYPES must not be empty")
+    else:
+        # ensure variants are letters-only and non-empty
+        for canon, vars_ in BP_TYPES.items():
+            if not canon or not vars_:
+                errors.append(f"BP_TYPES['{canon}'] must have at least one variant")
+            for v in vars_:
+                if not _LETTERS_ONLY.match(v):
+                    errors.append(
+                        f"BP_TYPES['{canon}'] variant '{v}' must be letters-only"
+                    )
+
+    # OK patterns sanity
+    if not OK_CONFIRM_PATTERNS:
+        errors.append("OK_CONFIRM_PATTERNS must not be empty")
+
     if errors:
         raise AssertionError("Config errors:\n- " + "\n- ".join(errors))

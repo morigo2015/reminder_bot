@@ -2,6 +2,7 @@
 from __future__ import annotations
 import re
 from typing import Final
+from . import config
 
 LABEL_PILL_NEGATE: Final[str] = "pill_negate"
 LABEL_OTHER: Final[str] = "other"
@@ -10,10 +11,6 @@ LABEL_OTHER: Final[str] = "other"
 _NEG_PAT = re.compile(
     r"\b(ні|не|нет|не\s+пив|не\s*прийм\w*)\b", re.IGNORECASE | re.UNICODE
 )
-_OK_PAT = re.compile(
-    r"\b(так|ок|ok|окей|готово|done|yes|прийняв\w*|випив\w*|принял\w*)\b",
-    re.IGNORECASE | re.UNICODE,
-)
 
 
 def is_negation(text: str) -> bool:
@@ -21,7 +18,11 @@ def is_negation(text: str) -> bool:
 
 
 def is_confirmation(text: str) -> bool:
-    return bool(_OK_PAT.search(text or ""))
+    t = text or ""
+    for pat in config.OK_CONFIRM_PATTERNS:
+        if pat.search(t):
+            return True
+    return False
 
 
 def classify_text(text: str) -> str:
