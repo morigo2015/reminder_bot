@@ -9,10 +9,16 @@ from app import config
 from app.db.pool import init_pool
 from app.bot.handlers import router
 from app.logic import ticker, sweeper
+from app.db.patients import upsert_patient
 
 
 async def main():
     await init_pool()
+
+    # Seed patients so FKs are satisfied
+    for p in config.PATIENTS:
+        await upsert_patient(p["id"], p["chat_id"], p["name"])
+
     bot = Bot(
         token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )

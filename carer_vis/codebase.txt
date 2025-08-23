@@ -232,7 +232,7 @@ PATIENTS = [
         "pills": {
             "times": {
                 "morning": time(8, 0, tzinfo=TZ),
-                "evening": time(20, 0, tzinfo=TZ),
+                "evening": time(23, 36, tzinfo=TZ),
             },
             "repeat_min": 10,  # per-patient override
             "confirm_window_min": 25,  # per-patient override
@@ -270,6 +270,20 @@ async def insert_reading(patient_id: str, side: str, sys_v: int, dia_v: int, pul
     async with pool().acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(sql, (patient_id, side, sys_v, dia_v, pulse_v, out_of_range))
+
+
+### FILE: ./app/db/patients.py
+from app.db.pool import pool
+
+
+async def upsert_patient(pid: str, chat_id: int, name: str) -> None:
+    sql = (
+        "INSERT INTO patients (id, chat_id, name) VALUES (%s, %s, %s) AS new "
+        "ON DUPLICATE KEY UPDATE chat_id = new.chat_id, name = new.name"
+    )
+    async with pool().acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(sql, (pid, chat_id, name))
 
 
 ### FILE: ./app/db/pills.py
@@ -611,23 +625,51 @@ async def tick(bot: Bot):
 
 
 ### FILE: ./app/main.py
-from __future__ import annotations
+# app/main.py
 import asyncio
-import signal
+from contextlib import suppress
 from aiogram import Bot, Dispatcher
-from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 from app import config
 from app.db.pool import init_pool
 from app.bot.handlers import router
 from app.logic import ticker, sweeper
+from app.db.patients import upsert_patient
+
+
+async def main():
+    await init_pool()
+
+    # Seed patients so FKs are satisfied
+    for p in config.PATIENTS:
+        await upsert_patient(p["id"], p["chat_id"], p["name"])
+
+    bot = Bot(
+        token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    # Use the loop helpers already in your repo
+    t1 = asyncio.create_task(ticker_loop(bot))  # <— defined below
+    t2 = asyncio.create_task(sweeper_loop(bot))  # <— defined below
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        for t in (t1, t2):
+            t.cancel()
+            with suppress(asyncio.CancelledError):
+                await t
+        await bot.session.close()
 
 
 async def ticker_loop(bot: Bot):
     while True:
         try:
-            await ticker.tick(bot)
+            await ticker.tick(bot)  # tick exists
         except Exception as e:
             print({"level": "error", "action": "ticker", "exception": str(e)})
         await asyncio.sleep(config.TICK_SECONDS)
@@ -636,45 +678,13 @@ async def ticker_loop(bot: Bot):
 async def sweeper_loop(bot: Bot):
     while True:
         try:
-            await sweeper.sweep(bot)
+            await sweeper.sweep(bot)  # sweep exists
         except Exception as e:
             print({"level": "error", "action": "sweeper", "exception": str(e)})
         await asyncio.sleep(config.SWEEP_SECONDS)
 
 
-async def main():
-    await init_pool()
-    bot = Bot(
-        token=config.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-    dp = Dispatcher()
-    dp.include_router(router)
-
-    # background loops
-    t1 = asyncio.create_task(ticker_loop(bot))
-    t2 = asyncio.create_task(sweeper_loop(bot))
-
-    # shutdown signals
-    loop = asyncio.get_running_loop()
-    for s in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(s, dp.stop_polling)
-        except NotImplementedError:
-            pass
-
-    try:
-        await dp.start_polling(bot)
-    finally:
-        t1.cancel()
-        t2.cancel()
-        with contextlib.suppress(Exception):
-            await bot.session.close()
-
-
 if __name__ == "__main__":
-    import contextlib
-
     asyncio.run(main())
 
 
