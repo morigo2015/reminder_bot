@@ -1,5 +1,6 @@
 # app/main.py
 import asyncio
+import logging
 from contextlib import suppress
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -12,6 +13,9 @@ from app.db.patients import upsert_patient
 
 
 async def main():
+    # Configure logging
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
     # Seed patients so FKs are satisfied (SQLAlchemy engine is lazy-initialized)
     for p in config.PATIENTS:
         await upsert_patient(p["id"], p["chat_id"], p["name"])

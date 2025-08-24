@@ -1,7 +1,7 @@
 import re
 
 CONFIRM_RE = re.compile(r"(?i)\b(випив|випила|прийняв|прийняла|прийнято|готово|ок|ok|done|taken)\b")
-BP_RE = re.compile(r"(?i)^(left|right|ліва|права|ліворуч|праворуч)\s+(\d{2,3})/(\d{2,3})\s+(\d{2,3})$")
+BP_RE = re.compile(r"(?i)^(left|right|ліва|права|ліворуч|праворуч)\s+(\d{2,3})[,|/\-\s]+(\d{2,3})[,|/\-\s]+(\d{2,3})$")
 
 SIDE_MAP = {
     "ліва": "left",

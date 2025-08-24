@@ -22,6 +22,7 @@ Assumptions:
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 from zoneinfo import ZoneInfo
 from aiogram import Bot
@@ -124,7 +125,7 @@ async def tick(bot: Bot) -> None:
     now_k = timez.now_kyiv()
 
     # Optional debug trace; comment out if noisy.
-    print({"level": "debug", "where": "tick", "now_kyiv": str(now_k)})
+    logging.debug(f"tick: now_kyiv={now_k}")
 
     for patient in config.PATIENTS:
         cfg = _pill_cfg(patient)
@@ -132,33 +133,16 @@ async def tick(bot: Bot) -> None:
         for dose, t_local in cfg["times"].items():
             # Due today?
             if not timez.due_today(t_local):
-                # Optional trace
-                print(
-                    {
-                        "level": "debug",
-                        "action": "due_check",
-                        "patient": patient["id"],
-                        "dose": dose,
-                        "due": False,
-                        "scheduled": f"{t_local.hour:02d}:{t_local.minute:02d}",
-                    }
+                logging.debug(
+                    f"due_check: patient={patient['id']} dose={dose} due=False scheduled={t_local.hour:02d}:{t_local.minute:02d}"
                 )
                 continue
 
             age = _age_min_since_local(t_local)
             exists = await pills.has_reminder_row(patient["id"], d, dose)
 
-            print(
-                {
-                    "level": "debug",
-                    "action": "due_check",
-                    "patient": patient["id"],
-                    "dose": dose,
-                    "due": True,
-                    "scheduled": f"{t_local.hour:02d}:{t_local.minute:02d}",
-                    "age_min": age,
-                    "exists": exists,
-                }
+            logging.debug(
+                f"due_check: patient={patient['id']} dose={dose} due=True scheduled={t_local.hour:02d}:{t_local.minute:02d} age_min={age} exists={exists}"
             )
 
             # Initial: send only within grace; otherwise skip entirely (no DB writes).

@@ -1,14 +1,20 @@
+# app/util/idempotency.py
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Set
 from datetime import date
 
+
 @dataclass
 class DailyFlags:
     day: date
-    repeats_sent: Set[str] = field(default_factory=set)  # reminder_id tokens sent as repeat
-    bp_prompted: Set[str] = field(default_factory=set)   # patient_id set
+    repeats_sent: Set[str] = field(
+        default_factory=set
+    )  # reminder_id tokens sent as repeat
+    bp_prompted: Set[str] = field(default_factory=set)  # patient_id set
     status_prompted: Set[str] = field(default_factory=set)
+
 
 _current: DailyFlags | None = None
 

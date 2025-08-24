@@ -33,15 +33,15 @@ PATIENTS = [
         "name": "Аліса",
         "pills": {
             "times": {
-                "morning": time(3, 13, tzinfo=TZ),
-                "evening": time(23, 36, tzinfo=TZ),
+                "morning": time(21, 36, tzinfo=TZ),
+                # "evening": time(23, 36, tzinfo=TZ),
             },
             "repeat_min": 2,  # per-patient override
             "confirm_window_min": 8,  # per-patient override
         },
         "bp": {
             "time": time(0, 25, tzinfo=TZ),
-            "safe_ranges": {"sys": (80, 170), "dia": (50, 110), "pulse": (40, 180)},
+            "safe_ranges": {"sys": (10, 300), "dia": (20, 310), "pulse": (30, 280)},
         },
     },
 ]
