@@ -1,29 +1,32 @@
 # app/logic/ticker.py
 """
-Minimal reminder ticker.
+Minimal reminder ticker (pills: time-throttled repeats; BP/Status: once/day).
 
 Policy:
-  1) Initial reminder: send ONLY if we're within a small grace window after the
-     scheduled local time (global DEFAULT_INITIAL_SEND_GRACE_MIN in config).
-  2) Repeats: only if an initial DB row exists, and only within confirm_window_min.
-  3) No backfill, no schedule-derived escalations here. Sweeper escalates ONLY
-     for rows that actually exist (i.e., an initial was sent earlier).
+  1) Initial pill reminder: send ONLY if we're within a small grace window after
+     the scheduled local time (DEFAULT_INITIAL_SEND_GRACE_MIN).
+  2) Pill repeats: only if an initial DB row exists; send when at least
+     repeat_min minutes have passed since the *last* repeat we sent,
+     and only while still inside the confirmation window.
+  3) BP and Status: send at most once per day (also within grace).
+  4) No backfill; Sweeper escalates ONLY for rows that exist.
 
 Assumptions:
-  - time helpers in app.util.timez return tz-aware datetimes for Kyiv and UTC.
-  - DB layer (app.db.pills) exposes:
+  - time helpers (app.util.timez) return tz-aware Kyiv/UTC datetimes.
+  - DB layer (app.db.pills):
       - upsert_reminder(patient_id, date, dose, label)
       - has_reminder_row(patient_id, date, dose) -> bool
       - get_state(patient_id, date, dose) -> (reminder_ts_utc_naive, confirm_ts_utc_naive) | None
-  - idempotency utils in app.util.idempotency for repeat throttling:
-      - was_repeated(key, date) / mark_repeat(key, date)
-  - texts_uk + confirm_keyboard render the localized copy and inline keyboard.
+  - idempotency helpers (app.util.idempotency):
+      - get_last_repeat_time(reminder_base_id, day) / set_last_repeat_time(...)
+      - was_bp_prompted / mark_bp_prompted
+      - was_status_prompted / mark_status_prompted
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from zoneinfo import ZoneInfo
 from aiogram import Bot
 
@@ -35,10 +38,7 @@ from app.util import timez, idempotency
 
 
 def _age_min_since_local(t_local) -> int:
-    """
-    Minutes from today's scheduled local (Kyiv) time to now (Kyiv).
-    Negative => not yet due.
-    """
+    """Minutes from today's scheduled local (Kyiv) time to now (Kyiv)."""
     d = timez.date_kyiv()
     sched = timez.combine_kyiv(d, t_local)  # tz-aware Kyiv datetime
     return int((timez.now_kyiv() - sched).total_seconds() // 60)
@@ -59,9 +59,7 @@ def _callback(patient_id: str, dose: str, d: date) -> str:
 
 
 async def _send_initial(bot: Bot, patient: dict, dose: str, d: date) -> None:
-    """
-    Sends the initial reminder and writes the DB row with reminder_ts = UTC NOW.
-    """
+    """Send the initial pill reminder and write DB row with reminder_ts=UTC NOW."""
     label = timez.pill_label(dose, d)
     kb = confirm_keyboard(_callback(patient["id"], dose, d))
     await bot.send_message(
@@ -75,6 +73,12 @@ async def _send_initial(bot: Bot, patient: dict, dose: str, d: date) -> None:
 async def _maybe_send_repeat(
     bot: Bot, patient: dict, dose: str, d: date, cfg: dict
 ) -> None:
+    """
+    Time-based throttling:
+      - Send a repeat if (now_utc - last_repeat_utc) >= repeat_min minutes,
+        while still inside the confirmation window and not yet confirmed.
+      - First repeat will send as soon as repeat_min minutes pass after initial.
+    """
     rid_base = f"{patient['id']}:{dose}:{d.isoformat()}"
 
     state = await pills.get_state(
@@ -86,24 +90,25 @@ async def _maybe_send_repeat(
     if reminder_ts is None or confirm_ts is not None:
         return
 
+    # Compute age since initial and ensure we are still within the window.
+    now_utc = timez.now_utc()
     age_min = int(
-        (timez.now_utc() - reminder_ts.replace(tzinfo=ZoneInfo("UTC"))).total_seconds()
-        // 60
+        (now_utc - reminder_ts.replace(tzinfo=ZoneInfo("UTC"))).total_seconds() // 60
     )
-
-    # Never repeat outside the confirmation window.
     if age_min > cfg["window_min"]:
         return
 
-    # Compute which repeat bucket we're in: 2,4,6,... for repeat_min=2
-    bucket = age_min // max(1, cfg["repeat_min"])
-    if bucket <= 0:
-        return
+    # Throttle by last repeat time (UTC).
+    last_repeat_utc = idempotency.get_last_repeat_time(rid_base, d)
+    if last_repeat_utc is not None:
+        if (now_utc - last_repeat_utc) < timedelta(minutes=max(1, cfg["repeat_min"])):
+            return
+    else:
+        # No repeat yet; ensure at least repeat_min minutes have passed since initial.
+        if age_min < max(1, cfg["repeat_min"]):
+            return
 
-    rid_bucket = f"{rid_base}:r{bucket}"
-    if idempotency.was_repeated(rid_bucket, d):
-        return
-
+    # Send repeat
     label = timez.pill_label(dose, d)
     kb = confirm_keyboard(_callback(patient["id"], dose, d))
     await bot.send_message(
@@ -111,25 +116,23 @@ async def _maybe_send_repeat(
         texts_uk.render("pills.repeat", label=label),
         reply_markup=kb,
     )
-    idempotency.mark_repeat(rid_bucket, d)
+    idempotency.set_last_repeat_time(rid_base, d, now_utc)
 
 
 async def tick(bot: Bot) -> None:
     """
     Runs once per TICK_SECONDS (see main.py loop).
-    For each patient/dose:
-      - If due today and within grace, send initial (if not already sent).
-      - If a row exists, consider sending a repeat (capped by window).
+    Pills: initial within grace; repeats throttled by time until confirm/escalation.
+    BP/Status: once per day max.
     """
     d = timez.date_kyiv()
     now_k = timez.now_kyiv()
-
-    # Optional debug trace; comment out if noisy.
     logging.debug(f"tick: now_kyiv={now_k}")
 
     for patient in config.PATIENTS:
         cfg = _pill_cfg(patient)
 
+        # -------- Pills --------
         for dose, t_local in cfg["times"].items():
             # Due today?
             if not timez.due_today(t_local):
@@ -145,10 +148,39 @@ async def tick(bot: Bot) -> None:
                 f"due_check: patient={patient['id']} dose={dose} due=True scheduled={t_local.hour:02d}:{t_local.minute:02d} age_min={age} exists={exists}"
             )
 
-            # Initial: send only within grace; otherwise skip entirely (no DB writes).
+            # Initial: only within grace; otherwise skip (no DB writes).
             if not exists and 0 <= age <= cfg["grace_min"]:
                 await _send_initial(bot, patient, dose, d)
 
-            # Repeats: only if a row exists; _maybe_send_repeat caps by window.
+            # Repeats: only if a row exists; time-throttled and capped by window.
             if exists:
                 await _maybe_send_repeat(bot, patient, dose, d, cfg)
+
+        # -------- BP (once per day) --------
+        bp_cfg = patient.get("bp") or {}
+        t_bp = bp_cfg.get("time")
+        if (
+            t_bp
+            and timez.due_today(t_bp)
+            and not idempotency.was_bp_prompted(patient["id"], d)
+        ):
+            age_bp = _age_min_since_local(t_bp)
+            if 0 <= age_bp <= cfg["grace_min"]:
+                await bot.send_message(
+                    patient["chat_id"], texts_uk.render("bp.reminder")
+                )
+                idempotency.mark_bp_prompted(patient["id"], d)
+
+        # -------- Status (once per day) --------
+        st_t = (config.STATUS or {}).get("time")
+        if (
+            st_t
+            and timez.due_today(st_t)
+            and not idempotency.was_status_prompted(patient["id"], d)
+        ):
+            age_st = _age_min_since_local(st_t)
+            if 0 <= age_st <= cfg["grace_min"]:
+                await bot.send_message(
+                    patient["chat_id"], texts_uk.render("status.prompt")
+                )
+                idempotency.mark_status_prompted(patient["id"], d)
