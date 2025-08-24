@@ -46,6 +46,27 @@ async def has_reminder_row(patient_id: str, d: date, dose: str) -> bool:
         return bool(row and row[0])
 
 
+async def get_state(patient_id: str, d: date, dose: str):
+    """
+    Return (reminder_ts, confirm_ts) or None if row doesn't exist.
+    Used by ticker to decide repeat eligibility.
+    """
+    stmt = (
+        select(pills_day.c.reminder_ts, pills_day.c.confirm_ts)
+        .where(
+            and_(
+                pills_day.c.patient_id == patient_id,
+                pills_day.c.date_kyiv == d,
+                pills_day.c.dose == dose,
+            )
+        )
+        .limit(1)
+    )
+    async with engine().begin() as conn:
+        row = (await conn.execute(stmt)).first()
+        return tuple(row) if row else None
+
+
 async def set_confirm_if_empty(
     patient_id: str, d: date, dose: str, via: str
 ) -> Tuple[bool, Optional[str], bool]:
@@ -84,27 +105,6 @@ async def set_confirm_if_empty(
             changed = res.rowcount > 0
             return changed, label, escalated_ts is not None
         return False, label, escalated_ts is not None
-
-
-async def get_state(patient_id: str, d: date, dose: str):
-    """
-    Return (reminder_ts, confirm_ts) or None if row doesn't exist.
-    Used by ticker to decide repeat eligibility.
-    """
-    stmt = (
-        select(pills_day.c.reminder_ts, pills_day.c.confirm_ts)
-        .where(
-            and_(
-                pills_day.c.patient_id == patient_id,
-                pills_day.c.date_kyiv == d,
-                pills_day.c.dose == dose,
-            )
-        )
-        .limit(1)
-    )
-    async with engine().begin() as conn:
-        row = (await conn.execute(stmt)).first()
-        return tuple(row) if row else None
 
 
 async def latest_unconfirmed(

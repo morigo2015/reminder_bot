@@ -29,10 +29,10 @@ pills_day = Table(
     Column("date_kyiv", Date, primary_key=True),
     Column("dose", String(16), primary_key=True),  # 'morning' | 'evening'
     Column("label", String(120), nullable=False),
-    Column("reminder_ts", DateTime, nullable=True),
-    Column("confirm_ts", DateTime, nullable=True),
+    Column("reminder_ts", DateTime, nullable=True),  # UTC naive
+    Column("confirm_ts", DateTime, nullable=True),  # UTC naive
     Column("confirm_via", String(10), nullable=True),  # 'button' | 'text'
-    Column("escalated_ts", DateTime, nullable=True),
+    Column("escalated_ts", DateTime, nullable=True),  # UTC naive
 )
 
 bp_readings = Table(
