@@ -104,11 +104,11 @@ async def _maybe_send_pill_repeat(
 
     state = await pills.get_state(
         patient["id"], d, dose
-    )  # (reminder_ts, confirm_ts) or None
+    )  # (reminder_ts, confirm_ts, escalated_ts) or None
     if not state:
         return
-    reminder_ts, confirm_ts = state
-    if reminder_ts is None or confirm_ts is not None:
+    reminder_ts, confirm_ts, escalated_ts = state
+    if reminder_ts is None or confirm_ts is not None or escalated_ts is not None:
         return
 
     now_utc = timez.now_utc()

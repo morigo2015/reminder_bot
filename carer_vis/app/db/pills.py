@@ -48,11 +48,11 @@ async def has_reminder_row(patient_id: str, d: date, dose: str) -> bool:
 
 async def get_state(patient_id: str, d: date, dose: str):
     """
-    Return (reminder_ts, confirm_ts) or None if row doesn't exist.
+    Return (reminder_ts, confirm_ts, escalated_ts) or None if row doesn't exist.
     Used by ticker to decide repeat eligibility.
     """
     stmt = (
-        select(pills_day.c.reminder_ts, pills_day.c.confirm_ts)
+        select(pills_day.c.reminder_ts, pills_day.c.confirm_ts, pills_day.c.escalated_ts)
         .where(
             and_(
                 pills_day.c.patient_id == patient_id,
