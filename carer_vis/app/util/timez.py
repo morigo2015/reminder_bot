@@ -1,16 +1,14 @@
 from __future__ import annotations
 from datetime import datetime, date, time
 from zoneinfo import ZoneInfo
-from typing import Tuple
-import calendar
 
 from app import config
 
-WEEKDAYS_UK = [
-    "Понеділок", "Вівторок", "Середа", "Четвер", "П’ятниця", "Субота", "Неділя"
-]
+WEEKDAYS_UK = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+# "Понеділок", "Вівторок", "Середа", "Четвер", "П’ятниця", "Субота", "Неділя"
 
-DOSE_UK = {"morning": "Ранок", "evening": "Вечір"}
+DOSE_UK = {"morning": "Р", "evening": "В"}
+# DOSE_UK = {"morning": "Ранок", "evening": "Вечір"}
 
 
 def now_utc() -> datetime:
@@ -27,7 +25,9 @@ def date_kyiv(dt: datetime | None = None) -> date:
 
 def combine_kyiv(d: date, t: time) -> datetime:
     # time already carries tzinfo=config.TZ per config contract
-    return datetime(d.year, d.month, d.day, t.hour, t.minute, t.second, tzinfo=config.TZ)
+    return datetime(
+        d.year, d.month, d.day, t.hour, t.minute, t.second, tzinfo=config.TZ
+    )
 
 
 def due_today(local_time: time) -> bool:
