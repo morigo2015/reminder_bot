@@ -60,22 +60,51 @@ def _callback(patient_id: str, dose: str, d: date) -> str:
     return f"pill:{patient_id}:{dose}:{d.isoformat()}"
 
 
+async def _remove_old_pill_button(bot: Bot, patient_id: str, d: date) -> None:
+    """
+    Remove the button from the last pill message for this patient, if any.
+    """
+    last_msg = idempotency.get_last_pill_message(patient_id, d)
+    if last_msg:
+        chat_id, message_id = last_msg
+        try:
+            await with_retry(
+                bot.edit_message_reply_markup,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=None,
+            )
+        except Exception as e:
+            # Message might be too old, deleted, or other API error - continue anyway
+            logging.debug(
+                "Failed to remove old pill button: patient=%s msg_id=%s err=%s",
+                patient_id, message_id, e
+            )
+
+
 async def _send_initial(bot: Bot, patient: dict, dose: str, d: date) -> None:
     """
     Send the initial pill reminder; always upsert the DB row even if the send fails.
     This ensures repeats/escalation still function after transient Telegram errors.
     """
+    # Remove old pill button first
+    await _remove_old_pill_button(bot, patient["id"], d)
+    
     label = timez.pill_label(dose, d)
     kb = confirm_keyboard(_callback(patient["id"], dose, d))
 
     send_err = None
+    message_sent = None
     try:
-        await with_retry(
+        message_sent = await with_retry(
             bot.send_message,
             patient["chat_id"],
             texts_uk.render("pills.initial", label=label),
             reply_markup=kb,
+            parse_mode="HTML",
         )
+        # Store the new message ID
+        idempotency.set_last_pill_message(patient["id"], patient["chat_id"], message_sent.message_id, d)
     except Exception as e:
         send_err = e
         logging.error(
@@ -127,16 +156,22 @@ async def _maybe_send_pill_repeat(
         if age_min < max(1, cfg["repeat_min"]):
             return
 
+    # Remove old pill button first
+    await _remove_old_pill_button(bot, patient["id"], d)
+    
     # Send repeat
     label = timez.pill_label(dose, d)
     kb = confirm_keyboard(_callback(patient["id"], dose, d))
     try:
-        await with_retry(
+        message_sent = await with_retry(
             bot.send_message,
             patient["chat_id"],
             texts_uk.render("pills.repeat", label=label),
             reply_markup=kb,
+            parse_mode="HTML",
         )
+        # Store the new message ID and update repeat time
+        idempotency.set_last_pill_message(patient["id"], patient["chat_id"], message_sent.message_id, d)
         idempotency.set_last_repeat_time(rid_base, d, now_utc)
     except Exception as e:
         logging.error(

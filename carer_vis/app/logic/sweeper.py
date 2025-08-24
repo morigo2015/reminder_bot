@@ -63,7 +63,7 @@ async def sweep(bot: Bot) -> None:
             time_local=time_local_str,
             minutes=age_min,
         )
-        await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg)
+        await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg, parse_mode="HTML")
 
         print(
             {

@@ -61,11 +61,19 @@ async def on_pill_confirm(cb: CallbackQuery, bot: Bot):
 
     await cb.answer("Підтверджено ✅")
 
+    # Send full confirmation acknowledgment message to user
+    if changed:
+        await bot.send_message(
+            cb.message.chat.id,
+            texts_uk.render("pills.confirm_ack", label=label or "—"),
+            parse_mode="HTML"
+        )
+
     if changed and was_escalated:
         t_local = p.get("pills", {}).get("times", {}).get(dose)
         time_local_str = timez.planned_time_str(t_local) if t_local else "—"
         msg = texts_uk.render("pills.late_confirm", name=p["name"], label=label, time_local=time_local_str)
-        await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg)
+        await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg, parse_mode="HTML")
 
 
 @router.message()
@@ -109,12 +117,12 @@ async def on_message(message: Message, bot: Bot):
             return
         d_row, dose = latest
         changed, label, was_escalated = await pills.set_confirm_if_empty(patient["id"], d_row, dose, via="text")
-        await message.answer(texts_uk.render("pills.confirm_ack", label=label or "—"))
+        await message.answer(texts_uk.render("pills.confirm_ack", label=label or "—"), parse_mode="HTML")
         if changed and was_escalated:
             t_local = patient.get("pills", {}).get("times", {}).get(dose)
             time_local_str = timez.planned_time_str(t_local) if t_local else "—"
             msg = texts_uk.render("pills.late_confirm", name=patient["name"], label=label or "—", time_local=time_local_str)
-            await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg)
+            await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg, parse_mode="HTML")
         return
 
     # 3) Otherwise, treat as daily health status text
