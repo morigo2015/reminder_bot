@@ -74,16 +74,7 @@ async def _send_initial(bot: Bot, patient: dict, dose: str, d: date) -> None:
 async def _maybe_send_repeat(
     bot: Bot, patient: dict, dose: str, d: date, cfg: dict
 ) -> None:
-    """
-    Sends a repeat if:
-      - we have a DB row (initial exists),
-      - still within confirm window,
-      - at least repeat_min minutes since the initial,
-      - and we didn't already repeat at this minute-slice (idempotency).
-    """
-    rid = f"{patient['id']}:{dose}:{d.isoformat()}"
-    if idempotency.was_repeated(rid, d):
-        return
+    rid_base = f"{patient['id']}:{dose}:{d.isoformat()}"
 
     state = await pills.get_state(
         patient["id"], d, dose
@@ -94,7 +85,6 @@ async def _maybe_send_repeat(
     if reminder_ts is None or confirm_ts is not None:
         return
 
-    # reminder_ts is stored naive UTC in DB; make it aware to compute age
     age_min = int(
         (timez.now_utc() - reminder_ts.replace(tzinfo=ZoneInfo("UTC"))).total_seconds()
         // 60
@@ -104,15 +94,23 @@ async def _maybe_send_repeat(
     if age_min > cfg["window_min"]:
         return
 
-    if age_min >= cfg["repeat_min"]:
-        label = timez.pill_label(dose, d)
-        kb = confirm_keyboard(_callback(patient["id"], dose, d))
-        await bot.send_message(
-            patient["chat_id"],
-            texts_uk.render("pills.repeat", label=label),
-            reply_markup=kb,
-        )
-        idempotency.mark_repeat(rid, d)
+    # Compute which repeat bucket we're in: 2,4,6,... for repeat_min=2
+    bucket = age_min // max(1, cfg["repeat_min"])
+    if bucket <= 0:
+        return
+
+    rid_bucket = f"{rid_base}:r{bucket}"
+    if idempotency.was_repeated(rid_bucket, d):
+        return
+
+    label = timez.pill_label(dose, d)
+    kb = confirm_keyboard(_callback(patient["id"], dose, d))
+    await bot.send_message(
+        patient["chat_id"],
+        texts_uk.render("pills.repeat", label=label),
+        reply_markup=kb,
+    )
+    idempotency.mark_repeat(rid_bucket, d)
 
 
 async def tick(bot: Bot) -> None:
