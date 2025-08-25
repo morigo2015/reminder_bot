@@ -1,17 +1,17 @@
 import re
 
-BP_RE = re.compile(r"(?i)^(left|right|ліва|права|ліворуч|праворуч)\s+(\d{2,3})[,|/\-\s]+(\d{2,3})[,|/\-\s]+(\d{2,3})$")
+BP_RE = re.compile(
+    r"(?i)^(мама|надя|надія|папа|сергій|сергей)\s+(\d{2,3})[,|/\-\s]+(\d{2,3})[,|/\-\s]+(\d{2,3})$"
+)
 
 SIDE_MAP = {
-    "ліва": "left",
-    "ліворуч": "left",
-    "права": "right",
-    "праворуч": "right",
-    "left": "left",
-    "right": "right",
+    "мама": "left",
+    "надя": "left",
+    "надія": "left",
+    "папа": "right",
+    "сергій": "right",
+    "сергей": "right",
 }
-
-
 
 
 def parse_bp(text: str):
@@ -28,7 +28,7 @@ def parse_bp(text: str):
         pulse_v = int(pulse_s)
     except ValueError:
         return None
-    # Hard limits
-    if not (70 <= sys_v <= 260 and 40 <= dia_v <= 160 and 30 <= pulse_v <= 200):
-        return (side, sys_v, dia_v, pulse_v, "hard_range_fail")
+    # Accept any positive integers
+    if sys_v <= 0 or dia_v <= 0 or pulse_v <= 0:
+        return None
     return (side, sys_v, dia_v, pulse_v, None)

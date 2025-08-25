@@ -18,6 +18,8 @@ router = Router()
 CHAT_TO_PATIENT = {p["chat_id"]: p for p in config.PATIENTS}
 ID_TO_PATIENT = {p["id"]: p for p in config.PATIENTS}
 
+SIDE_DISPLAY_UK = {"left": "мама", "right": "папа"}
+
 
 def is_patient(msg_or_cb) -> bool:
     chat_id = (
@@ -31,9 +33,9 @@ def is_patient(msg_or_cb) -> bool:
 @router.message(CommandStart())
 async def start(message: Message):
     if message.chat.id in CHAT_TO_PATIENT:
-        await message.answer("Вітаю! Я буду нагадувати про ліки та збирати показники.")
+        await message.answer("Вітаю! Я буду нагадувати про ліки та тиск.")
     elif message.chat.id == config.NURSE_CHAT_ID:
-        await message.answer("Канал ескалацій підключено.")
+        await message.answer("Коммунікація з Іриною - підключено.")
 
 
 @router.callback_query(F.data.startswith("pill:"))
@@ -99,10 +101,7 @@ async def on_message(message: Message, bot: Bot):
     # 1) BP reading?
     bp = parser.parse_bp(txt)
     if bp:
-        side, sys_v, dia_v, pulse_v, hard_fail = bp
-        if hard_fail:
-            await message.answer(texts_uk.render("bp.error.range"))
-            return
+        side, sys_v, dia_v, pulse_v, _ = bp
         # compare safe ranges
         safe = patient.get("bp", {}).get("safe_ranges", {})
         s_sys = safe.get("sys", (90, 150))
@@ -116,6 +115,12 @@ async def on_message(message: Message, bot: Bot):
         await bp_db.insert_reading(
             patient["id"], side, sys_v, dia_v, pulse_v, out_of_range
         )
+        # Send confirmation to patient
+        side_uk = SIDE_DISPLAY_UK.get(side, side)
+        confirmation_msg = texts_uk.render(
+            "bp.received_ack", side=side_uk, sys=sys_v, dia=dia_v, pulse=pulse_v
+        )
+        await message.answer(confirmation_msg)
         if out_of_range:
             msg = texts_uk.render(
                 "bp.out_of_range_nurse",
@@ -128,7 +133,14 @@ async def on_message(message: Message, bot: Bot):
             await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg)
         return
 
-    # 2) Otherwise, treat as daily health status text
+    # 2) Otherwise, check if health status processing is enabled
+    if not config.USE_STATUS:
+        # Send "don't understand" message
+        unknown_msg = texts_uk.render("message.unknown", received_message=txt)
+        await message.answer(unknown_msg)
+        return
+
+    # 3) Treat as daily health status text
     # Match alert regexes
     match_str = None
     for rx in config.STATUS.get("alert_regexes", []):

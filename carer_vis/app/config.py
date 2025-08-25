@@ -23,6 +23,7 @@ DEFAULT_CONFIRM_WINDOW_MIN = 25
 DEFAULT_INITIAL_SEND_GRACE_MIN = 5  # global grace, keep it simple
 TICK_SECONDS = 60
 SWEEP_SECONDS = 300
+USE_STATUS = False  # Set to False to disable health status processing
 
 # --- Patients ---
 # id must match [a-z0-9_-]+ (used in callback payloads)
@@ -30,10 +31,10 @@ PATIENTS = [
     {
         "id": "alice",
         "chat_id": 382163513,
-        "name": "Аліса",
+        "name": "Мама",
         "pills": {
             "times": {
-                "morning": time(18, 32, tzinfo=TZ),
+                "morning": time(2, 1, tzinfo=TZ),
                 # "evening": time(23, 36, tzinfo=TZ),
             },
             "repeat_min": 2,  # per-patient override
@@ -41,14 +42,14 @@ PATIENTS = [
         },
         "bp": {
             "time": time(0, 25, tzinfo=TZ),
-            "safe_ranges": {"sys": (10, 300), "dia": (20, 310), "pulse": (30, 280)},
+            "safe_ranges": {"sys": (90, 220), "dia": (50, 140), "pulse": (40, 150)},
         },
     },
 ]
 
 # --- Daily health status ---
 STATUS = {
-    "time": time(18, 0, tzinfo=TZ),
+    # "time": time(18, 0, tzinfo=TZ),
     # initial examples; later refined with medical input
     "alert_regexes": [
         r"(?i)сильн(ий|а) біль",

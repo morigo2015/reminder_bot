@@ -1,5 +1,6 @@
 # app/db/pills.py
 from __future__ import annotations
+import logging
 from typing import Optional, Tuple
 from datetime import date
 from sqlalchemy import select, update, func, text, and_, desc
@@ -8,12 +9,18 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from app.db.session import engine
 from app.db.models import pills_day
 
+logger = logging.getLogger(__name__)
+
 
 async def upsert_reminder(patient_id: str, d: date, dose: str, label: str) -> None:
     """
     INSERT ... ON DUPLICATE KEY UPDATE with COALESCE(reminder_ts, inserted.reminder_ts)
     to preserve the original reminder_ts if already set.
     """
+    logger.debug(
+        "DB: Pills reminder upserted - patient=%s, date=%s, dose=%s, label=%s",
+        patient_id, d, dose, label
+    )
     stmt = mysql_insert(pills_day).values(
         patient_id=patient_id,
         date_kyiv=d,
@@ -103,6 +110,11 @@ async def set_confirm_if_empty(
             )
             res = await conn.execute(upd)
             changed = res.rowcount > 0
+            if changed:
+                logger.debug(
+                    "DB: Pills confirmation recorded - patient=%s, date=%s, dose=%s, via=%s, label=%s",
+                    patient_id, d, dose, via, label
+                )
             return changed, label, escalated_ts is not None
         return False, label, escalated_ts is not None
 
@@ -185,7 +197,13 @@ async def mark_escalated(patient_id: str, d: date, dose: str) -> bool:
     )
     async with engine().begin() as conn:
         res = await conn.execute(stmt)
-        return res.rowcount > 0
+        escalated = res.rowcount > 0
+        if escalated:
+            logger.debug(
+                "DB: Pills escalation marked - patient=%s, date=%s, dose=%s",
+                patient_id, d, dose
+            )
+        return escalated
 
 
 async def delete_today_records(patient_id: str, d: date, dose: str) -> int:
