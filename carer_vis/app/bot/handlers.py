@@ -9,7 +9,6 @@ from app.logic import parser
 from app.db import pills, bp as bp_db, status as status_db
 from app.util import timez
 from app.bot import texts_uk
-from app.bot.keyboards import BUTTON_TEXT_CONFIRM
 from app.util.retry import with_retry
 
 router = Router()
@@ -21,18 +20,12 @@ ID_TO_PATIENT = {p["id"]: p for p in config.PATIENTS}
 
 
 def is_patient(msg_or_cb) -> bool:
-    chat_id = msg_or_cb.message.chat.id if isinstance(msg_or_cb, CallbackQuery) else msg_or_cb.chat.id
+    chat_id = (
+        msg_or_cb.message.chat.id
+        if isinstance(msg_or_cb, CallbackQuery)
+        else msg_or_cb.chat.id
+    )
     return chat_id in CHAT_TO_PATIENT
-
-
-async def _send_confirmation_response(bot: Bot, chat_id: int, changed: bool, label: str, callback_query: CallbackQuery):
-    """Send confirmation response via callback answer for button confirmations."""
-    if changed:
-        confirmation_text = texts_uk.render("pills.confirm_ack", label=label or "—")
-        await callback_query.answer(confirmation_text, show_alert=True)
-    else:
-        # Already confirmed
-        await callback_query.answer("Підтверджено ✅")
 
 
 @router.message(CommandStart())
@@ -58,24 +51,36 @@ async def on_pill_confirm(cb: CallbackQuery, bot: Bot):
         await cb.answer("Недоступно.", show_alert=True)
         return
 
-    changed, label, was_escalated = await pills.set_confirm_if_empty(pid, d, dose, via="button")
+    changed, label, was_escalated = await pills.set_confirm_if_empty(
+        pid, d, dose, via="button"
+    )
     # Edit original message regardless; append check and remove keyboard
     try:
         text = cb.message.text
-        if text and "✅ Підтверджено" not in text:
-            text = text + "\n\n✅ Підтверджено"
-            await with_retry(bot.edit_message_text, text, chat_id=cb.message.chat.id, message_id=cb.message.message_id)
-        await with_retry(bot.edit_message_reply_markup, chat_id=cb.message.chat.id, message_id=cb.message.message_id, reply_markup=None)
+        ack_text = texts_uk.render("pills.confirm_ack", label=label)
+        if text and ack_text not in text:
+            text = text + "\n\n" + ack_text
+            await with_retry(
+                bot.edit_message_text,
+                text,
+                chat_id=cb.message.chat.id,
+                message_id=cb.message.message_id,
+            )
+        await with_retry(
+            bot.edit_message_reply_markup,
+            chat_id=cb.message.chat.id,
+            message_id=cb.message.message_id,
+            reply_markup=None,
+        )
     except Exception:
         pass
-
-    # Send confirmation response
-    await _send_confirmation_response(bot, cb.message.chat.id, changed, label, cb)
 
     if changed and was_escalated:
         t_local = p.get("pills", {}).get("times", {}).get(dose)
         time_local_str = timez.planned_time_str(t_local) if t_local else "—"
-        msg = texts_uk.render("pills.late_confirm", name=p["name"], label=label, time_local=time_local_str)
+        msg = texts_uk.render(
+            "pills.late_confirm", name=p["name"], label=label, time_local=time_local_str
+        )
         await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg, parse_mode="HTML")
 
 
@@ -103,10 +108,23 @@ async def on_message(message: Message, bot: Bot):
         s_sys = safe.get("sys", (90, 150))
         s_dia = safe.get("dia", (60, 95))
         s_pul = safe.get("pulse", (45, 110))
-        out_of_range = not (s_sys[0] <= sys_v <= s_sys[1] and s_dia[0] <= dia_v <= s_dia[1] and s_pul[0] <= pulse_v <= s_pul[1])
-        await bp_db.insert_reading(patient["id"], side, sys_v, dia_v, pulse_v, out_of_range)
+        out_of_range = not (
+            s_sys[0] <= sys_v <= s_sys[1]
+            and s_dia[0] <= dia_v <= s_dia[1]
+            and s_pul[0] <= pulse_v <= s_pul[1]
+        )
+        await bp_db.insert_reading(
+            patient["id"], side, sys_v, dia_v, pulse_v, out_of_range
+        )
         if out_of_range:
-            msg = texts_uk.render("bp.out_of_range_nurse", name=patient["name"], side=side, sys=sys_v, dia=dia_v, pulse=pulse_v)
+            msg = texts_uk.render(
+                "bp.out_of_range_nurse",
+                name=patient["name"],
+                side=side,
+                sys=sys_v,
+                dia=dia_v,
+                pulse=pulse_v,
+            )
             await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg)
         return
 
@@ -120,5 +138,7 @@ async def on_message(message: Message, bot: Bot):
             break
     await status_db.insert_status(patient["id"], txt, match_str)
     if match_str:
-        msg = texts_uk.render("status.alert_nurse", name=patient["name"], match=match_str)
+        msg = texts_uk.render(
+            "status.alert_nurse", name=patient["name"], match=match_str
+        )
         await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg)
