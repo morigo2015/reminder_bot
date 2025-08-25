@@ -25,6 +25,21 @@ def is_patient(msg_or_cb) -> bool:
     return chat_id in CHAT_TO_PATIENT
 
 
+async def _send_confirmation_response(bot: Bot, chat_id: int, changed: bool, label: str, callback_query: CallbackQuery = None):
+    """Send confirmation response - either as callback answer or regular message."""
+    if changed:
+        confirmation_text = texts_uk.render("pills.confirm_ack", label=label or "—")
+        if callback_query:
+            await callback_query.answer(confirmation_text, show_alert=True)
+        else:
+            await bot.send_message(chat_id, confirmation_text, parse_mode="HTML")
+    else:
+        # Already confirmed
+        if callback_query:
+            await callback_query.answer("Підтверджено ✅")
+        # For text confirmation, we don't send "already confirmed" message
+
+
 @router.message(CommandStart())
 async def start(message: Message):
     if message.chat.id in CHAT_TO_PATIENT:
@@ -59,15 +74,8 @@ async def on_pill_confirm(cb: CallbackQuery, bot: Bot):
     except Exception:
         pass
 
-    await cb.answer("Підтверджено ✅")
-
-    # Send full confirmation acknowledgment message to user
-    if changed:
-        await bot.send_message(
-            cb.message.chat.id,
-            texts_uk.render("pills.confirm_ack", label=label or "—"),
-            parse_mode="HTML"
-        )
+    # Send confirmation response
+    await _send_confirmation_response(bot, cb.message.chat.id, changed, label, callback_query=cb)
 
     if changed and was_escalated:
         t_local = p.get("pills", {}).get("times", {}).get(dose)
@@ -117,7 +125,7 @@ async def on_message(message: Message, bot: Bot):
             return
         d_row, dose = latest
         changed, label, was_escalated = await pills.set_confirm_if_empty(patient["id"], d_row, dose, via="text")
-        await message.answer(texts_uk.render("pills.confirm_ack", label=label or "—"), parse_mode="HTML")
+        await _send_confirmation_response(bot, message.chat.id, changed, label)
         if changed and was_escalated:
             t_local = patient.get("pills", {}).get("times", {}).get(dose)
             time_local_str = timez.planned_time_str(t_local) if t_local else "—"

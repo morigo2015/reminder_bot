@@ -186,3 +186,22 @@ async def mark_escalated(patient_id: str, d: date, dose: str) -> bool:
     async with engine().begin() as conn:
         res = await conn.execute(stmt)
         return res.rowcount > 0
+
+
+async def delete_today_records(patient_id: str, d: date, dose: str) -> int:
+    """
+    Delete all records for specific (patient_id, date, dose).
+    Returns number of deleted rows.
+    """
+    from sqlalchemy import delete
+    
+    stmt = delete(pills_day).where(
+        and_(
+            pills_day.c.patient_id == patient_id,
+            pills_day.c.date_kyiv == d,
+            pills_day.c.dose == dose,
+        )
+    )
+    async with engine().begin() as conn:
+        res = await conn.execute(stmt)
+        return res.rowcount

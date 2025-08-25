@@ -10,6 +10,8 @@ from app import config
 from app.bot.handlers import router
 from app.logic import ticker, sweeper
 from app.db.patients import upsert_patient
+from app.db.pills import delete_today_records
+from app.util import timez
 
 
 async def main():
@@ -19,6 +21,22 @@ async def main():
     # Seed patients so FKs are satisfied (SQLAlchemy engine is lazy-initialized)
     for p in config.PATIENTS:
         await upsert_patient(p["id"], p["chat_id"], p["name"])
+    
+    # Clean up today's pill records for fresh reminders
+    today = timez.date_kyiv()
+    total_deleted = 0
+    for patient in config.PATIENTS:
+        pill_cfg = patient.get("pills", {}) or {}
+        times = pill_cfg.get("times", {})
+        for dose in times.keys():
+            deleted = await delete_today_records(patient["id"], today, dose)
+            total_deleted += deleted
+            if deleted > 0:
+                logging.debug("Cleaned up %d records for patient=%s dose=%s date=%s", 
+                            deleted, patient["id"], dose, today)
+    
+    if total_deleted > 0:
+        logging.info("Bot startup: cleaned %d pill records for today=%s", total_deleted, today)
 
     bot = Bot(
         token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)

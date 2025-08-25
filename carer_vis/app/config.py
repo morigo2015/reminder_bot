@@ -33,7 +33,7 @@ PATIENTS = [
         "name": "Аліса",
         "pills": {
             "times": {
-                "morning": time(2, 38, tzinfo=TZ),
+                "morning": time(16, 35, tzinfo=TZ),
                 # "evening": time(23, 36, tzinfo=TZ),
             },
             "repeat_min": 2,  # per-patient override
