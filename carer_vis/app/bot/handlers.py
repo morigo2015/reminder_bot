@@ -25,19 +25,14 @@ def is_patient(msg_or_cb) -> bool:
     return chat_id in CHAT_TO_PATIENT
 
 
-async def _send_confirmation_response(bot: Bot, chat_id: int, changed: bool, label: str, callback_query: CallbackQuery = None):
-    """Send confirmation response - either as callback answer or regular message."""
+async def _send_confirmation_response(bot: Bot, chat_id: int, changed: bool, label: str, callback_query: CallbackQuery):
+    """Send confirmation response via callback answer for button confirmations."""
     if changed:
         confirmation_text = texts_uk.render("pills.confirm_ack", label=label or "—")
-        if callback_query:
-            await callback_query.answer(confirmation_text, show_alert=True)
-        else:
-            await bot.send_message(chat_id, confirmation_text, parse_mode="HTML")
+        await callback_query.answer(confirmation_text, show_alert=True)
     else:
         # Already confirmed
-        if callback_query:
-            await callback_query.answer("Підтверджено ✅")
-        # For text confirmation, we don't send "already confirmed" message
+        await callback_query.answer("Підтверджено ✅")
 
 
 @router.message(CommandStart())
@@ -75,7 +70,7 @@ async def on_pill_confirm(cb: CallbackQuery, bot: Bot):
         pass
 
     # Send confirmation response
-    await _send_confirmation_response(bot, cb.message.chat.id, changed, label, callback_query=cb)
+    await _send_confirmation_response(bot, cb.message.chat.id, changed, label, cb)
 
     if changed and was_escalated:
         t_local = p.get("pills", {}).get("times", {}).get(dose)
@@ -115,25 +110,7 @@ async def on_message(message: Message, bot: Bot):
             await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg)
         return
 
-    # 2) Confirmation text?
-    if parser.is_confirm_text(txt):
-        # resolve latest unconfirmed (today -> previous day)
-        d = timez.date_kyiv()
-        latest = await pills.latest_unconfirmed(patient["id"], d)
-        if not latest:
-            await message.answer(texts_uk.render("generic.not_found_pending"))
-            return
-        d_row, dose = latest
-        changed, label, was_escalated = await pills.set_confirm_if_empty(patient["id"], d_row, dose, via="text")
-        await _send_confirmation_response(bot, message.chat.id, changed, label)
-        if changed and was_escalated:
-            t_local = patient.get("pills", {}).get("times", {}).get(dose)
-            time_local_str = timez.planned_time_str(t_local) if t_local else "—"
-            msg = texts_uk.render("pills.late_confirm", name=patient["name"], label=label or "—", time_local=time_local_str)
-            await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg, parse_mode="HTML")
-        return
-
-    # 3) Otherwise, treat as daily health status text
+    # 2) Otherwise, treat as daily health status text
     # Match alert regexes
     match_str = None
     for rx in config.STATUS.get("alert_regexes", []):
