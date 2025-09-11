@@ -9,20 +9,31 @@ from aiogram.enums import ParseMode
 from app import config
 from app.bot.handlers import router
 from app.logic import ticker, sweeper
+from app.logic.schedule_loader import load_all_schedules, start_periodic_refresh
 from app.db.patients import upsert_patient
 from app.db.pills import delete_today_records
 from app.util import timez
 
 
 async def main():
-    # Configure logging
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
+    # Configure logging (DEBUG per spec)
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    # --- Load schedules from Google Sheets (stop on error) ---
+    try:
+        await load_all_schedules(startup=True)
+    except Exception as e:
+        logging.error("Startup aborted: %s", e)
+        return
+
     # Seed patients so FKs are satisfied (SQLAlchemy engine is lazy-initialized)
     for p in config.PATIENTS:
         await upsert_patient(p["id"], p["chat_id"], p["name"])
-    
-    # Clean up today's pill records for fresh reminders
+
+    # Clean up today's pill records for fresh reminders (based on loaded times)
     today = timez.date_kyiv()
     total_deleted = 0
     for patient in config.PATIENTS:
@@ -32,11 +43,18 @@ async def main():
             deleted = await delete_today_records(patient["id"], today, dose)
             total_deleted += deleted
             if deleted > 0:
-                logging.debug("Cleaned up %d records for patient=%s dose=%s date=%s", 
-                            deleted, patient["id"], dose, today)
-    
+                logging.debug(
+                    "Cleaned up %d records for patient=%s dose=%s date=%s",
+                    deleted,
+                    patient["id"],
+                    dose,
+                    today,
+                )
+
     if total_deleted > 0:
-        logging.info("Bot startup: cleaned %d pill records for today=%s", total_deleted, today)
+        logging.info(
+            "Bot startup: cleaned %d pill records for today=%s", total_deleted, today
+        )
 
     bot = Bot(
         token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -44,13 +62,15 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
+    # Background loops
+    t0 = asyncio.create_task(start_periodic_refresh())
     t1 = asyncio.create_task(ticker_loop(bot))
     t2 = asyncio.create_task(sweeper_loop(bot))
 
     try:
         await dp.start_polling(bot)
     finally:
-        for t in (t1, t2):
+        for t in (t0, t1, t2):
             t.cancel()
             with suppress(asyncio.CancelledError):
                 await t

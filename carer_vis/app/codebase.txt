@@ -1,0 +1,1321 @@
+### FILE: ./bot/handlers.py
+from __future__ import annotations
+from aiogram import Router, F, Bot
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import CommandStart
+from datetime import date
+
+from app import config
+from app.logic import parser
+from app.db import pills, bp as bp_db, status as status_db
+from app.util import timez
+from app.bot import texts_uk
+from app.util.retry import with_retry
+
+router = Router()
+
+# Helpers
+
+CHAT_TO_PATIENT = {p["chat_id"]: p for p in config.PATIENTS}
+ID_TO_PATIENT = {p["id"]: p for p in config.PATIENTS}
+
+SIDE_DISPLAY_UK = {"left": "мама", "right": "папа"}
+
+
+def is_patient(msg_or_cb) -> bool:
+    chat_id = (
+        msg_or_cb.message.chat.id
+        if isinstance(msg_or_cb, CallbackQuery)
+        else msg_or_cb.chat.id
+    )
+    return chat_id in CHAT_TO_PATIENT
+
+
+@router.message(CommandStart())
+async def start(message: Message):
+    if message.chat.id in CHAT_TO_PATIENT:
+        await message.answer("Вітаю! Я буду нагадувати про ліки та тиск.")
+    elif message.chat.id == config.NURSE_CHAT_ID:
+        await message.answer("Коммунікація з Іриною - підключено.")
+
+
+@router.callback_query(F.data.startswith("pill:"))
+async def on_pill_confirm(cb: CallbackQuery, bot: Bot):
+    # payload: pill:{patient_id}:{dose}:{YYYY-MM-DD}
+    try:
+        _, pid, dose, dates = cb.data.split(":", 3)
+        d = date.fromisoformat(dates)
+    except Exception:
+        await cb.answer("Невірні дані.", show_alert=True)
+        return
+    # authorize: only the patient themself can confirm
+    p = CHAT_TO_PATIENT.get(cb.message.chat.id)
+    if not p or p["id"] != pid:
+        await cb.answer("Недоступно.", show_alert=True)
+        return
+
+    changed, label, was_escalated = await pills.set_confirm_if_empty(
+        pid, d, dose, via="button"
+    )
+    # Edit original message regardless; append check and remove keyboard
+    try:
+        text = cb.message.text
+        ack_text = texts_uk.render("pills.confirm_ack", label=label)
+        if text and ack_text not in text:
+            text = text + "\n\n" + ack_text
+            await with_retry(
+                bot.edit_message_text,
+                text,
+                chat_id=cb.message.chat.id,
+                message_id=cb.message.message_id,
+            )
+        await with_retry(
+            bot.edit_message_reply_markup,
+            chat_id=cb.message.chat.id,
+            message_id=cb.message.message_id,
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    if changed and was_escalated:
+        t_local = p.get("pills", {}).get("times", {}).get(dose)
+        time_local_str = timez.planned_time_str(t_local) if t_local else "—"
+        msg = texts_uk.render(
+            "pills.late_confirm", name=p["name"], label=label, time_local=time_local_str
+        )
+        await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg, parse_mode="HTML")
+
+
+@router.message()
+async def on_message(message: Message, bot: Bot):
+    # Ignore nurse chat messages
+    if message.chat.id == config.NURSE_CHAT_ID:
+        return
+
+    patient = CHAT_TO_PATIENT.get(message.chat.id)
+    if not patient or not message.text:
+        return
+
+    txt = message.text.strip()
+
+    # 1) BP reading?
+    bp = parser.parse_bp(txt)
+    if bp:
+        side, sys_v, dia_v, pulse_v, _ = bp
+        # compare safe ranges
+        safe = patient.get("bp", {}).get("safe_ranges", {})
+        s_sys = safe.get("sys", (90, 150))
+        s_dia = safe.get("dia", (60, 95))
+        s_pul = safe.get("pulse", (45, 110))
+        out_of_range = not (
+            s_sys[0] <= sys_v <= s_sys[1]
+            and s_dia[0] <= dia_v <= s_dia[1]
+            and s_pul[0] <= pulse_v <= s_pul[1]
+        )
+        await bp_db.insert_reading(
+            patient["id"], side, sys_v, dia_v, pulse_v, out_of_range
+        )
+        # Send confirmation to patient
+        side_uk = SIDE_DISPLAY_UK.get(side, side)
+        confirmation_msg = texts_uk.render(
+            "bp.received_ack", side=side_uk, sys=sys_v, dia=dia_v, pulse=pulse_v
+        )
+        await message.answer(confirmation_msg)
+        if out_of_range:
+            msg = texts_uk.render(
+                "bp.out_of_range_nurse",
+                name=patient["name"],
+                side=side,
+                sys=sys_v,
+                dia=dia_v,
+                pulse=pulse_v,
+            )
+            await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg)
+        return
+
+    # 2) Otherwise, check if health status processing is enabled
+    if not config.USE_STATUS:
+        # Send "don't understand" message
+        unknown_msg = texts_uk.render("message.unknown", received_message=txt)
+        await message.answer(unknown_msg)
+        return
+
+    # 3) Treat as daily health status text
+    # Match alert regexes
+    match_str = None
+    for rx in config.STATUS.get("alert_regexes", []):
+        m = __import__("re").search(rx, txt)
+        if m:
+            match_str = m.group(0)
+            break
+    await status_db.insert_status(patient["id"], txt, match_str)
+    if match_str:
+        msg = texts_uk.render(
+            "status.alert_nurse", name=patient["name"], match=match_str
+        )
+        await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg)
+
+
+### FILE: ./bot/keyboards.py
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+BUTTON_TEXT_CONFIRM = "Підтвердити прийом ✅"
+
+
+def confirm_keyboard(callback_payload: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=BUTTON_TEXT_CONFIRM, callback_data=callback_payload)]]
+    )
+
+
+### FILE: ./bot/texts_uk.py
+# -*- coding: utf-8 -*-
+from typing import Mapping
+
+T = {
+    # Pills – patient
+    "pills.initial": "🔔💊 Час випити ліки {label_ext} (<b>{label}</b>)\n\n❗Натисніть\n'Підтвердити прийом'\n <b>ПІСЛЯ</b> того як приймете ліки",
+    "pills.repeat": "🔔💊 Повторне нагадування: ліки <b>{label}</b>\n\n❗ Не забудьте підтвердити!",
+    "pills.final": "⚠️💊 Підтвердження так і <b>не отримано</b>❗\n🚨 Відправляю повідомлення сімейній мед.сестрі!",
+    "pills.confirm_ack": "✅💊 Дякую!\nПрийом <b>{label}</b> підтверджено",
+    # Pills – nurse (private chat)
+    "pills.escalation": (
+        "🚨💊 Увага: {name} не підтвердила прийом ліків <b>{label}</b>.\n"
+        "Було заплановано на {time_local}\n⏱️ Вже минуло: {minutes} хв."
+    ),
+    "pills.late_confirm": (
+        "ℹ️ Оновлення: {name} підтвердила прийом ліків <b>{label}</b> (вже ПІСЛЯ ескалації).\n"
+    ),
+    # BP
+    "bp.reminder": "🔔💓 Час виміряти тиск!\n\nНадішліть результати у форматі:\nпапа 120 60 55\nабо:\nмама 120 60 55",
+    "bp.error.format": "❌💓🔄 Невірно записані результати тиску\n\nПриклад як правильно: папа 120 60 55",
+    "bp.error.range": "⚠️💓🔄 Значення тиску - поза межами.\n\n Перевірте, будь ласка, і надішліть ще раз.",
+    "bp.out_of_range_nurse": "🚨💓 Попередження: у {side} тиск поза межами:\n {sys}/{dia} {pulse}",
+    "bp.received_ack": "✅💓 Отримано виміри тиску \n <b>{side}: {sys}/{dia} {pulse}</b>\nДякую!",
+    # Status
+    "status.prompt": "😊 Як Ви сьогодні себе почуваєте?\n\n💭 Коротко опишіть стан.",
+    "status.alert_nurse": "🚨 Попередження: стан пацієнта {name} містить ризикові ознаки:\n⚠️ '{match}'",
+    "message.unknown": "отримано:\n<b>{received_message}</b>\n🤷🏼‍♂️не розумію що це.\nЯкщо тиск то має бути, наприклад:\nпапа 120 60 55",
+}
+
+
+class MissingVarError(KeyError): ...
+
+
+def render(key: str, **vars: Mapping[str, object]) -> str:
+    try:
+        return T[key].format(**vars)
+    except KeyError as e:
+        raise MissingVarError(f"Template '{key}' missing var: {e}") from e
+
+
+### FILE: ./config.py
+from zoneinfo import ZoneInfo
+from datetime import time
+
+# --- Timezone ---
+TZ = ZoneInfo("Europe/Kyiv")
+
+# --- Telegram (temporary: keep here per spec) ---
+# BOT_TOKEN = "550433191:AAFkG6atLs_uo0nwphtuiwbwIJeUhwfzCyI"
+BOT_TOKEN = "7994158515:AAF_huVgWba-DwJ6b1vNUTl3nxP1Qa4xykE"
+NURSE_CHAT_ID = 7391874317  # private chat id
+
+# --- Defaults (can be overridden per patient) ---
+DEFAULT_REPEAT_REMINDER_MIN = 10
+DEFAULT_CONFIRM_WINDOW_MIN = 25
+DEFAULT_INITIAL_SEND_GRACE_MIN = 10  # global grace, keep it simple
+TICK_SECONDS = 60
+SWEEP_SECONDS = 300
+USE_STATUS = False  # Set to False to disable health status processing
+
+# --- Patients ---
+PATIENTS = [
+    {
+        "id": "alice",  # id must match [a-z0-9_-]+ (used in callback payloads)
+        "chat_id": 382163513,
+        "name": "Мама",
+        "pills": {
+            "times": {
+                "morning": time(23, 14, tzinfo=TZ),
+                # "evening": time(23, 36, tzinfo=TZ),
+            },
+            "repeat_min": 2,  # per-patient override
+            "confirm_window_min": 8,  # per-patient override
+        },
+        "bp": {
+            "time": time(22, 46, tzinfo=TZ),
+            "safe_ranges": {"sys": (90, 220), "dia": (50, 140), "pulse": (40, 150)},
+        },
+    },
+]
+
+# --- Daily health status ---
+STATUS = {
+    # "time": time(18, 0, tzinfo=TZ),
+    # initial examples; later refined with medical input
+    "alert_regexes": [
+        r"(?i)сильн(ий|а) біль",
+        # r"(?i)сильн(ий|а) біль у грудях|коротке дихання|задишка",
+        # r"(?i)запамороченн(я|ям)|втрата свідомості|непритомн",
+        # r"(?i)сильний головний біль|сплутаність свідомості",
+        r"(?i)сильний головний біль",
+        # r"(?i)аритмія|нерівн(ий|е) серцебиття",
+    ],
+}
+
+# --- MySQL connection ---
+DB = {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "igor",
+    "password": "1",
+    "db": "carer",
+}
+
+
+### FILE: ./db/bp.py
+# app/db/bp.py
+from __future__ import annotations
+import logging
+from sqlalchemy import insert, func
+from app.db.session import engine
+from app.db.models import bp_readings
+
+logger = logging.getLogger(__name__)
+
+
+async def insert_reading(
+    patient_id: str, side: str, sys_v: int, dia_v: int, pulse_v: int, out_of_range: bool
+) -> None:
+    flags = "out_of_range" if out_of_range else None
+    logger.debug(
+        "DB: BP reading inserted - patient=%s, side=%s, bp=%s/%s, pulse=%s, out_of_range=%s",
+        patient_id, side, sys_v, dia_v, pulse_v, out_of_range
+    )
+    stmt = insert(bp_readings).values(
+        patient_id=patient_id,
+        ts_utc=func.utc_timestamp(),
+        side=side,
+        sys=sys_v,
+        dia=dia_v,
+        pulse=pulse_v,
+        flags=flags,
+    )
+    async with engine().begin() as conn:
+        await conn.execute(stmt)
+
+
+### FILE: ./db/models.py
+# app/db/models.py
+from __future__ import annotations
+from sqlalchemy import (
+    MetaData,
+    Table,
+    Column,
+    String,
+    BigInteger,
+    Date,
+    DateTime,
+    Text,
+    SmallInteger,
+)
+
+metadata = MetaData()
+
+patients = Table(
+    "patients",
+    metadata,
+    Column("id", String(40), primary_key=True),
+    Column("chat_id", BigInteger, nullable=False),
+    Column("name", String(100), nullable=False),
+)
+
+pills_day = Table(
+    "pills_day",
+    metadata,
+    Column("patient_id", String(40), primary_key=True),
+    Column("date_kyiv", Date, primary_key=True),
+    Column("dose", String(16), primary_key=True),  # 'morning' | 'evening'
+    Column("label", String(120), nullable=False),
+    Column("reminder_ts", DateTime, nullable=True),  # UTC naive
+    Column("confirm_ts", DateTime, nullable=True),  # UTC naive
+    Column("confirm_via", String(10), nullable=True),  # 'button' | 'text'
+    Column("escalated_ts", DateTime, nullable=True),  # UTC naive
+)
+
+bp_readings = Table(
+    "bp_readings",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("patient_id", String(40), nullable=False),
+    Column("ts_utc", DateTime, nullable=False),
+    Column("side", String(10), nullable=False),  # 'left' | 'right'
+    Column("sys", SmallInteger, nullable=False),
+    Column("dia", SmallInteger, nullable=False),
+    Column("pulse", SmallInteger, nullable=False),
+    Column("flags", String(40), nullable=True),  # may contain 'out_of_range'
+    Column("escalated_ts", DateTime, nullable=True),
+)
+
+health_status = Table(
+    "health_status",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("patient_id", String(40), nullable=False),
+    Column("ts_utc", DateTime, nullable=False),
+    Column("text", Text, nullable=False),
+    Column("alert_match", String(200), nullable=True),
+    Column("escalated_ts", DateTime, nullable=True),
+)
+
+
+### FILE: ./db/patients.py
+# app/db/patients.py
+from __future__ import annotations
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from app.db.session import engine
+from app.db.models import patients
+
+
+async def upsert_patient(pid: str, chat_id: int, name: str) -> None:
+    stmt = mysql_insert(patients).values(id=pid, chat_id=chat_id, name=name)
+    stmt = stmt.on_duplicate_key_update(
+        chat_id=stmt.inserted.chat_id,
+        name=stmt.inserted.name,
+    )
+    async with engine().begin() as conn:
+        await conn.execute(stmt)
+
+
+### FILE: ./db/pills.py
+# app/db/pills.py
+from __future__ import annotations
+import logging
+from typing import Optional, Tuple
+from datetime import date
+from sqlalchemy import select, update, func, text, and_, desc
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+from app.db.session import engine
+from app.db.models import pills_day
+
+logger = logging.getLogger(__name__)
+
+
+async def upsert_reminder(patient_id: str, d: date, dose: str, label: str) -> None:
+    """
+    INSERT ... ON DUPLICATE KEY UPDATE with COALESCE(reminder_ts, inserted.reminder_ts)
+    to preserve the original reminder_ts if already set.
+    """
+    logger.debug(
+        "DB: Pills reminder upserted - patient=%s, date=%s, dose=%s, label=%s",
+        patient_id, d, dose, label
+    )
+    stmt = mysql_insert(pills_day).values(
+        patient_id=patient_id,
+        date_kyiv=d,
+        dose=dose,
+        label=label,
+        reminder_ts=func.utc_timestamp(),
+    )
+    stmt = stmt.on_duplicate_key_update(
+        reminder_ts=func.coalesce(pills_day.c.reminder_ts, stmt.inserted.reminder_ts),
+        label=stmt.inserted.label,
+    )
+    async with engine().begin() as conn:
+        await conn.execute(stmt)
+
+
+async def has_reminder_row(patient_id: str, d: date, dose: str) -> bool:
+    stmt = (
+        select(pills_day.c.reminder_ts.is_not(None))
+        .where(
+            and_(
+                pills_day.c.patient_id == patient_id,
+                pills_day.c.date_kyiv == d,
+                pills_day.c.dose == dose,
+            )
+        )
+        .limit(1)
+    )
+    async with engine().begin() as conn:
+        row = (await conn.execute(stmt)).first()
+        return bool(row and row[0])
+
+
+async def get_state(patient_id: str, d: date, dose: str):
+    """
+    Return (reminder_ts, confirm_ts, escalated_ts) or None if row doesn't exist.
+    Used by ticker to decide repeat eligibility.
+    """
+    stmt = (
+        select(pills_day.c.reminder_ts, pills_day.c.confirm_ts, pills_day.c.escalated_ts)
+        .where(
+            and_(
+                pills_day.c.patient_id == patient_id,
+                pills_day.c.date_kyiv == d,
+                pills_day.c.dose == dose,
+            )
+        )
+        .limit(1)
+    )
+    async with engine().begin() as conn:
+        row = (await conn.execute(stmt)).first()
+        return tuple(row) if row else None
+
+
+async def set_confirm_if_empty(
+    patient_id: str, d: date, dose: str, via: str
+) -> Tuple[bool, Optional[str], bool]:
+    """
+    Return (changed, label, was_escalated)
+    changed=True if confirm_ts was written now.
+    """
+    sel = select(
+        pills_day.c.confirm_ts, pills_day.c.escalated_ts, pills_day.c.label
+    ).where(
+        and_(
+            pills_day.c.patient_id == patient_id,
+            pills_day.c.date_kyiv == d,
+            pills_day.c.dose == dose,
+        )
+    )
+    async with engine().begin() as conn:
+        row = (await conn.execute(sel)).first()
+        if not row:
+            return False, None, False
+        confirm_ts, escalated_ts, label = row
+        if confirm_ts is None:
+            upd = (
+                update(pills_day)
+                .where(
+                    and_(
+                        pills_day.c.patient_id == patient_id,
+                        pills_day.c.date_kyiv == d,
+                        pills_day.c.dose == dose,
+                        pills_day.c.confirm_ts.is_(None),
+                    )
+                )
+                .values(confirm_ts=func.utc_timestamp(), confirm_via=via)
+            )
+            res = await conn.execute(upd)
+            changed = res.rowcount > 0
+            if changed:
+                logger.debug(
+                    "DB: Pills confirmation recorded - patient=%s, date=%s, dose=%s, via=%s, label=%s",
+                    patient_id, d, dose, via, label
+                )
+            return changed, label, escalated_ts is not None
+        return False, label, escalated_ts is not None
+
+
+async def latest_unconfirmed(
+    patient_id: str, today: date
+) -> Optional[Tuple[date, str]]:
+    """Find latest unconfirmed: prefer today, else previous day(s). Returns (date, dose)."""
+    async with engine().begin() as conn:
+        # 1) Today first (latest by reminder_ts)
+        stmt_today = (
+            select(pills_day.c.date_kyiv, pills_day.c.dose)
+            .where(
+                and_(
+                    pills_day.c.patient_id == patient_id,
+                    pills_day.c.date_kyiv == today,
+                    pills_day.c.reminder_ts.is_not(None),
+                    pills_day.c.confirm_ts.is_(None),
+                )
+            )
+            .order_by(desc(pills_day.c.reminder_ts))
+            .limit(1)
+        )
+        row = (await conn.execute(stmt_today)).first()
+        if row:
+            return row[0], row[1]
+        # 2) Previous days (latest by date_kyiv, reminder_ts)
+        stmt_prev = (
+            select(pills_day.c.date_kyiv, pills_day.c.dose)
+            .where(
+                and_(
+                    pills_day.c.patient_id == patient_id,
+                    pills_day.c.date_kyiv < today,
+                    pills_day.c.reminder_ts.is_not(None),
+                    pills_day.c.confirm_ts.is_(None),
+                )
+            )
+            .order_by(desc(pills_day.c.date_kyiv), desc(pills_day.c.reminder_ts))
+            .limit(1)
+        )
+        row = (await conn.execute(stmt_prev)).first()
+        if row:
+            return row[0], row[1]
+        return None
+
+
+async def overdue_candidates():
+    """
+    Return rows of (patient_id, date_kyiv, dose, age_min) for all unconfirmed & not escalated reminders.
+    """
+    age_min = func.timestampdiff(
+        text("MINUTE"), pills_day.c.reminder_ts, func.utc_timestamp()
+    ).label("age_min")
+    stmt = select(
+        pills_day.c.patient_id, pills_day.c.date_kyiv, pills_day.c.dose, age_min
+    ).where(
+        and_(
+            pills_day.c.reminder_ts.is_not(None),
+            pills_day.c.confirm_ts.is_(None),
+            pills_day.c.escalated_ts.is_(None),
+        )
+    )
+    async with engine().begin() as conn:
+        rows = (await conn.execute(stmt)).all()
+        return [tuple(r) for r in rows]
+
+
+async def mark_escalated(patient_id: str, d: date, dose: str) -> bool:
+    stmt = (
+        update(pills_day)
+        .where(
+            and_(
+                pills_day.c.patient_id == patient_id,
+                pills_day.c.date_kyiv == d,
+                pills_day.c.dose == dose,
+                pills_day.c.escalated_ts.is_(None),
+            )
+        )
+        .values(escalated_ts=func.utc_timestamp())
+    )
+    async with engine().begin() as conn:
+        res = await conn.execute(stmt)
+        escalated = res.rowcount > 0
+        if escalated:
+            logger.debug(
+                "DB: Pills escalation marked - patient=%s, date=%s, dose=%s",
+                patient_id, d, dose
+            )
+        return escalated
+
+
+async def delete_today_records(patient_id: str, d: date, dose: str) -> int:
+    """
+    Delete all records for specific (patient_id, date, dose).
+    Returns number of deleted rows.
+    """
+    from sqlalchemy import delete
+    
+    stmt = delete(pills_day).where(
+        and_(
+            pills_day.c.patient_id == patient_id,
+            pills_day.c.date_kyiv == d,
+            pills_day.c.dose == dose,
+        )
+    )
+    async with engine().begin() as conn:
+        res = await conn.execute(stmt)
+        return res.rowcount
+
+
+### FILE: ./db/session.py
+# app/db/session.py
+from __future__ import annotations
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from app import config
+
+_engine: AsyncEngine | None = None
+
+
+def engine() -> AsyncEngine:
+    """
+    Lazily create a singleton AsyncEngine.
+    Uses the already-installed aiomysql driver via SQLAlchemy's 'mysql+aiomysql'.
+    """
+    global _engine
+    if _engine is None:
+        _engine = create_async_engine(
+            f"mysql+aiomysql://{config.DB['user']}:{config.DB['password']}"
+            f"@{config.DB['host']}:{config.DB['port']}/{config.DB['db']}",
+            pool_pre_ping=True,
+            pool_size=5,
+            max_overflow=0,
+            echo=False,
+        )
+    return _engine
+
+
+### FILE: ./db/status.py
+# app/db/status.py
+from __future__ import annotations
+import logging
+from sqlalchemy import insert, func
+from app.db.session import engine
+from app.db.models import health_status
+
+logger = logging.getLogger(__name__)
+
+
+async def insert_status(patient_id: str, text: str, alert_match: str | None) -> None:
+    logger.debug(
+        "DB: Health status inserted - patient=%s, text=%s, alert_match=%s",
+        patient_id, text[:50] + "..." if len(text) > 50 else text, alert_match
+    )
+    stmt = insert(health_status).values(
+        patient_id=patient_id,
+        ts_utc=func.utc_timestamp(),
+        text=text,
+        alert_match=alert_match,
+    )
+    async with engine().begin() as conn:
+        await conn.execute(stmt)
+
+
+### FILE: ./logic/parser.py
+import re
+
+BP_RE = re.compile(
+    r"(?i)^(мама|надя|надія|папа|сергій|сергей)\s+(\d{2,3})[,|/\-\s]+(\d{2,3})[,|/\-\s]+(\d{2,3})$"
+)
+
+SIDE_MAP = {
+    "мама": "left",
+    "надя": "left",
+    "надія": "left",
+    "папа": "right",
+    "сергій": "right",
+    "сергей": "right",
+}
+
+
+def parse_bp(text: str):
+    m = BP_RE.match(text.strip())
+    if not m:
+        return None
+    side_raw, sys_s, dia_s, pulse_s = m.groups()
+    side = SIDE_MAP.get(side_raw.lower())
+    if side is None:
+        return None
+    try:
+        sys_v = int(sys_s)
+        dia_v = int(dia_s)
+        pulse_v = int(pulse_s)
+    except ValueError:
+        return None
+    # Accept any positive integers
+    if sys_v <= 0 or dia_v <= 0 or pulse_v <= 0:
+        return None
+    return (side, sys_v, dia_v, pulse_v, None)
+
+
+### FILE: ./logic/sweeper.py
+# app/logic/sweeper.py
+from __future__ import annotations
+from typing import Optional
+from aiogram import Bot
+
+from app import config
+from app.bot import texts_uk
+from app.db import pills
+from app.util import timez
+from app.util.retry import with_retry
+
+
+def _find_patient(pid: str) -> Optional[dict]:
+    for p in config.PATIENTS:
+        if p.get("id") == pid:
+            return p
+    return None
+
+
+def _confirm_window_min(patient: dict) -> int:
+    p = patient.get("pills") or {}
+    return p.get(
+        "confirm_window_min", getattr(config, "DEFAULT_CONFIRM_WINDOW_MIN", 25)
+    )
+
+
+async def sweep(bot: Bot) -> None:
+    """
+    Escalate ONLY rows that exist (initial was sent) and are past the confirm window.
+    Sends a final notice to the patient + an escalation to the nurse, then marks escalated.
+    """
+    rows = await pills.overdue_candidates()  # (patient_id, date_kyiv, dose, age_min)
+    for pid, d, dose, age_min in rows:
+        patient = _find_patient(pid)
+        if not patient:
+            print(
+                {"level": "warn", "action": "sweeper.skip.unknown_patient", "pid": pid}
+            )
+            continue
+
+        window_min = _confirm_window_min(patient)
+        if age_min < window_min:
+            continue
+
+        # Mark escalated first (idempotent)
+        updated = await pills.mark_escalated(pid, d, dose)
+        if not updated:
+            continue
+
+        # Final notice to patient
+        await with_retry(
+            bot.send_message, patient["chat_id"], texts_uk.render("pills.final")
+        )
+
+        # Nurse escalation
+        label = timez.pill_label(dose, d)
+        t_local = (patient.get("pills") or {}).get("times", {}).get(dose)
+        time_local_str = timez.planned_time_str(t_local) if t_local else "—"
+        msg = texts_uk.render(
+            "pills.escalation",
+            name=patient["name"],
+            label=label,
+            time_local=time_local_str,
+            minutes=age_min,
+        )
+        await with_retry(bot.send_message, config.NURSE_CHAT_ID, msg, parse_mode="HTML")
+
+        print(
+            {
+                "level": "info",
+                "action": "sweeper.escalated",
+                "patient": pid,
+                "dose": dose,
+                "date": d.isoformat(),
+                "age_min": age_min,
+                "nurse_chat": config.NURSE_CHAT_ID,
+            }
+        )
+
+
+### FILE: ./logic/ticker.py
+# app/logic/ticker.py
+"""
+Minimal reminder ticker (time-throttled; no buckets, no DB repeat claim).
+
+Policy:
+  1) Initial pill reminder: send ONLY if we're within a small grace window after
+     the scheduled local time (DEFAULT_INITIAL_SEND_GRACE_MIN).
+     We upsert the DB row even if the Telegram send fails (so repeats/escalation still work).
+  2) Pill repeats: only if an initial DB row exists; send when at least
+     repeat_min minutes have passed since the *last* repeat we sent,
+     and only while still inside the confirmation window.
+  3) BP and Status: also time-throttled; default interval is 24h (once/day).
+  4) No backfill; Sweeper escalates ONLY for rows that exist.
+
+Assumptions:
+  - time helpers (app.util.timez) return tz-aware Kyiv/UTC datetimes.
+  - DB layer (app.db.pills):
+      - upsert_reminder(patient_id, date, dose, label)
+      - has_reminder_row(patient_id, date, dose) -> bool
+      - get_state(patient_id, date, dose) -> (reminder_ts_utc_naive, confirm_ts_utc_naive) | None
+  - idempotency helpers (app.util.idempotency):
+      - get_last_repeat_time(reminder_base_id, day) / set_last_repeat_time(...)
+      - get_last_bp_time / set_last_bp_time
+      - get_last_status_time / set_last_status_time
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import date, timedelta
+from zoneinfo import ZoneInfo
+from aiogram import Bot
+
+from app import config
+from app.bot import texts_uk
+from app.bot.keyboards import confirm_keyboard
+from app.db import pills
+from app.util import timez, idempotency
+from app.util.retry import with_retry
+
+
+def _age_min_since_local(t_local) -> int:
+    """Minutes from today's scheduled local (Kyiv) time to now (Kyiv)."""
+    d = timez.date_kyiv()
+    sched = timez.combine_kyiv(d, t_local)  # tz-aware Kyiv datetime
+    return int((timez.now_kyiv() - sched).total_seconds() // 60)
+
+
+def _pill_cfg(patient: dict) -> dict:
+    p = patient.get("pills", {}) or {}
+    return {
+        "repeat_min": p.get("repeat_min", config.DEFAULT_REPEAT_REMINDER_MIN),
+        "window_min": p.get("confirm_window_min", config.DEFAULT_CONFIRM_WINDOW_MIN),
+        "grace_min": getattr(config, "DEFAULT_INITIAL_SEND_GRACE_MIN", 5),
+        "times": p.get("times", {}),
+    }
+
+
+def _callback(patient_id: str, dose: str, d: date) -> str:
+    return f"pill:{patient_id}:{dose}:{d.isoformat()}"
+
+
+async def _remove_old_pill_button(bot: Bot, patient_id: str, d: date) -> None:
+    """
+    Remove the button from the last pill message for this patient, if any.
+    """
+    last_msg = idempotency.get_last_pill_message(patient_id, d)
+    if last_msg:
+        chat_id, message_id = last_msg
+        try:
+            await with_retry(
+                bot.edit_message_reply_markup,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=None,
+            )
+        except Exception as e:
+            # Message might be too old, deleted, or other API error - continue anyway
+            logging.debug(
+                "Failed to remove old pill button: patient=%s msg_id=%s err=%s",
+                patient_id, message_id, e
+            )
+
+
+async def _send_initial(bot: Bot, patient: dict, dose: str, d: date) -> None:
+    """
+    Send the initial pill reminder; always upsert the DB row even if the send fails.
+    This ensures repeats/escalation still function after transient Telegram errors.
+    """
+    # Remove old pill button first
+    await _remove_old_pill_button(bot, patient["id"], d)
+    
+    label = timez.pill_label(dose, d)
+    label_ext = timez.pill_label_ext(dose, d)
+    kb = confirm_keyboard(_callback(patient["id"], dose, d))
+
+    send_err = None
+    message_sent = None
+    try:
+        message_sent = await with_retry(
+            bot.send_message,
+            patient["chat_id"],
+            texts_uk.render("pills.initial", label=label, label_ext=label_ext),
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        # Store the new message ID
+        idempotency.set_last_pill_message(patient["id"], patient["chat_id"], message_sent.message_id, d)
+    except Exception as e:
+        send_err = e
+        logging.error(
+            "initial send failed: patient=%s dose=%s err=%s", patient["id"], dose, e
+        )
+
+    # Upsert regardless of send status
+    try:
+        await pills.upsert_reminder(patient["id"], d, dose, label)
+    finally:
+        if send_err:
+            # Don't re-raise; let repeats/escalation handle recovery.
+            pass
+
+
+async def _maybe_send_pill_repeat(
+    bot: Bot, patient: dict, dose: str, d: date, cfg: dict
+) -> None:
+    """
+    Time-based throttling for pills:
+      - Send a repeat if (now_utc - last_repeat_utc) >= repeat_min minutes,
+        while inside the confirmation window and not yet confirmed.
+      - First repeat waits repeat_min minutes after initial.
+    """
+    rid_base = f"{patient['id']}:{dose}:{d.isoformat()}"
+
+    state = await pills.get_state(
+        patient["id"], d, dose
+    )  # (reminder_ts, confirm_ts, escalated_ts) or None
+    if not state:
+        return
+    reminder_ts, confirm_ts, escalated_ts = state
+    if reminder_ts is None or confirm_ts is not None or escalated_ts is not None:
+        return
+
+    now_utc = timez.now_utc()
+    age_min = int(
+        (now_utc - reminder_ts.replace(tzinfo=ZoneInfo("UTC"))).total_seconds() // 60
+    )
+    if age_min > cfg["window_min"]:
+        return
+
+    last_repeat_utc = idempotency.get_last_repeat_time(rid_base, d)
+    if last_repeat_utc is not None:
+        if (now_utc - last_repeat_utc) < timedelta(minutes=max(1, cfg["repeat_min"])):
+            return
+    else:
+        # No repeat yet; ensure at least repeat_min minutes since initial.
+        if age_min < max(1, cfg["repeat_min"]):
+            return
+
+    # Remove old pill button first
+    await _remove_old_pill_button(bot, patient["id"], d)
+    
+    # Send repeat
+    label = timez.pill_label(dose, d)
+    kb = confirm_keyboard(_callback(patient["id"], dose, d))
+    try:
+        message_sent = await with_retry(
+            bot.send_message,
+            patient["chat_id"],
+            texts_uk.render("pills.repeat", label=label),
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        # Store the new message ID and update repeat time
+        idempotency.set_last_pill_message(patient["id"], patient["chat_id"], message_sent.message_id, d)
+        idempotency.set_last_repeat_time(rid_base, d, now_utc)
+    except Exception as e:
+        logging.error(
+            "repeat send failed: patient=%s dose=%s err=%s", patient["id"], dose, e
+        )
+
+
+async def tick(bot: Bot) -> None:
+    """
+    Runs once per TICK_SECONDS (see main.py loop).
+    Pills: initial within grace; time-throttled repeats until confirm/escalation.
+    BP/Status: time-throttled (defaults to once per day).
+    """
+    d = timez.date_kyiv()
+    now_k = timez.now_kyiv()
+    now_utc = timez.now_utc()
+    logging.debug("tick: now_kyiv=%s", now_k)
+
+    for patient in config.PATIENTS:
+        cfg = _pill_cfg(patient)
+
+        # -------- Pills --------
+        for dose, t_local in cfg["times"].items():
+            if not timez.due_today(t_local):
+                logging.debug(
+                    "due_check: patient=%s dose=%s due=False scheduled=%02d:%02d",
+                    patient["id"],
+                    dose,
+                    t_local.hour,
+                    t_local.minute,
+                )
+                continue
+
+            age = _age_min_since_local(t_local)
+            exists = await pills.has_reminder_row(patient["id"], d, dose)
+
+            logging.debug(
+                "due_check: patient=%s dose=%s due=True scheduled=%02d:%02d age_min=%s exists=%s",
+                patient["id"],
+                dose,
+                t_local.hour,
+                t_local.minute,
+                age,
+                exists,
+            )
+
+            # Initial: only within grace; otherwise skip (no DB writes).
+            if not exists and 0 <= age <= cfg["grace_min"]:
+                await _send_initial(bot, patient, dose, d)
+
+            # Repeats: only if a row exists; time-throttled and capped by window.
+            if exists:
+                await _maybe_send_pill_repeat(bot, patient, dose, d, cfg)
+
+        # -------- BP (time-throttled, defaults to once/day) --------
+        bp_cfg = patient.get("bp") or {}
+        t_bp = bp_cfg.get("time")
+        if t_bp and timez.due_today(t_bp):
+            age_bp = _age_min_since_local(t_bp)
+            if 0 <= age_bp <= cfg["grace_min"]:
+                # throttle interval: default 1440 min (once/day)
+                bp_repeat_min = getattr(config, "BP_REPEAT_MIN", 1440)
+                last_bp = idempotency.get_last_bp_time(patient["id"], d)
+                if (last_bp is None) or (
+                    (now_utc - last_bp) >= timedelta(minutes=max(1, bp_repeat_min))
+                ):
+                    try:
+                        await with_retry(
+                            bot.send_message,
+                            patient["chat_id"],
+                            texts_uk.render("bp.reminder"),
+                        )
+                        idempotency.set_last_bp_time(patient["id"], d, now_utc)
+                    except Exception as e:
+                        logging.error(
+                            "bp send failed: patient=%s err=%s", patient["id"], e
+                        )
+
+        # -------- Status (time-throttled, defaults to once/day) --------
+        st_t = (config.STATUS or {}).get("time")
+        if st_t and timez.due_today(st_t):
+            age_st = _age_min_since_local(st_t)
+            if 0 <= age_st <= cfg["grace_min"]:
+                status_repeat_min = getattr(config, "STATUS_REPEAT_MIN", 1440)
+                last_st = idempotency.get_last_status_time(patient["id"], d)
+                if (last_st is None) or (
+                    (now_utc - last_st) >= timedelta(minutes=max(1, status_repeat_min))
+                ):
+                    try:
+                        await with_retry(
+                            bot.send_message,
+                            patient["chat_id"],
+                            texts_uk.render("status.prompt"),
+                        )
+                        idempotency.set_last_status_time(patient["id"], d, now_utc)
+                    except Exception as e:
+                        logging.error(
+                            "status send failed: patient=%s err=%s", patient["id"], e
+                        )
+
+
+### FILE: ./main.py
+# app/main.py
+import asyncio
+import logging
+from contextlib import suppress
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+from app import config
+from app.bot.handlers import router
+from app.logic import ticker, sweeper
+from app.db.patients import upsert_patient
+from app.db.pills import delete_today_records
+from app.util import timez
+
+
+async def main():
+    # Configure logging
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Seed patients so FKs are satisfied (SQLAlchemy engine is lazy-initialized)
+    for p in config.PATIENTS:
+        await upsert_patient(p["id"], p["chat_id"], p["name"])
+    
+    # Clean up today's pill records for fresh reminders
+    today = timez.date_kyiv()
+    total_deleted = 0
+    for patient in config.PATIENTS:
+        pill_cfg = patient.get("pills", {}) or {}
+        times = pill_cfg.get("times", {})
+        for dose in times.keys():
+            deleted = await delete_today_records(patient["id"], today, dose)
+            total_deleted += deleted
+            if deleted > 0:
+                logging.debug("Cleaned up %d records for patient=%s dose=%s date=%s", 
+                            deleted, patient["id"], dose, today)
+    
+    if total_deleted > 0:
+        logging.info("Bot startup: cleaned %d pill records for today=%s", total_deleted, today)
+
+    bot = Bot(
+        token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    t1 = asyncio.create_task(ticker_loop(bot))
+    t2 = asyncio.create_task(sweeper_loop(bot))
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        for t in (t1, t2):
+            t.cancel()
+            with suppress(asyncio.CancelledError):
+                await t
+        await bot.session.close()
+
+
+async def ticker_loop(bot: Bot):
+    while True:
+        try:
+            await ticker.tick(bot)
+        except Exception as e:
+            print({"level": "error", "action": "ticker", "exception": str(e)})
+        await asyncio.sleep(config.TICK_SECONDS)
+
+
+async def sweeper_loop(bot: Bot):
+    while True:
+        try:
+            await sweeper.sweep(bot)
+        except Exception as e:
+            print({"level": "error", "action": "sweeper", "exception": str(e)})
+        await asyncio.sleep(config.SWEEP_SECONDS)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+### FILE: ./util/idempotency.py
+# app/util/idempotency.py
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict, Set, Optional, Tuple
+from datetime import date, datetime
+
+
+@dataclass
+class DailyFlags:
+    day: date
+    # Pills: store last repeat send time (UTC) for each reminder base id
+    # key = f"{patient_id}:{dose}:{yyyy-mm-dd}"
+    pills_last_repeat_utc: Dict[str, datetime] = field(default_factory=dict)
+    
+    # Pills: store last pill message ID per patient to remove old buttons
+    # key = patient_id, value = (chat_id, message_id)
+    pills_last_message: Dict[str, Tuple[int, int]] = field(default_factory=dict)
+
+    # BP and Status: once per day (set of patient ids)
+    bp_prompted: Set[str] = field(default_factory=set)
+    status_prompted: Set[str] = field(default_factory=set)
+
+
+_current: DailyFlags | None = None
+
+
+def _ensure(day: date) -> DailyFlags:
+    """Rotate daily in-memory flags at date boundary."""
+    global _current
+    if _current is None or _current.day != day:
+        _current = DailyFlags(day)
+    return _current
+
+
+# ---------- Pills (time-based throttling) ----------
+
+
+def get_last_repeat_time(reminder_base_id: str, day: date) -> Optional[datetime]:
+    """
+    Returns UTC datetime of the last repeat we sent for this reminder today, or None.
+    """
+    return _ensure(day).pills_last_repeat_utc.get(reminder_base_id)
+
+
+def set_last_repeat_time(reminder_base_id: str, day: date, ts_utc: datetime) -> None:
+    """
+    Records the UTC time when we sent the last repeat for this reminder today.
+    """
+    _ensure(day).pills_last_repeat_utc[reminder_base_id] = ts_utc
+
+
+# ---------- BP (once per day) ----------
+
+
+def mark_bp_prompted(patient_id: str, day: date) -> None:
+    _ensure(day).bp_prompted.add(patient_id)
+
+
+def was_bp_prompted(patient_id: str, day: date) -> bool:
+    return patient_id in _ensure(day).bp_prompted
+
+
+# ---------- Status (once per day) ----------
+
+
+def mark_status_prompted(patient_id: str, day: date) -> None:
+    _ensure(day).status_prompted.add(patient_id)
+
+
+def was_status_prompted(patient_id: str, day: date) -> bool:
+    return patient_id in _ensure(day).status_prompted
+
+
+# ---------- Pills Message ID tracking (for button removal) ----------
+
+
+def get_last_pill_message(patient_id: str, day: date) -> Optional[Tuple[int, int]]:
+    """
+    Returns (chat_id, message_id) of the last pill message for this patient today, or None.
+    """
+    return _ensure(day).pills_last_message.get(patient_id)
+
+
+def set_last_pill_message(patient_id: str, chat_id: int, message_id: int, day: date) -> None:
+    """
+    Records the chat_id and message_id of the last pill message sent to this patient today.
+    """
+    _ensure(day).pills_last_message[patient_id] = (chat_id, message_id)
+
+
+### FILE: ./util/retry.py
+import asyncio
+from typing import Callable, Any
+
+BACKOFFS = [1, 3, 10]
+
+async def with_retry(func: Callable[..., Any], *args, **kwargs):
+    last_exc = None
+    for attempt in range(len(BACKOFFS) + 1):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:  # aiogram/HTTPError
+            last_exc = e
+            if attempt == len(BACKOFFS):
+                raise
+            await asyncio.sleep(BACKOFFS[attempt])
+    raise last_exc
+
+
+### FILE: ./util/timez.py
+from __future__ import annotations
+from datetime import datetime, date, time
+from zoneinfo import ZoneInfo
+
+from app import config
+
+WEEKDAYS_UK = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+WEEKDAYS_UK_EXT = ["Понеділок", "Вівторок", "Середа", "Четвер", "П’ятниця", "Субота", "Неділя"]  # fmt: skip
+
+DOSE_UK = {"morning": "Р", "evening": "В"}
+DOSE_UK_EXT = {"morning": "Ранок", "evening": "Вечір"}
+
+
+def now_utc() -> datetime:
+    return datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
+
+
+def now_kyiv() -> datetime:
+    return now_utc().astimezone(config.TZ)
+
+
+def date_kyiv(dt: datetime | None = None) -> date:
+    return (dt or now_kyiv()).date()
+
+
+def combine_kyiv(d: date, t: time) -> datetime:
+    # time already carries tzinfo=config.TZ per config contract
+    return datetime(
+        d.year, d.month, d.day, t.hour, t.minute, t.second, tzinfo=config.TZ
+    )
+
+
+def due_today(local_time: time) -> bool:
+    """Has the moment for today's local_time already arrived?"""
+    return now_kyiv() >= combine_kyiv(date_kyiv(), local_time)
+
+
+def weekday_uk(d: date | None = None) -> str:
+    d = d or date_kyiv()
+    return WEEKDAYS_UK[d.weekday()]
+
+
+def weekday_uk_ext(d: date | None = None) -> str:
+    d = d or date_kyiv()
+    return WEEKDAYS_UK_EXT[d.weekday()]
+
+
+def pill_label(dose: str, d: date | None = None) -> str:
+    d = d or date_kyiv()
+    return f"{weekday_uk(d)}/{DOSE_UK.get(dose, dose)}"
+
+
+def pill_label_ext(dose: str, d: date | None = None) -> str:
+    d = d or date_kyiv()
+    return f"{weekday_uk_ext(d)}/{DOSE_UK_EXT.get(dose, dose)}"
+
+
+def planned_time_str(t: time) -> str:
+    return f"{t.hour:02d}:{t.minute:02d} Київ"
+
+

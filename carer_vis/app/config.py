@@ -1,5 +1,6 @@
+# app/config.py
 from zoneinfo import ZoneInfo
-from datetime import time
+from datetime import time  # noqa: F401 (kept for compatibility where 'time' type is referenced)
 
 # --- Timezone ---
 TZ = ZoneInfo("Europe/Kyiv")
@@ -17,22 +18,29 @@ TICK_SECONDS = 60
 SWEEP_SECONDS = 300
 USE_STATUS = False  # Set to False to disable health status processing
 
+# --- Google Sheets/Drive (Service Account) ---
+# Path to your service account JSON. Placeholder; replace with your real path.
+GSHEETS_CREDENTIALS_PATH = "/home/igor/med/nodal-deck-381522-ebe4f40d6f96.json"
+
+# Sheet name and periodic refresh
+GSHEETS_SCHEDULE_SHEET_NAME = "Розклад"
+GSHEETS_REFRESH_SECONDS = 600  # refresh schedules every 10 minutes
+
 # --- Patients ---
+
 PATIENTS = [
     {
-        "id": "alice",  # id must match [a-z0-9_-]+ (used in callback payloads)
+        "id": "Мама",  # id must match [a-z0-9_-]+ (used in callback payloads)
         "chat_id": 382163513,
         "name": "Мама",
+        "gdrive_file_id": "1Y3pJoHF0qdC5s_jyYUET8Qcu6Gk0AtfmoedTJCKIWbE",
         "pills": {
-            "times": {
-                "morning": time(23, 14, tzinfo=TZ),
-                # "evening": time(23, 36, tzinfo=TZ),
-            },
+            # 'times' will be injected at runtime from the sheet
             "repeat_min": 2,  # per-patient override
             "confirm_window_min": 8,  # per-patient override
         },
         "bp": {
-            "time": time(22, 46, tzinfo=TZ),
+            # 'time' will be injected at runtime from the sheet
             "safe_ranges": {"sys": (90, 220), "dia": (50, 140), "pulse": (40, 150)},
         },
     },
@@ -40,15 +48,11 @@ PATIENTS = [
 
 # --- Daily health status ---
 STATUS = {
-    # "time": time(18, 0, tzinfo=TZ),
+    # "time": time(18, 0, tzinfo=TZ),  # may also be injected from a sheet in the future
     # initial examples; later refined with medical input
     "alert_regexes": [
         r"(?i)сильн(ий|а) біль",
-        # r"(?i)сильн(ий|а) біль у грудях|коротке дихання|задишка",
-        # r"(?i)запамороченн(я|ям)|втрата свідомості|непритомн",
-        # r"(?i)сильний головний біль|сплутаність свідомості",
         r"(?i)сильний головний біль",
-        # r"(?i)аритмія|нерівн(ий|е) серцебиття",
     ],
 }
 
