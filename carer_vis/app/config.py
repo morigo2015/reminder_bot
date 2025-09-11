@@ -5,43 +5,34 @@ from datetime import time
 TZ = ZoneInfo("Europe/Kyiv")
 
 # --- Telegram (temporary: keep here per spec) ---
-BOT_TOKEN = "550433191:AAFkG6atLs_uo0nwphtuiwbwIJeUhwfzCyI"
+# BOT_TOKEN = "550433191:AAFkG6atLs_uo0nwphtuiwbwIJeUhwfzCyI"
+BOT_TOKEN = "7994158515:AAF_huVgWba-DwJ6b1vNUTl3nxP1Qa4xykE"
 NURSE_CHAT_ID = 7391874317  # private chat id
-
-# --- MySQL connection ---
-DB = {
-    "host": "127.0.0.1",
-    "port": 3306,
-    "user": "igor",
-    "password": "1",
-    "db": "carer",
-}
 
 # --- Defaults (can be overridden per patient) ---
 DEFAULT_REPEAT_REMINDER_MIN = 10
 DEFAULT_CONFIRM_WINDOW_MIN = 25
-DEFAULT_INITIAL_SEND_GRACE_MIN = 5  # global grace, keep it simple
+DEFAULT_INITIAL_SEND_GRACE_MIN = 10  # global grace, keep it simple
 TICK_SECONDS = 60
 SWEEP_SECONDS = 300
 USE_STATUS = False  # Set to False to disable health status processing
 
 # --- Patients ---
-# id must match [a-z0-9_-]+ (used in callback payloads)
 PATIENTS = [
     {
-        "id": "alice",
+        "id": "alice",  # id must match [a-z0-9_-]+ (used in callback payloads)
         "chat_id": 382163513,
         "name": "Мама",
         "pills": {
             "times": {
-                "morning": time(2, 1, tzinfo=TZ),
+                "morning": time(23, 14, tzinfo=TZ),
                 # "evening": time(23, 36, tzinfo=TZ),
             },
             "repeat_min": 2,  # per-patient override
             "confirm_window_min": 8,  # per-patient override
         },
         "bp": {
-            "time": time(0, 25, tzinfo=TZ),
+            "time": time(22, 46, tzinfo=TZ),
             "safe_ranges": {"sys": (90, 220), "dia": (50, 140), "pulse": (40, 150)},
         },
     },
@@ -59,4 +50,13 @@ STATUS = {
         r"(?i)сильний головний біль",
         # r"(?i)аритмія|нерівн(ий|е) серцебиття",
     ],
+}
+
+# --- MySQL connection ---
+DB = {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "igor",
+    "password": "1",
+    "db": "carer",
 }

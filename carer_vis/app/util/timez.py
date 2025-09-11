@@ -5,10 +5,10 @@ from zoneinfo import ZoneInfo
 from app import config
 
 WEEKDAYS_UK = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
-# "Понеділок", "Вівторок", "Середа", "Четвер", "П’ятниця", "Субота", "Неділя"
+WEEKDAYS_UK_EXT = ["Понеділок", "Вівторок", "Середа", "Четвер", "П’ятниця", "Субота", "Неділя"]  # fmt: skip
 
 DOSE_UK = {"morning": "Р", "evening": "В"}
-# DOSE_UK = {"morning": "Ранок", "evening": "Вечір"}
+DOSE_UK_EXT = {"morning": "Ранок", "evening": "Вечір"}
 
 
 def now_utc() -> datetime:
@@ -40,9 +40,19 @@ def weekday_uk(d: date | None = None) -> str:
     return WEEKDAYS_UK[d.weekday()]
 
 
+def weekday_uk_ext(d: date | None = None) -> str:
+    d = d or date_kyiv()
+    return WEEKDAYS_UK_EXT[d.weekday()]
+
+
 def pill_label(dose: str, d: date | None = None) -> str:
     d = d or date_kyiv()
     return f"{weekday_uk(d)}/{DOSE_UK.get(dose, dose)}"
+
+
+def pill_label_ext(dose: str, d: date | None = None) -> str:
+    d = d or date_kyiv()
+    return f"{weekday_uk_ext(d)}/{DOSE_UK_EXT.get(dose, dose)}"
 
 
 def planned_time_str(t: time) -> str:

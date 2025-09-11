@@ -91,6 +91,7 @@ async def _send_initial(bot: Bot, patient: dict, dose: str, d: date) -> None:
     await _remove_old_pill_button(bot, patient["id"], d)
     
     label = timez.pill_label(dose, d)
+    label_ext = timez.pill_label_ext(dose, d)
     kb = confirm_keyboard(_callback(patient["id"], dose, d))
 
     send_err = None
@@ -99,7 +100,7 @@ async def _send_initial(bot: Bot, patient: dict, dose: str, d: date) -> None:
         message_sent = await with_retry(
             bot.send_message,
             patient["chat_id"],
-            texts_uk.render("pills.initial", label=label),
+            texts_uk.render("pills.initial", label=label, label_ext=label_ext),
             reply_markup=kb,
             parse_mode="HTML",
         )
