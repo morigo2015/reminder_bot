@@ -20,7 +20,7 @@ USE_STATUS = False  # Set to False to disable health status processing
 
 # --- Google Sheets/Drive (Service Account) ---
 # Path to your service account JSON. Placeholder; replace with your real path.
-GSHEETS_CREDENTIALS_PATH = "/home/igor/med/nodal-deck-381522-ebe4f40d6f96.json"
+GSHEETS_CREDENTIALS_PATH = "/home/igor/creds/nodal-deck-381522-ebe4f40d6f96.json"
 
 # Sheet name and periodic refresh
 GSHEETS_SCHEDULE_SHEET_NAME = "Розклад"
