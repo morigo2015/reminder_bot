@@ -20,7 +20,10 @@ SCOPES = [
 
 
 def _creds() -> Credentials:
-    # Service account JSON (single account used across all sheets)
+    """
+    Build service-account credentials from a JSON file path.
+    Single service account is used across all patient workbooks.
+    """
     return Credentials.from_service_account_file(
         config.GSHEETS_CREDENTIALS_PATH, scopes=SCOPES
     )
@@ -28,7 +31,7 @@ def _creds() -> Credentials:
 
 def _fetch_values_blocking(spreadsheet_id: str, sheet_name: str) -> List[List[str]]:
     """
-    Blocking function executed in a thread. Fetches A:B columns for the sheet.
+    Blocking: fetch A:B values from given sheet. Runs under asyncio.to_thread().
     """
     service = build("sheets", "v4", credentials=_creds(), cache_discovery=False)
     range_a1 = f"{sheet_name}!A1:B"
@@ -57,7 +60,7 @@ async def fetch_schedule_values(
     def _do():
         return _fetch_values_blocking(spreadsheet_id, sheet_name)
 
-    # with_retry expects an awaitable; we pass asyncio.to_thread to execute the blocking call
+    # with_retry should handle backoff/retries; we run the blocking call in a thread
     values = await with_retry(asyncio.to_thread, _do)
     logger.debug("gsheets: fetched %d rows", len(values))
     return values

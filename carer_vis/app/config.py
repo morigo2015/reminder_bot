@@ -19,6 +19,7 @@ SWEEP_SECONDS = 300
 USE_STATUS = False  # Set to False to disable health status processing
 
 # --- Google Sheets/Drive (Service Account) ---
+# Service account JSON path (you confirmed service-account flow).
 GSHEETS_CREDENTIALS_PATH = "/home/igor/creds/nodal-deck-381522-ebe4f40d6f96.json"
 
 # Sheet name and periodic refresh
@@ -26,10 +27,13 @@ GSHEETS_SCHEDULE_SHEET_NAME = "Розклад"
 GSHEETS_REFRESH_SECONDS = 600  # refresh schedules every 10 minutes
 
 # --- Patients ---
-
+# NOTE:
+#   * Times for pills/bp are NOT configured here anymore.
+#   * Each patient has their own Google Sheets workbook with a single sheet "Розклад".
+#   * We store the Google Drive FILE ID of that workbook (not the name).
 PATIENTS = [
     {
-        "id": "Мама",  # id must match [a-z0-9_-]+ (used in callback payloads)
+        "id": "mama",  # ASCII stable key (safer for DB FKs & callbacks)
         "chat_id": 382163513,
         "name": "Мама",
         "gdrive_file_id": "1Y3pJoHF0qdC5s_jyYUET8Qcu6Gk0AtfmoedTJCKIWbE",
@@ -48,7 +52,6 @@ PATIENTS = [
 # --- Daily health status ---
 STATUS = {
     # "time": time(18, 0, tzinfo=TZ),  # may also be injected from a sheet in the future
-    # initial examples; later refined with medical input
     "alert_regexes": [
         r"(?i)сильн(ий|а) біль",
         r"(?i)сильний головний біль",

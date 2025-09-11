@@ -2,6 +2,7 @@
 import asyncio
 import logging
 from contextlib import suppress
+
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -10,13 +11,13 @@ from app import config
 from app.bot.handlers import router
 from app.logic import ticker, sweeper
 from app.logic.schedule_loader import load_all_schedules, start_periodic_refresh
-from app.db.patients import upsert_patient
+from app.db.patients import upsert_patient, exists_patient
 from app.db.pills import delete_today_records
 from app.util import timez
 
 
 async def main():
-    # Configure logging (DEBUG per spec)
+    # DEBUG logging per spec
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -29,11 +30,25 @@ async def main():
         logging.error("Startup aborted: %s", e)
         return
 
-    # Seed patients so FKs are satisfied (SQLAlchemy engine is lazy-initialized)
+    # --- Seed/refresh patients in DB ---
     for p in config.PATIENTS:
         await upsert_patient(p["id"], p["chat_id"], p["name"])
 
-    # Clean up today's pill records for fresh reminders (based on loaded times)
+    # --- Verify patients exist (fail fast if not) ---
+    missing = []
+    for p in config.PATIENTS:
+        ok = await exists_patient(p["id"])
+        if not ok:
+            missing.append(p["id"])
+    if missing:
+        logging.error(
+            "Startup aborted: patients missing from DB (ids=%s). "
+            "Check DB charset/collations and config PATIENTS ids.",
+            ", ".join(missing),
+        )
+        return
+
+    # --- Clean today's pill records for fresh reminders based on loaded times ---
     today = timez.date_kyiv()
     total_deleted = 0
     for patient in config.PATIENTS:
@@ -56,13 +71,15 @@ async def main():
             "Bot startup: cleaned %d pill records for today=%s", total_deleted, today
         )
 
+    # --- Telegram bot ---
     bot = Bot(
-        token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        token=config.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Background loops
+    # --- Background loops ---
     t0 = asyncio.create_task(start_periodic_refresh())
     t1 = asyncio.create_task(ticker_loop(bot))
     t2 = asyncio.create_task(sweeper_loop(bot))

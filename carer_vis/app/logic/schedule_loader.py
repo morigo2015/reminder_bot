@@ -12,7 +12,8 @@ from app.integrations.gsheets import fetch_schedule_values
 
 logger = logging.getLogger(__name__)
 
-EVENT_MORNING = "ліки - утро"
+# Supported events in sheet column A ("Подія")
+EVENT_MORNING = "ліки - ранок"
 EVENT_EVENING = "ліки - вечір"
 EVENT_BP = "тиск"
 
@@ -47,10 +48,12 @@ def _fmt_time(t: Optional[time]) -> str:
 def _apply_patient_times(
     patient: dict, pills_times: Dict[str, time], bp_time: Optional[time]
 ) -> None:
-    # Inject pills.times
+    """
+    Inject parsed schedule into the in-memory patient config.
+    """
     pills_cfg = patient.setdefault("pills", {}) or {}
     pills_cfg["times"] = pills_times
-    # Inject/clear bp.time
+
     bp_cfg = patient.setdefault("bp", {}) or {}
     if bp_time is None:
         bp_cfg.pop("time", None)
@@ -59,29 +62,32 @@ def _apply_patient_times(
 
 
 async def _load_single_patient(patient: dict) -> Tuple[Dict[str, time], Optional[time]]:
+    """
+    Load and parse the sheet for a single patient.
+    Raises ScheduleError on duplicates/invalid data as requested.
+    """
     spreadsheet_id = patient.get("gdrive_file_id")
     if not spreadsheet_id:
         raise ScheduleError(f"Patient '{patient.get('id')}' missing gdrive_file_id")
 
-    # Fetch rows from Google Sheets
     values = await fetch_schedule_values(
         spreadsheet_id, config.GSHEETS_SCHEDULE_SHEET_NAME
     )
     if not values:
-        # Empty sheet is acceptable => no events configured
         values = [["Подія", "Час"]]
 
-    # Optional: validate headers if present
+    # Optional: validate header shape (soft check)
     header = [c.strip().lower() for c in (values[0] if values else []) + ["", ""]][:2]
     if header and (header[0] not in ("подія", "подiя") or header[1] != "час"):
         logger.debug(
-            "schedule: header unexpected for patient=%s: %s", patient.get("id"), header
+            "schedule: header unexpected for patient=%s: %s",
+            patient.get("id"),
+            header,
         )
 
     pills_times: Dict[str, time] = {}
     bp_time: Optional[time] = None
 
-    # Process data rows (from row 2)
     for idx, row in enumerate(values[1:], start=2):
         if not row or all((c or "").strip() == "" for c in row):
             continue
@@ -101,9 +107,8 @@ async def _load_single_patient(patient: dict) -> Tuple[Dict[str, time], Optional
                 idx,
                 patient.get("id"),
             )
-            continue  # ignore unknown events silently as agreed
+            continue  # ignore unknown events silently
 
-        # Parse time (must be valid)
         t_local = _parse_hhmm_to_time(raw_time)
 
         domain, key = _EVENT_MAP[raw_event]
@@ -126,14 +131,12 @@ async def _load_single_patient(patient: dict) -> Tuple[Dict[str, time], Optional
 def _print_patient_summary(
     patient: dict, pills_times: Dict[str, time], bp_time: Optional[time]
 ) -> None:
-    # Console-friendly one-liner per patient for monitoring
     line = (
         f"[SCHEDULE] {patient.get('id')} ({patient.get('name')}): "
         f"pills.morning={_fmt_time(pills_times.get('morning'))}, "
         f"pills.evening={_fmt_time(pills_times.get('evening'))}, "
         f"bp={_fmt_time(bp_time)}"
     )
-    # Print and log
     print(line)
     logger.info(line)
 
@@ -158,14 +161,10 @@ async def load_all_schedules(*, startup: bool = True) -> None:
             logger.error(msg)
 
     if startup and errors:
-        # Stop startup with a clear error
         raise ScheduleError("Schedule loading failed:\n  - " + "\n  - ".join(errors))
 
 
 async def refresh_all_schedules() -> None:
-    """
-    Periodic refresh that does not stop the bot on failure.
-    """
     try:
         await load_all_schedules(startup=False)
     except Exception as e:
