@@ -24,7 +24,7 @@ GSHEETS_CREDENTIALS_PATH = "/home/igor/creds/nodal-deck-381522-ebe4f40d6f96.json
 
 # Sheet name and periodic refresh
 GSHEETS_SCHEDULE_SHEET_NAME = "Розклад"
-GSHEETS_REFRESH_SECONDS = 600  # refresh schedules every 10 minutes
+GSHEETS_REFRESH_SECONDS = 30  # refresh schedules every 10 minutes
 
 # --- Patients ---
 # NOTE:
